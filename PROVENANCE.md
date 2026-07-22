@@ -51,3 +51,11 @@ The methodology ([`docs/methodology.md`](docs/methodology.md) and the in-skill
 references) and a sanitized sample report ([`examples/`](examples/)) live in this
 repo alongside the code that produces them, so the credibility can be checked
 against the shipped implementation rather than a claim made elsewhere.
+
+One honest caveat: the two shipped worked examples were generated shortly
+*before* this repository's public root commit, so their stamped skill commit and
+`scripts/` tree hash resolve in the maintainers' pre-public development archive,
+not here — they are labelled "(pre-public archive)" in the reports. Every report
+generated from this repository's code stamps hashes you can resolve right here;
+a test (`tests/test_examples_provenance.py`) forbids any future example from
+claiming the archive label.

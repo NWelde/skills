@@ -11,6 +11,27 @@ unversioned and updates by reinstall from `main`.
 
 ## [Unreleased]
 
+### Fixed (pre-flip audit wave 2)
+
+- **2026-07-22** — **Catalog deep-links now use GitHub's real GFM anchor rule.**
+  `scan._slug_anchor` / `collect_runs._catalog_anchor` hyphenated punctuation
+  where GitHub deletes it, so the report's "Catalog (background + fix recipe)"
+  links for 15 patterns whose titles contain `/`, backticks, `.`, `:`, or `≫`
+  (OPT13/14/32/41/42/47/52/55/56/58/69/70/72/74 + the OPT14 sub-head) landed at
+  the top of the patterns file instead of the cited section. Both slug
+  implementations now delete punctuation and map each space to one hyphen —
+  validated against every catalog heading (0 mismatches) — and the two shipped
+  examples' live links (playwright OPT14, flask OPT32) plus the baked test
+  fixture are corrected. Also fixed two stale hand-authored anchors (OPT12's
+  guardrail link still pointed at the pre-renumber `#p22--…`;
+  `savings-methodology.md`'s ToC still said `#billing-semantics-…` after the
+  pricing punt renamed the heading) and the `verify_report.py` docstring
+  escape-sequence DeprecationWarning contributors saw on every `pytest` run.
+  Shipped docs no longer point readers at the archive-only `reports/` corpus
+  without saying so (ARCHITECTURE.md ×3, MAINTAINERS.md), the examples' scripts
+  tree stamps carry the "(pre-public archive)" label like their commit stamps,
+  and PROVENANCE.md states the caveat outright.
+
 ### Changed
 
 - **2026-07-22** — **Public cut-over pre-flight.** The repository's public

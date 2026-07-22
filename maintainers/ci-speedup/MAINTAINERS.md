@@ -48,7 +48,8 @@ python3 maintainers/ci-speedup/scripts/install_dogfood_command.py --check  # det
 
 #### The committed reports are DOCUMENTATION, but they may no longer lag the renderer
 
-`skills/ci-speedup/reports/<repo>/blocking-path-speed.md` are illustrative worked
+`skills/ci-speedup/reports/<repo>/blocking-path-speed.md` (maintained in the
+pre-public development archive, not shipped here) are illustrative worked
 examples — open and read them. They are **not** the test input.
 `test_committed_reports.py` runs verify_report's invariants against a **FRESH render**
 of each committed `findings.json` (real data + the current renderer), so:

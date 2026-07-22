@@ -78,9 +78,15 @@ class CatalogEntry:
 
 
 def _slug_anchor(opt_id: str, title: str) -> str:
-    """Mirror the GFM heading-anchor rule (lowercased, non-word→`-`)."""
+    """Mirror GitHub's REAL GFM heading-anchor rule: lowercase, DELETE punctuation
+    (GitHub removes it — it never hyphenates it), then each space becomes one
+    hyphen. The old non-word→`-` rule diverged on every heading containing `/`,
+    backticks, `.`, `:`, or `≫` (15 catalog headings), so the rendered report's
+    catalog deep-links landed at the top of the file instead of the pattern.
+    Keep in lockstep with collect_runs._catalog_anchor."""
     raw = f"{opt_id.lower()}--{title.lower()}"
-    return re.sub(r"[^\w-]+", "-", raw).strip("-")
+    raw = re.sub(r"[^\w\s-]", "", raw)
+    return re.sub(r"\s", "-", raw)
 
 
 def load_catalog(path: Path) -> list[CatalogEntry]:

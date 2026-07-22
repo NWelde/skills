@@ -1032,7 +1032,7 @@ failure mode and how you have guarded it before shipping.
 **Where:** `infra.yml:1` (doc-and-lint), `tests_primary.yml:1` (test_vscode_extension)
 **Wall-clock:** this saves runner-minutes but its fix is **wall-clock-negative** (build-once-then-fan-out adds a serial gate), so it lengthens the merge wait. Treat it as a bill saving, not a speed win.
 **Evidence:** 2 jobs each run checkout + dependency install with no `actions/upload-artifact` / `download-artifact` handoff: doc-and-lint, lint-snippets; 2 jobs each run checkout + dependency install with no `actions/upload-artifact` / `download-artifact` handoff: test_vscode_extension, test_package_installations
-**Catalog (background + fix recipe):** https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt14--repeated-checkout-setup-without-artifact-handoff-and-slow-tool-replacement
+**Catalog (background + fix recipe):** https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt14--repeated-checkoutsetup-without-artifact-handoff-and-slow-tool-replacement
 
 #### 🤖 Prompt for your coding agent
 
@@ -1046,7 +1046,7 @@ What ci-speedup saw: 2 jobs each run checkout + dependency install with no `acti
 Saving: ~1,172 runner-min/mo - off the merge-gating critical path, so ~0 developer wall-clock (a cloud-bill cut, not a merge-wait cut).
 
 Read the catalog entry (background, fix recipe, and guardrail):
-  https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt14--repeated-checkout-setup-without-artifact-handoff-and-slow-tool-replacement
+  https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt14--repeated-checkoutsetup-without-artifact-handoff-and-slow-tool-replacement
 
 Do: confirm the pattern at each location above, recover the intent from git
 history, and apply the catalog's fix recipe where it is safe. State the
@@ -1155,7 +1155,7 @@ failure mode and how you have guarded it before shipping.
 
 | Source | Coverage | Used for |
 | --- | --- | --- |
-| ci-speedup static scan (skill commit `3bb6e2e`, scripts tree `4c21de6`) | All `.github/workflows/*.yml` under the analyzed tree (4037273) | Static pattern detection (OPT1-OPT69 catalog) |
+| ci-speedup static scan (skill commit `3bb6e2e`, scripts tree `4c21de6` (pre-public archive)) | All `.github/workflows/*.yml` under the analyzed tree (4037273) | Static pattern detection (OPT1-OPT69 catalog) |
 | gh runs/jobs API (timestamps) | 145 runs / 1484 jobs sampled | Critical-path + per-step P50 |
 | job logs | 2 job log(s) sampled | Step internals + cross-run magnitude (deeper levels) |
 | workflow YAML | 18 from the analyzed checkout | `on:` triggers, matrix/shard axes, job timeouts (detector inputs) |

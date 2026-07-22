@@ -6667,7 +6667,8 @@ def _new_finding(pat: str, severity: str, title: str, wf_path: str,
 
 def _struct_anchor(opt_id: str, title: str) -> str:
     raw = f"{opt_id.lower()}--{title.lower()}"
-    return _re.sub(r"[^\w-]+", "-", raw).strip("-")
+    raw = _re.sub(r"[^\w\s-]", "", raw)
+    return _re.sub(r"\s", "-", raw)
 
 
 _STRUCTURAL_META: dict[str, dict[str, Any]] = {
@@ -8003,7 +8004,8 @@ def _catalog_anchor(opt_id: str, title: str) -> str:
     """GFM-ish heading anchor, mirroring scan._slug_anchor so a data-driven
     finding deep-links to the same catalog section a static finding would."""
     raw = f"{opt_id.lower()}--{title.lower()}"
-    return _re.sub(r"[^\w-]+", "-", raw).strip("-")
+    raw = _re.sub(r"[^\w\s-]", "", raw)
+    return _re.sub(r"\s", "-", raw)
 
 
 def _wf_on(wf_doc: dict[str, Any]) -> Any:

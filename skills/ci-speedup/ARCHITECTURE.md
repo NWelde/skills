@@ -1532,9 +1532,10 @@ catalog pattern lacking a registered detector in
   passes when the recorded commit is an ancestor **or** the recorded scripts tree
   equals HEAD's exactly, and refuses a `-dirty` tree (rendered from uncommitted
   code, whose sha names the committed tree rather than the code that ran).
-  `scripts/` and not the whole skill dir, because the skill dir contains
-  `reports/` - stamping it would make committing a report change the very tree
-  that report claims to have been produced under.
+  `scripts/` and not the whole skill dir, because the skill dir can contain
+  committed reports (the archive's `reports/` corpus) - stamping the whole dir
+  would make committing a report change the very tree that report claims to
+  have been produced under.
 
   So the gate is now **enforced** on the committed examples, against the real
   checkout, and it no longer false-reds on a squash. The cost, accepted
@@ -1774,9 +1775,12 @@ Tests live under `tests/` and are picked up by the repo-root `pyproject.toml`'s
   verbatim cache miss/hit extraction, the unprovable-cache drop, OPT48 advisory
   shape, and that the report renders the evidence table (not a YAML fence).
   Several assert against **committed worked-example** reports under
-  `reports/`.
+  `reports/` (a corpus maintained in the pre-public development archive — this
+  repository ships its public worked examples under `examples/` instead, and
+  these guards skip loudly when the corpus is absent).
 - **Committed-report guard** (`test_committed_reports.py`) - the committed
-  `reports/<repo>/` are **documentation** (illustrative worked examples), NOT the
+  `reports/<repo>/` (archive corpus; skips when absent) are **documentation**
+  (illustrative worked examples), NOT the
   test input. The guard renders each committed `findings.json` **fresh** with the
   current renderer and runs the invariants (no typographic dash, no coverage-gap
   dead-end, and the full `verify_report.py` check set) against that fresh render,
@@ -2677,7 +2681,8 @@ measured root cause, links the tool's official docs, and asks the user's agent t
 investigate the repo and apply a safe change (stating the failure mode). There is
 deliberately **no recommendation and no code diff** in the report — the agent has
 the repo checkout + the captured bundle and reasons the fix in context. (The
-`blocking-path-*.md` worked examples under `reports/` are the committed
+`blocking-path-*.md` worked examples — under `reports/` in the pre-public
+development archive; see `examples/` in this repository — are the committed
 documentation of this shape (verified by a fresh render each run, §7).)
 
 ### 12.6a The PR-floor on a push-only repo — never bury a measured pole as static-only

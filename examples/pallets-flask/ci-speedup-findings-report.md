@@ -420,7 +420,7 @@ failure mode and how you have guarded it before shipping.
 
 **Where:** `publish.yaml:2` (build)
 **Evidence:** workflow triggers on push but declares no `paths:`/`paths-ignore:` filter (the `on:` block below has no `paths:` key).
-**Catalog (background + fix recipe):** https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt32--missing-paths-paths-ignore-on-expensive-workflows
+**Catalog (background + fix recipe):** https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt32--missing-pathspaths-ignore-on-expensive-workflows
 
 #### 🤖 Prompt for your coding agent
 
@@ -434,7 +434,7 @@ What ci-speedup saw: workflow triggers on push but declares no `paths:`/`paths-i
 Saving: no measured runner-min saving - off the merge-gating critical path, so ~0 developer wall-clock (a cloud-bill cut, not a merge-wait cut).
 
 Read the catalog entry (background, fix recipe, and guardrail):
-  https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt32--missing-paths-paths-ignore-on-expensive-workflows
+  https://github.com/starslingdev/skills/blob/main/skills/ci-speedup/references/optimization-patterns.md#opt32--missing-pathspaths-ignore-on-expensive-workflows
 
 CAVEAT - the required-status 'Pending' landmine: if ANY check this
 workflow produces is a required status check, do NOT skip it via
@@ -509,7 +509,7 @@ failure mode and how you have guarded it before shipping.
 
 | Source | Coverage | Used for |
 | --- | --- | --- |
-| ci-speedup static scan (skill commit `3bb6e2e`, scripts tree `f978505`) | All `.github/workflows/*.yml` under the analyzed tree (36e4a82) | Static pattern detection (OPT1-OPT69 catalog) |
+| ci-speedup static scan (skill commit `3bb6e2e`, scripts tree `f978505` (pre-public archive)) | All `.github/workflows/*.yml` under the analyzed tree (36e4a82) | Static pattern detection (OPT1-OPT69 catalog) |
 | gh runs/jobs API (timestamps) | 45 runs / 126 jobs sampled | Critical-path + per-step P50 |
 | job logs | 1 job log(s) sampled | Step internals + cross-run magnitude (deeper levels) |
 | workflow YAML | 5 from the analyzed checkout | `on:` triggers, matrix/shard axes, job timeouts (detector inputs) |

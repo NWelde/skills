@@ -1335,7 +1335,7 @@ def _all_events_scoped_poles(findings_path: Path | None) -> list[str]:
 
 
 def _push_floor_pole_keys(findings_path: Path | None) -> set[tuple[str, str]]:
-    """`(workflow-basename, _cmp_name(check))` for each `pr_critical_path.poles[*]` flagged
+    r"""`(workflow-basename, _cmp_name(check))` for each `pr_critical_path.poles[*]` flagged
     `pr_floor_push_fallback` — the genuine PUSH-only floor synthesized for a repo with no file-backed
     pole. Such a pole is synthesized from per-workflow timing and may legitimately carry NO per-step
     breakdown (the job has no sampled steps), so the stunted-pole guard must EXEMPT it (a bare body is

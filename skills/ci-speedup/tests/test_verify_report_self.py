@@ -2448,7 +2448,7 @@ def test_s3_skip_family_prompt_carries_pending_caveat(tmp_path: Path):
         "wall_clock_p50_s": 0.0,
         "realization": "none",
         "sizing_basis": "modeled",
-        "fix_recipe_anchor": "opt32--missing-paths-paths-ignore-on-expensive-workflows",
+        "fix_recipe_anchor": "opt32--missing-pathspaths-ignore-on-expensive-workflows",
     }]
     report = bp.render(doc)
     assert "required-status 'Pending' landmine" in report

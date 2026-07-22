@@ -27,7 +27,7 @@ model.
 - [Runner-minute axis (billing) — the subtractive formula](#runner-minute-axis-billing--the-subtractive-formula)
   - [Term 1: current_30d_sum](#term-1-current_30d_sum)
   - [Term 2: post_fix_30d_sum](#term-2-post_fix_30d_sum)
-  - [Billing semantics for the Tier-2 render](#billing-semantics-for-the-tier-2-render)
+  - [Billing semantics for the Tier-2 render](#runner-minute-semantics-for-the-tier-2-render)
   - [Forbidden shortcuts](#forbidden-shortcuts)
   - [Term 0 (precondition): verify run-volume from total_count](#term-0-precondition-verify-run-volume-from-total_count)
   - [Term 1.5 (precondition): exclude jobs where the fix costs more](#term-15-precondition-exclude-jobs-where-the-fix-costs-more)
