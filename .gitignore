@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Stray logs (e.g. STARSLING_LOG_LEVEL=DEBUG session captures) and the uv
+# lockfile — local artifacts a bulk `git add` must not sweep into the repo.
+# CI installs deps with pip, so the skill doesn't ship a uv.lock.
+*.log
+uv.lock
+
+# Claude Code project-local config (skills symlinks, settings.local.json,
+# installed slash-command copies under .claude/commands/, etc.)
+.claude/
+
+# ci-speedup gap -> catalog loop (maintainers-only, local). Holds gap captures
+# from real ci-speedup runs where the LLM fallback fired (SKILL.md phase 4a): the
+# captured third-party job log + the LLM analysis + metadata. Job logs can carry
+# repo internals / tokens, so NEVER commit this directory; only the human-reviewed
+# detector + test PR the loop proposes reaches the repo.
+# See maintainers/ci-speedup/MAINTAINERS.md.
+.ci-speedup-gaps/
+
+# ci-speedup transcript self-improvement loop (maintainers-only, local). Holds
+# raw session transcripts AND generated summaries of real ci-speedup runs against
+# third-party repos — job logs / report context may carry repo internals or tokens.
+# NEVER commit this directory; only the human-reviewed SKILL.md / references / evals
+# PR the loop proposes reaches the repo. See maintainers/ci-speedup/MAINTAINERS.md.
+.ci-speedup-loop/
+
+# ci-speedup dogfood loop (maintainers-only, local). Holds full clones of the
+# third-party repos the dogfood workflow audits plus their run captures — large,
+# and may carry repo internals or tokens. NEVER commit this directory; git cannot
+# restore it if deleted. See maintainers/ci-speedup/MAINTAINERS.md.
+.ci-speedup-dogfood/

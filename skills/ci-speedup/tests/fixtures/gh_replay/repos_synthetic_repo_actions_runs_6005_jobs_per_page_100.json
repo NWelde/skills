@@ -1,0 +1,160 @@
+{
+  "total_count": 5,
+  "jobs": [
+    {
+      "id": 60050,
+      "run_id": 6005,
+      "name": "build",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-06-24T05:00:05Z",
+      "completed_at": "2026-06-24T05:01:35Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "html_url": "https://github.com/synthetic/repo/actions/runs/6005/job/60050",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-06-24T05:00:05Z",
+          "completed_at": "2026-06-24T05:00:05Z",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "name": "Build",
+          "number": 2,
+          "started_at": "2026-06-24T05:00:05Z",
+          "completed_at": "2026-06-24T05:01:35Z",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 60051,
+      "run_id": 6005,
+      "name": "unit (a)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-06-24T05:00:10Z",
+      "completed_at": "2026-06-24T05:00:30Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "html_url": "https://github.com/synthetic/repo/actions/runs/6005/job/60051",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-06-24T05:00:10Z",
+          "completed_at": "2026-06-24T05:00:10Z",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run unit slice",
+          "number": 2,
+          "started_at": "2026-06-24T05:00:10Z",
+          "completed_at": "2026-06-24T05:00:30Z",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 60052,
+      "run_id": 6005,
+      "name": "unit (b)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-06-24T05:00:11Z",
+      "completed_at": "2026-06-24T05:00:32Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "html_url": "https://github.com/synthetic/repo/actions/runs/6005/job/60052",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-06-24T05:00:11Z",
+          "completed_at": "2026-06-24T05:00:11Z",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run unit slice",
+          "number": 2,
+          "started_at": "2026-06-24T05:00:11Z",
+          "completed_at": "2026-06-24T05:00:32Z",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 60053,
+      "run_id": 6005,
+      "name": "unit (c)",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-06-24T05:00:12Z",
+      "completed_at": "2026-06-24T05:00:34Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "html_url": "https://github.com/synthetic/repo/actions/runs/6005/job/60053",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-06-24T05:00:12Z",
+          "completed_at": "2026-06-24T05:00:12Z",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "name": "Run unit slice",
+          "number": 2,
+          "started_at": "2026-06-24T05:00:12Z",
+          "completed_at": "2026-06-24T05:00:34Z",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    },
+    {
+      "id": 60054,
+      "run_id": 6005,
+      "name": "integration",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-06-24T05:00:15Z",
+      "completed_at": "2026-06-24T05:03:15Z",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "html_url": "https://github.com/synthetic/repo/actions/runs/6005/job/60054",
+      "steps": [
+        {
+          "name": "Set up job",
+          "number": 1,
+          "started_at": "2026-06-24T05:00:15Z",
+          "completed_at": "2026-06-24T05:00:15Z",
+          "status": "completed",
+          "conclusion": "success"
+        },
+        {
+          "name": "Integration suite",
+          "number": 2,
+          "started_at": "2026-06-24T05:00:15Z",
+          "completed_at": "2026-06-24T05:03:15Z",
+          "status": "completed",
+          "conclusion": "success"
+        }
+      ]
+    }
+  ]
+}

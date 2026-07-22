@@ -1,0 +1,7 @@
+{
+  "pr_critical_path": {
+    "critical_path_check": "build",
+    "dropped_non_required_checks": ["Run integration tests"]
+  },
+  "findings": []
+}

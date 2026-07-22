@@ -1,0 +1,217 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://starsling.dev/schemas/ci-speedup/loop-summary.schema.json",
+  "title": "ci-speedup loop summary",
+  "description": "Schema for one summary.json produced by the ci-speedup maintainer transcript self-improvement loop (the GENERAL loop that improves SKILL.md / evals / reference docs from how a session went; NOT the gap->catalog detector loop). One file per transcript, written under .ci-speedup-loop/transcripts/<dir>/summary.json (gitignored). Summaries derive from raw session transcripts of ci-speedup runs against third-party repos and stay local; only the generalized contents of proposed_changes ever inform a committed PR. Strict (additionalProperties:false) so a validator catches a structurally malformed summary before it is acted on (it cannot vouch for semantic invariants like scrub truthfulness or id integrity).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "transcript_id",
+    "session_kind",
+    "session_summary",
+    "steering_events",
+    "proposed_changes",
+    "scrub_check"
+  ],
+  "properties": {
+    "transcript_id": {
+      "type": "string",
+      "description": "The transcript directory name, e.g. 2026-06-09-ci-speedup-run. Identifies which session this summary came from.",
+      "minLength": 1
+    },
+    "session_kind": {
+      "type": "string",
+      "description": "What kind of session this transcript is. A real ci-speedup run against a third-party repo is the highest-signal input; a skill-build session shows design intent; pr-review or other sessions are lower signal.",
+      "enum": ["ci-speedup-run", "skill-build", "pr-review", "other"]
+    },
+    "session_summary": {
+      "type": "string",
+      "description": "1-4 neutral sentences: what the operator set out to do and how the session went, plus any lesson that is ALREADY encoded in the current SKILL.md (so it isn't re-proposed). Do not name third-party repositories, customers, or internal systems; describe the target generically.",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "scanned_target": {
+      "type": "string",
+      "description": "Generic descriptor of what was audited, NOT a real repo name. Examples: 'a third-party OSS monorepo with a turbo build', 'this skills repo', 'n/a (skill-build session)'.",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "steering_events": {
+      "type": "array",
+      "description": "The heart of the summary: every moment the operator had to steer the agent — interrupt, correct, reject, redirect, or repeat themselves — plus near-misses the operator caught. Empty array is valid (a clean run is itself a signal). Order by leverage, highest first.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "signature", "trigger", "operator_correction", "root_cause", "leverage", "generalizable"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable id within this summary, e.g. 's1'. Uniqueness is a producer convention; draft-07 can't enforce it.",
+            "pattern": "^s[0-9]+$"
+          },
+          "signature": {
+            "type": "string",
+            "description": "Stable, normalized key for WHAT the operator steered — its root-cause area plus the contract surface it touches — so the SAME lesson from two different sessions clusters into one signal (the cross-session recurrence gate, mirroring the dogfood bug signature). It is NOT free prose: it is a fixed `<area>@<file>:<rule-slug>` template with a closed vocabulary per segment, enforced by the `pattern`, so the analysis LLM's phrasing drift (synonyms, word order, casing) across sessions can't split one real cluster into two that never recur and so never promote. `<area>` is one of the contract areas {spine, required-scope, gap-fill, render, sizing, present}; `<file>` is the contract surface it lands in (`SKILL.md` or a specific `references/<name>.md`); `<rule-slug>` is a kebab-case slug naming the phase/rule it touches. An eval-only lesson signs under its PAIRED `SKILL.md` / reference rule — `evals/evals.json` is never a signature `<file>` (the signature names the contract rule the eval is paired to, not the eval file). Select the area + file from the closed sets and lowercase/kebab-case the slug; aggregation also folds case/whitespace before comparing as a backstop. Examples: `gap-fill@SKILL.md:fill-coverage-gap`, `sizing@references/savings-methodology.md:floor-cap-structural`, `render@SKILL.md:second-pole`.",
+            "pattern": "^(spine|required-scope|gap-fill|render|sizing|present)@(SKILL\\.md|references/[a-z0-9]+(-[a-z0-9]+)*\\.md):[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "What the agent did (or failed to do) that required steering, in generic terms. E.g. 'agent shipped a pole as a no-drill-down coverage-gap dead-end', 'agent quoted estimated savings instead of the run's measured numbers', 'agent rendered only one long pole when the user expected two findings'.",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "operator_correction": {
+            "type": "string",
+            "description": "What the operator said or did to steer the agent back. E.g. 'told it a coverage gap is a product failure and to fill it', 'told it to measure, not estimate', 'told it to re-run the committed invariants against the new reports'.",
+            "minLength": 1,
+            "maxLength": 600
+          },
+          "root_cause": {
+            "type": "string",
+            "description": "Why the agent went wrong: a gap the loop can close. Pick the closest category.",
+            "enum": [
+              "missing-never-rule",
+              "ambiguous-phase-instruction",
+              "missing-phase-check",
+              "scope-overreach",
+              "coverage-gap-dead-end",
+              "estimated-not-measured",
+              "fabricated-or-unsupported-finding",
+              "mis-ranked-lever",
+              "missing-second-pole-or-finding",
+              "skipped-verification-after-regen",
+              "prescribed-a-fix",
+              "unscrubbed-or-disclosure-risk",
+              "tooling-or-environment",
+              "other"
+            ]
+          },
+          "leverage": {
+            "type": "string",
+            "description": "How much closing this gap would improve the skill. HIGH = recurring or trust-relevant (dead-end shipped, fabricated number, commit/push, disclosure); MEDIUM = wrong/weak output the operator caught; LOW = cosmetic or one-off.",
+            "enum": ["HIGH", "MEDIUM", "LOW"]
+          },
+          "generalizable": {
+            "type": "boolean",
+            "description": "true if a systemic gap that would recur on other repos (worth encoding into SKILL.md / evals / docs); false if a one-off specific to this session (noted but not encoded)."
+          },
+          "evidence_locator": {
+            "type": "string",
+            "description": "OPTIONAL pointer back into the local transcript (a turn number, a short quoted operator phrase, or a phase name) so a maintainer can find the moment. Stays local; never copied into a committed artifact. Must not contain secrets.",
+            "minLength": 1,
+            "maxLength": 300
+          }
+        }
+      }
+    },
+    "proposed_changes": {
+      "type": "array",
+      "description": "Concrete, generalized changes that would prevent the steering events from recurring. These descriptions are the ONLY part of the summary that flows into the committed PR, so they MUST be generic and internal-free: no real repo names/paths/job-names/run-URLs from the audited repo, no secrets, no internal-only identifiers. Do NOT propose new _parse_log detectors or catalog patterns here (that is the gap->catalog loop).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "target_file", "description", "linked_steering"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable id within this summary, e.g. 'c1'. Uniqueness is a producer convention.",
+            "pattern": "^c[0-9]+$"
+          },
+          "kind": {
+            "type": "string",
+            "description": "The mechanism. never-rule and phase-check edit SKILL.md; eval-case adds a behavioral case to evals/evals.json (ideally paired with a never-rule/phase-check so CI catches the regression); doc-clarification tightens a reference doc.",
+            "enum": ["never-rule", "phase-check", "eval-case", "doc-clarification"]
+          },
+          "target_file": {
+            "type": "string",
+            "description": "Which committed file this change lands in. Path relative to the skill dir.",
+            "enum": [
+              "SKILL.md",
+              "evals/evals.json",
+              "references/optimization-patterns.md",
+              "references/wall-clock-methodology.md",
+              "references/savings-methodology.md",
+              "references/adversarial-review-rubric.md",
+              "ARCHITECTURE.md",
+              "other"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "description": "The proposed change, stated generically and ready to adapt into the target file. For a never-rule: the rule text. For a phase-check: which phase and the check. For an eval-case: the behavior to assert. Internal-free and scrub-safe (see array-level description).",
+            "minLength": 1,
+            "maxLength": 1200
+          },
+          "linked_steering": {
+            "type": "array",
+            "description": "ids of the steering_events this change addresses. Should reference ids present in steering_events; the loop (not the validator) checks referential integrity.",
+            "items": {"type": "string", "pattern": "^s[0-9]+$"},
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "eval_sketch": {
+            "type": "object",
+            "description": "OPTIONAL. Present when kind is eval-case. A sketch of the behavioral case in the existing evals.json shape so the matched-pair step can build it.",
+            "additionalProperties": false,
+            "required": ["prompt", "expected_output", "expectations"],
+            "properties": {
+              "prompt": {
+                "type": "string",
+                "description": "The user prompt the eval would run (typically an end-to-end audit of a public repo in a given mode).",
+                "minLength": 1
+              },
+              "expected_output": {
+                "type": "string",
+                "description": "Prose description of the correct ci-speedup behavior for this case (assert the report SHAPE, not a specific repo's numbers).",
+                "minLength": 1
+              },
+              "fixture_sketch": {
+                "type": "string",
+                "description": "What the case needs to exercise the behaviour (a repo class + the report property to check), NOT a real third-party repo's contents.",
+                "maxLength": 800
+              },
+              "expectations": {
+                "type": "array",
+                "description": "The checklist of assertions, matching the style of existing evals[].expectations.",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1
+              }
+            }
+          }
+        },
+        "if": {"properties": {"kind": {"const": "eval-case"}}, "required": ["kind"]},
+        "then": {"required": ["eval_sketch"]},
+        "else": {"not": {"required": ["eval_sketch"]}}
+      }
+    },
+    "scrub_check": {
+      "type": "object",
+      "description": "Self-attestation the summarizer fills in after writing the summary, confirming the generalized fields are safe to act on. The three flags are `const: true`, so a summary that self-attests a scrub failure fails schema validation outright. It is the first gate, not the last: a human still reviews the final PR.",
+      "additionalProperties": false,
+      "required": [
+        "proposed_changes_internal_free",
+        "proposed_changes_no_repo_specifics",
+        "no_secrets_in_proposed_changes"
+      ],
+      "properties": {
+        "proposed_changes_internal_free": {
+          "const": true,
+          "description": "Must be true: no proposed_changes field contains internal-only identifiers (internal service/tool/vendor names, internal dashboards, customer names). `const: true` so a non-confirming summary fails validation."
+        },
+        "proposed_changes_no_repo_specifics": {
+          "const": true,
+          "description": "Must be true: no proposed_changes field names the audited third-party repo's specifics (repo name, file path, job name, or run URL); behavioral lessons are generalized. `const: true` so a non-confirming summary fails validation."
+        },
+        "no_secrets_in_proposed_changes": {
+          "const": true,
+          "description": "Must be true: no proposed_changes field contains a token, key, or other secret surfaced in a job log. `const: true` so a non-confirming summary fails validation."
+        },
+        "notes": {
+          "type": "string",
+          "description": "OPTIONAL free-text on anything the human reviewer should double-check before merging.",
+          "maxLength": 600
+        }
+      }
+    }
+  }
+}

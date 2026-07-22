@@ -1,0 +1,15 @@
+[project]
+name = "ci-speedup"
+version = "1.0.0"
+description = "ci-speedup — measured CI optimization audits for GitHub Actions (wall-clock long poles + runner-minute waste)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "skills/ci-speedup/tests", "maintainers/ci-speedup/tests"]
+pythonpath = [".", "skills/ci-speedup/scripts", "maintainers/ci-speedup/scripts"]

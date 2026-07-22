@@ -1,0 +1,23 @@
+{
+  "total_count": 3,
+  "workflows": [
+    {
+      "id": 1001,
+      "name": "CI",
+      "path": ".github/workflows/ci.yml",
+      "state": "active"
+    },
+    {
+      "id": 1002,
+      "name": "Unit matrix",
+      "path": ".github/workflows/matrix.yml",
+      "state": "active"
+    },
+    {
+      "id": 1003,
+      "name": "Chained",
+      "path": ".github/workflows/chained.yml",
+      "state": "active"
+    }
+  ]
+}
