@@ -45,10 +45,18 @@ def _sans_provenance(report: str) -> str:
 
 
 def _example_findings() -> list[Path]:
-    fs = sorted(_EXAMPLES.glob("*/findings.json"))
-    if not fs:
-        pytest.skip("no findings.json found under examples/ — nothing to freshness-check")
-    return fs
+    """Discover the corpus from committed `.md` reports, not from `findings.json` —
+    an example report with no `findings.json` is exactly the staleness risk this
+    guard exists to catch, so it must fail loudly here rather than being silently
+    dropped by globbing on the file that's missing."""
+    reports = sorted(_EXAMPLES.glob("*/ci-speedup-findings-report.md"))
+    if not reports:
+        pytest.skip("no example reports found under examples/ — nothing to freshness-check")
+    missing = [r.parent.name for r in reports if not (r.parent / "findings.json").exists()]
+    assert not missing, (
+        f"example report(s) with no committed findings.json to freshness-check "
+        f"against: {missing}. Commit a findings.json (or remove the stale report).")
+    return [r.parent / "findings.json" for r in reports]
 
 
 def _load_verify_report():
@@ -64,8 +72,13 @@ def _load_verify_report():
     return mod
 
 
-def _render_fresh(findings_path: Path, out_path: Path) -> str:
-    """Render `findings.json` with the CURRENT renderer and return the markdown."""
+def _render_fresh(findings_path: Path, out_path: Path) -> tuple[str, str]:
+    """Render `findings.json` with the CURRENT renderer and return (markdown, claims_json).
+
+    `blocking_path.py --out <out_path>` also writes `<out_path>.claims.json` as a
+    side effect — that sidecar is a committed artifact too, so it must come back
+    from the same fresh render the markdown does.
+    """
     r = subprocess.run(
         [sys.executable, str(_REPO / "skills" / "ci-speedup" / "scripts" / "blocking_path.py"),
          "--in", str(findings_path), "--out", str(out_path)],
@@ -75,19 +88,26 @@ def _render_fresh(findings_path: Path, out_path: Path) -> str:
     assert len(report) > 2000, (
         f"fresh render of {findings_path.parent.name} is only {len(report)} chars — "
         "degenerate render (would pass content scans vacuously)")
-    return report
+    claims_path = out_path.parent / (out_path.name + ".claims.json")
+    assert claims_path.exists(), (
+        f"fresh render of {findings_path.parent.name} produced no "
+        f"{claims_path.name} sidecar")
+    claims_json = claims_path.read_text(encoding="utf-8")
+    return report, claims_json
 
 
 @pytest.fixture(scope="module")
 def fresh_reports(tmp_path_factory):
     """Render each committed examples/*/findings.json ONCE, shared across every
-    test below that asks for it — a list of (repo, findings_path, md_path, rendered_text)."""
+    test below that asks for it — a list of
+    (repo, findings_path, md_path, rendered_text, rendered_claims_json)."""
     out_dir = tmp_path_factory.mktemp("fresh_examples")
     out = []
     for fj in _example_findings():
         repo = fj.parent.name
         md = out_dir / f"{repo}.md"
-        out.append((repo, fj, md, _render_fresh(fj, md)))
+        report, claims_json = _render_fresh(fj, md)
+        out.append((repo, fj, md, report, claims_json))
     return out
 
 
@@ -95,7 +115,7 @@ def test_example_report_matches_a_fresh_render(fresh_reports):
     """A committed example must be exactly what today's renderer produces from its
     committed findings.json — provenance stamp aside. Catches silent staleness."""
     stale = []
-    for repo, fj, _md, fresh in fresh_reports:
+    for repo, fj, _md, fresh, _claims in fresh_reports:
         committed_md = fj.parent / "ci-speedup-findings-report.md"
         committed = committed_md.read_text(encoding="utf-8")
         if _sans_provenance(committed) != _sans_provenance(fresh):
@@ -106,6 +126,27 @@ def test_example_report_matches_a_fresh_render(fresh_reports):
         "ci-speedup-findings-report.md`) and commit the result.")
 
 
+def test_example_claims_sidecar_matches_a_fresh_render(fresh_reports):
+    """The committed `<report>.claims.json` sidecar must match what today's renderer
+    produces from the committed findings.json. The sidecar carries no provenance
+    stamp, so this is a plain equality check (unlike the .md comparison above)."""
+    stale = []
+    for repo, fj, _md, _fresh, fresh_claims in fresh_reports:
+        committed_claims_path = (
+            fj.parent / "ci-speedup-findings-report.md.claims.json")
+        assert committed_claims_path.exists(), (
+            f"{repo}: no committed ci-speedup-findings-report.md.claims.json "
+            "sidecar for a repo that ships findings.json")
+        committed_claims = committed_claims_path.read_text(encoding="utf-8")
+        if committed_claims != fresh_claims:
+            stale.append(repo)
+    assert not stale, (
+        f"committed example claims sidecar(s) no longer match a fresh render: "
+        f"{stale}. Re-render (`blocking_path.py --in findings.json --out "
+        "ci-speedup-findings-report.md`) and commit the regenerated "
+        "*.claims.json alongside it.")
+
+
 def test_example_fresh_render_passes_verify_report_invariants(fresh_reports):
     """verify_report over a FRESH render of each committed examples/*/findings.json
     (real data, current renderer) — a renderer/verifier drift fails here, not just
@@ -113,7 +154,7 @@ def test_example_fresh_render_passes_verify_report_invariants(fresh_reports):
     skipped wholesale, so a real regression can't hide behind a whole-repo skip."""
     vr = _load_verify_report()
     failures: list[str] = []
-    for repo, fj, md, report in fresh_reports:
+    for repo, fj, md, report, _claims in fresh_reports:
         fired: set[str] = set()
         for c in vr.run_checks(report, md, fj, skill_repo=None):
             if c.skipped:
