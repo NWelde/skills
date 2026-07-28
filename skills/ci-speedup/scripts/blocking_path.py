@@ -278,17 +278,86 @@ def _defuse_backtick_runs(s: str) -> str:
     return _FENCE_RUN_RE.sub(lambda m: "'" * len(m.group(0)), s)
 
 
+# Credential masking (#12, skills.sh Snyk W007). The quoted evidence is verbatim
+# third-party job-log / workflow-YAML text, and the report is the artifact users commit
+# and share. GitHub masks the secrets it KNOWS about (registered ones) in its own log
+# output — that stays the first layer — but an accidentally-echoed unregistered token
+# reaches the captured log in the clear. So mask credential-SHAPED strings here too,
+# deterministically, at the same sink that defuses backtick runs.
+#
+# SHAPED patterns only, deliberately: no entropy heuristic. A report whose step names,
+# durations, run URLs or 40-hex provenance shas came back `[REDACTED:...]` would be
+# useless, and a bare sha is not a credential. Each entry masks its WHOLE match.
+_SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"
+                                r"|\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{30,}")),
+    ("docker-token", re.compile(r"\bdckr_pat_[A-Za-z0-9_-]{20,}")),
+    # OpenAI / Anthropic style. Anchored on the `sk-` prefix AND a >=20-char alphanumeric
+    # tail, so a hyphenated step name can't reach it.
+    ("llm-api-key", re.compile(r"\bsk-(?:proj-|ant-[a-z0-9]+-|live-|test-)?[A-Za-z0-9]{20,}")),
+)
+# The un-shaped catch-all: `<key> = <value>` / `<key>: <value>`. Only the VALUE is masked
+# (the key name is half the diagnostic value of the line). The key may carry the usual
+# env-var prefix (`NPM_TOKEN=`, `GH_API_KEY:`) — the plain `\btoken\b` form would miss
+# every real-world log line, since `_` is a word char. An HTTP auth SCHEME word may sit
+# between the separator and the value (`Authorization: Bearer <opaque>` is the single most
+# common real form, and the value — not the scheme — is the credential). The value must be
+# >=8 chars AND (a digit anywhere OR >=16 chars), so ordinary prose (`token: yes`,
+# `authorization: required`) and timing lines are left alone. The lookahead makes the mask
+# idempotent.
+_ASSIGN_SECRET_RE = re.compile(
+    r"(?i)\b(?:[A-Za-z0-9]+[._-])*"
+    r"(?:token|secret|password|passwd|api[_-]?key|authorization|bearer)\b\s*[=:]\s*"
+    r"(?:(?:bearer|basic|token)\s+)?"
+    r"(?!\[REDACTED:)(\S{8,})")
+# A value that is a variable REFERENCE, not a value: `${{ secrets.X }}` (the actions
+# expression, with or without inner spaces), `${VAR}`, `$VAR`, `%VAR%`. These are exactly
+# what a correctly-written workflow YAML line looks like, and they are the lines the
+# catalog detectors quote as evidence — masking them would destroy the diagnostic and
+# falsely suggest the repo hardcodes a token.
+_ASSIGN_VAR_REF_RE = re.compile(r"^(?:\$\{\{?[^}]*\}?\}|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%)")
+
+
+def _redact_secrets(s: str) -> str:
+    """Mask credential-shaped substrings in one line of untrusted third-party text,
+    replacing each with `[REDACTED:<kind>]` and KEEPING the surrounding words so the
+    evidence stays interpretable. Idempotent, and a no-op on text with no credential
+    shape in it (the overwhelmingly common case)."""
+    for kind, pat in _SECRET_PATTERNS:
+        s = pat.sub(f"[REDACTED:{kind}]", s)
+
+    def _assign(m: "re.Match[str]") -> str:
+        val = m.group(1)
+        if not (len(val) >= 16 or any(c.isdigit() for c in val)):
+            return m.group(0)          # `password: changeme` — prose, not a credential
+        if _ASSIGN_VAR_REF_RE.match(val):
+            return m.group(0)          # `TOKEN: ${{secrets.X}}` — a reference, not a value
+        return m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED:credential]"
+
+    return _ASSIGN_SECRET_RE.sub(_assign, s)
+
+
 def _fence_safe(s: object) -> str:
     """Make one line of repo-controlled free text safe to drop into a ```text fence (a
     waterfall label, a verbatim log/YAML evidence line): defuse >=3-backtick runs, collapse
     any embedded newline/CR run to a single space (a name/step/log line is ONE line — an
     embedded newline could otherwise become its own all-backtick line and close the fence),
-    and strip dangerous control chars (tab kept). BYTE-IDENTICAL for clean single-line input
-    (no >=3-backtick run, no newline, no control char) — every normal name/label/evidence
-    line passes through unchanged."""
+    strip dangerous control chars (tab kept), and mask credential-shaped strings (#12).
+    BYTE-IDENTICAL for clean single-line input (no >=3-backtick run, no newline, no control
+    char, no credential shape) — every normal name/label/evidence line passes through
+    unchanged. This is the ONE chokepoint every verbatim log/YAML line, every repo-controlled
+    name and every agent-prompt line already flows through (directly, or via `_clean_label` /
+    `_safe_span` / `_fence_body`), so the mask covers the whole class by construction instead
+    of site by site."""
     s = _FENCE_CTRL_RE.sub("", str(s))
     s = re.sub(r"[\r\n]+", " ", s)
-    return _defuse_backtick_runs(s)
+    return _redact_secrets(_defuse_backtick_runs(s))
 
 
 def _safe_span(s: object) -> str:
@@ -2780,7 +2849,12 @@ def _llm_analysis_block(a: dict[str, Any], cross_run_rendered: bool = False) -> 
     suppresses that section, so the citation must be suppressed too, or it dangles)."""
     if not isinstance(a, dict):
         return []
-    cause = str(a.get("cause", "")).strip()
+    # `cause`/`breakdown` are LLM prose ABOUT the log, so they can echo a credential the
+    # log carried. They render as markdown (not in a fence), so they don't pass through
+    # `_fence_safe` — mask them here. The `evidence` lines and the `prompt` do go through
+    # `_fence_safe`/`_fence_body`; these two fields are the only untrusted-derived text
+    # that bypasses it, which makes this the second (and last) masking chokepoint.
+    cause = _redact_secrets(str(a.get("cause", "")).strip())
     breakdown = a.get("breakdown") or []
     evidence = a.get("evidence") or []
     if not (cause or breakdown or evidence):
@@ -2798,9 +2872,9 @@ def _llm_analysis_block(a: dict[str, Any], cross_run_rendered: bool = False) -> 
         out += ["**Where the time likely goes (LLM reading of the log):**", ""]
         for row in breakdown:
             if isinstance(row, (list, tuple)) and len(row) >= 2:
-                out.append(f"- {row[0]} - {row[1]}")
+                out.append(_redact_secrets(f"- {row[0]} - {row[1]}"))
             else:
-                out.append(f"- {row}")
+                out.append(_redact_secrets(f"- {row}"))
         out.append("")
     if evidence:
         out += ["**Evidence — verbatim from the captured job log:**", "",
@@ -4493,9 +4567,15 @@ def _flatten_cell(text: str) -> str:
     """A markdown table cell can't contain a raw newline or an unescaped pipe — and a
     >=3-backtick run in the repo evidence text that flows through here (structural /
     workflow-YAML `evidence`) would break out of a ```text fence elsewhere in the report
-    AND desync `verify_report`'s fence split, so defuse it here too. No-op on clean cells."""
-    return _defuse_backtick_runs(
-        re.sub(r"\s+", " ", str(text)).replace("|", "\\|").strip())
+    AND desync `verify_report`'s fence split, so defuse it here too. No-op on clean cells.
+
+    This is the THIRD untrusted-text sink (with `_fence_safe` and `_llm_analysis_block`):
+    the appendix `**Evidence:**` lines and the Tier-2 / structural rows quote workflow-YAML
+    verbatim through here WITHOUT going through `_fence_safe`, and a hardcoded token in a
+    workflow file is the most likely place a credential is quoted from — so mask here too
+    (#12). Masking is a no-op on clean cells, so the byte-identity contract holds."""
+    return _redact_secrets(_defuse_backtick_runs(
+        re.sub(r"\s+", " ", str(text)).replace("|", "\\|").strip()))
 
 
 def _dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
