@@ -2280,3 +2280,126 @@ def test_door_derive_without_prepass_is_flagged_not_silently_clamped():
         assert f["runner_min_saving"] == 5000.0, "not silently clamped to measured"
     finally:
         del _RM_DOOR_OVERRIDES["OPT_TEST_DERIVE"]
+
+
+# --- issue #2: YAML key ↔ `name:` override join -------------------------------
+# biomejs/biome: OPT33 names its job by YAML KEY (`lint` in pull_request.yml), but
+# the spine records that job under its `name:` OVERRIDE, expanded per matrix leg
+# (`Lint project (depot-ubuntu-24.04-arm-16)` + `(depot-windows-2022)`, Σ 13,381.6
+# min/mo). The bare key missed the join, and the cross-workflow same-name FALLBACK
+# then mis-bound it to an UNRELATED job literally named `lint` in
+# pull_request_markdown.yml (553.0) → false FAIL. The join must resolve key ↔ name
+# through the scanned `workflow_job_graph`, and a same-workflow resolution must
+# always beat the cross-workflow fallback.
+_NAME_WF = ".github/workflows/pull_request.yml"
+_NAME_OTHER_WF = ".github/workflows/pull_request_markdown.yml"
+_NAME_ROWS = [
+    (_NAME_WF, "Lint project (depot-ubuntu-24.04-arm-16)", 2411.8),
+    (_NAME_WF, "Lint project (depot-windows-2022)", 10969.8),   # Σ Lint project = 13,381.6
+    (_NAME_OTHER_WF, "lint", 553.0),                            # UNRELATED job, same bare name
+]
+_NAME_BILLABLE = 13381.6
+_NAME_GRAPH = {
+    _NAME_WF: {"lint": {"name": "Lint project", "needs": [], "matrix": True}},
+    _NAME_OTHER_WF: {"lint": {"name": "lint", "needs": [], "matrix": False}},
+}
+
+
+def _name_doc(saving: float, jobs=("lint",), wf=_NAME_WF, graph=_NAME_GRAPH) -> dict:
+    doc = {"findings": [{"pattern": "OPT33", "workflow_file": wf,
+                         "affected_jobs": list(jobs), "runner_min_saving": saving}],
+           "runner_minute_spine": {"render_ready": True, "rows": [
+               {"workflow_file": w, "job_name": j, "billable_equiv_min_per_month": b}
+               for w, j, b in _NAME_ROWS]}}
+    if graph is not None:
+        doc["workflow_job_graph"] = graph
+    return doc
+
+
+def _name_result(doc: dict, tmp_path):
+    import json
+    vr = _load_verify_report_for_bounds()
+    fp = tmp_path / "name-override-findings.json"
+    fp.write_text(json.dumps(doc), encoding="utf-8")
+    return vr.check_saving_within_measured_compute("# report\n", fp)
+
+
+def test_name_overridden_job_binds_via_the_scanned_job_graph(tmp_path):
+    # THE issue #2 shape. 3187.9 is well within the real job's 13,381.6 measured
+    # compute; pre-fix the key `lint` fell through to the cross-workflow fallback
+    # and bound the unrelated 553.0 job → false FAIL.
+    res = _name_result(_name_doc(3187.9), tmp_path)
+    assert res.ok and not res.skipped, res.detail
+    assert "partial coverage" not in res.detail and "coverage gap" not in res.detail
+
+
+def test_name_override_join_aggregates_matrix_legs_and_beats_the_fallback(tmp_path):
+    # The bound is the SUM of the resolved job's matrix legs (13,381.6) — not one
+    # leg, and never the same-named foreign job (553.0). A credit just above the
+    # summed legs still FAILs, so the wider join never becomes a blanket pass.
+    assert _name_result(_name_doc(_NAME_BILLABLE * 0.99), tmp_path).ok
+    over = _name_result(_name_doc(_NAME_BILLABLE * 1.10), tmp_path)
+    assert not over.ok and not over.skipped
+    assert "13381.6" in over.detail   # bounded by the real job, not the 553.0 namesake
+
+
+def test_name_override_join_resolves_a_display_name_back_to_its_key(tmp_path):
+    # Reverse direction: a finding that names the DISPLAY name resolves the same
+    # way (and a bare leg name still folds into its base's summed compute).
+    assert _name_result(_name_doc(3187.9, jobs=("Lint project",)), tmp_path).ok
+    assert _name_result(
+        _name_doc(3187.9, jobs=("Lint project (depot-windows-2022)",)), tmp_path).ok
+
+
+def test_name_override_join_leaves_an_absent_job_uncovered(tmp_path):
+    # No new severity semantics: a job genuinely absent from the spine stays a
+    # coverage gap (nothing bounded → loud SKIP), exactly as before the fix.
+    res = _name_result(_name_doc(3187.9, jobs=("documentation",)), tmp_path)
+    assert res.skipped and "coverage gap" in res.detail
+
+
+def test_name_override_alias_never_widens_the_cross_workflow_fallback(tmp_path):
+    # A graph-resolved alias is evidence about ITS OWN workflow only. `deploy` in
+    # pull_request.yml renders as `Deploy app` but has NO spine row there; an
+    # UNRELATED `Deploy app` in another workflow bills 50,000. Carrying the alias
+    # into the cross-workflow fallback would bind that foreign compute and let a
+    # 40,000 credit read "within measured compute" — an inflated upper bound
+    # masking an oversized finding. The fallback stays on the LITERAL base, so
+    # this stays an honest coverage gap (nothing bounded → loud SKIP).
+    doc = _name_doc(40000.0, jobs=("deploy",))
+    doc["workflow_job_graph"] = {
+        _NAME_WF: {"deploy": {"name": "Deploy app", "needs": [], "matrix": False}},
+        _NAME_OTHER_WF: {"deploy_app": {"name": "Deploy app", "needs": [], "matrix": False}},
+    }
+    doc["runner_minute_spine"]["rows"].append(
+        {"workflow_file": _NAME_OTHER_WF, "job_name": "Deploy app",
+         "billable_equiv_min_per_month": 50000.0})
+    res = _name_result(doc, tmp_path)
+    assert res.skipped and "coverage gap" in res.detail, res.detail
+
+
+def test_name_override_alias_skips_a_colliding_display_name(tmp_path):
+    # Two job KEYS in one workflow rendering to the SAME display name are one row in
+    # the spine (which indexes by name), so that row's compute belongs to BOTH jobs.
+    # Aliasing either key onto it would bound the finding by the SUM and inflate the
+    # ceiling — a 9,000 credit against a 5,000-min job would read "within measured
+    # compute" off its twin's 5,000. An ambiguous name yields no alias, so this stays
+    # an honest coverage gap (nothing bounded → loud SKIP).
+    doc = _name_doc(9000.0, jobs=("test_unit",))
+    doc["workflow_job_graph"] = {
+        _NAME_WF: {"test_unit": {"name": "Test suite", "needs": [], "matrix": False},
+                   "test_e2e": {"name": "Test suite", "needs": [], "matrix": False}},
+    }
+    doc["runner_minute_spine"]["rows"].append(
+        {"workflow_file": _NAME_WF, "job_name": "Test suite",
+         "billable_equiv_min_per_month": 10000.0})
+    res = _name_result(doc, tmp_path)
+    assert res.skipped and "coverage gap" in res.detail, res.detail
+
+
+def test_name_override_join_without_a_graph_keeps_the_legacy_fallback(tmp_path):
+    # An artifact predating `workflow_job_graph` keeps today's behavior: the bare
+    # key resolves only through the cross-workflow same-name fallback (553.0), so
+    # the same credit FAILs. The graph is what makes the join correct.
+    res = _name_result(_name_doc(3187.9, graph=None), tmp_path)
+    assert not res.ok and not res.skipped and "553" in res.detail
