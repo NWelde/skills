@@ -883,9 +883,23 @@ def _agg_gate_shape(pole: dict[str, Any], job_graph: dict[str, Any] | None,
         if not matched:
             unmeasured.append(nm)
             continue
-        top = max(matched, key=lambda c: _num(c.get("p50_s")) or 0.0)
-        if slowest is None or ((_num(top.get("p50_s")) or 0.0)
-                               > (_num(slowest.get("p50_s")) or 0.0)):
+        # Rank the upstream members by the SECONDS their own drilled pole HEADER would show
+        # (`_pole_headline(c)[0]`, the bimodal-aware header duration), NOT the bare p50. Both
+        # max() calls: WITHIN a matrix job's legs (`top`) and ACROSS jobs (`slowest`). Selecting
+        # by p50 named the p50-slowest sibling while the member that actually CAPS the sink's
+        # `needs:` wait is the one whose bimodal SLOW mode is the true ceiling (a matrix leg whose
+        # blended p50 sits below a faster-median sibling but whose slow mode exceeds it) — so the
+        # sink pointed the reader at the wrong lever, and the pole it links to (headlined at its
+        # slow mode) showed a longer time than the sink named (issue #22 class). We rank by
+        # `_pole_headline`, NOT `_eff_floor_s`: for a member whose median sits on the FAST cluster
+        # `_pole_headline` returns the slow mode (== `_eff_floor_s`, the #22 case we must catch),
+        # but for a member whose median ALREADY sits in the SLOW cluster it returns the p50 that
+        # its header shows (`_eff_floor_s` would over-state that to the high mode). Ranking AND
+        # rendering by the header value keeps the pick, its quoted duration, and the linked pole's
+        # header in exact agreement — `_eff_floor_s` would quote a duration ABOVE the linked pole's
+        # header on a slow-median member (greptile P1).
+        top = max(matched, key=lambda c: _pole_headline(c)[0])
+        if slowest is None or _pole_headline(top)[0] > _pole_headline(slowest)[0]:
             slowest = top
     if slowest is None:
         return None
@@ -8418,7 +8432,15 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
             # aggregates. Say that, name the slowest measured upstream member, and (below)
             # render NO drill and NO "optimize this step" prompt for the sink itself.
             _ag_slow = _clean_label(_check_name(_agg["slowest"]))
-            _ag_dur = _clock(_num(_agg["slowest"].get("p50_s")))
+            # Render the member's own drilled-pole HEADER duration (`_pole_headline(...)[0]`), not
+            # the bare p50 and not `_eff_floor_s` — it MUST agree with the selection above (which
+            # ranks by the same header value) or the sink would name a member `X` yet quote a
+            # duration SMALLER than an unnamed sibling, and it MUST equal the header of the very
+            # pole its "Where the wait actually is" pointer links to. `_eff_floor_s` (always the
+            # high mode) satisfies neither on a member whose median already sits IN the slow
+            # cluster: there `_pole_headline` shows the p50 the linked pole's header shows, while
+            # `_eff_floor_s` would over-quote the high mode above it (issue #22 / greptile P1).
+            _ag_dur = _clock(_pole_headline(_agg["slowest"])[0])
             # BOTH caveats compose — they are independent, and neither may silently drop the
             # other. "Runs no work of its own" rests on the measured P50 plus the `needs:`
             # structure whenever no per-step data was captured, so that basis is disclosed on
@@ -8465,7 +8487,92 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
                 # one "the slowest"; that would contradict the headline's truthful split.
                 # Quote `floor_name`'s OWN time (`slowest_dur`); it only "sets the wall-clock
                 # floor" when it isn't a non-universal check (else a median PR finishes sooner).
-                _sets_floor = "" if floor_lowered else ", which sets the wall-clock floor"
+                #
+                # Effective-floor honesty (issue #22 class). `floor_name`/`slowest_dur` come from
+                # `src[0]` — the p50-slowest TYPICAL check — and are STAMP-BOUND to the data
+                # layer's p50-based `critical_path_check`
+                # (`verify_report.check_headline_slowest_matches_stamp`). Re-ranking THIS pick to
+                # the effective floor would desync the headline from its stamp (which is NOT
+                # bimodal-aware), so we keep the p50 pick and instead DISCLOSE the true ceiling
+                # beside it: when we would otherwise credit `floor_name` with setting the
+                # wall-clock floor (`not floor_lowered`), consult `_binding_floor` over the
+                # concurrent set (the pole itself excluded, mirroring `_floor_note`). `_others` is
+                # the FULL concurrent set minus the gate (managed checks INCLUDED), exactly
+                # `_floor_note`'s pool, so `_bf` is the SAME binding floor `_floor_note` computes —
+                # the two can never name different checks as the cap.
+                #
+                # Gate AND quote by `_pole_headline(_bf)[0]` (the seconds `_bf`'s OWN drilled-pole
+                # header would show), NOT frac-blind `_eff_floor_s` — the same choice site A makes.
+                # `_pole_headline` returns the slow mode only for a WELL-FORMED bimodal whose median
+                # sits on the fast cluster (`hi and lo and frac and hi > p50*1.15 and p50 <= mid`),
+                # else the p50. So (i) the quoted duration equals `_bf`'s own header (no "names a
+                # check at a time its drill contradicts"), and (ii) a DEGENERATE bimodal (missing
+                # `low_p50_s`/`slow_frac`, or `slow_frac == 0`) can't fire a phantom "slow mode on
+                # ~0% of runs" — `_eff_floor_s` would, reading only `high_p50_s`.
+                #
+                # Three outcomes, so `floor_name` is NEVER credited with a floor a slower sibling
+                # actually sets (greptile: "managed floor is misattributed"):
+                #   (a) `_bf` out-floors `floor_name` AND is FILE-BACKED → name it as the tunable
+                #       ceiling to attack ("sets the wall-clock floor on slow-mode PRs").
+                #   (b) `_bf` out-floors `floor_name` but is MANAGED/external (no `workflow_file`)
+                #       → DROP the floor claim entirely (`_sets_floor = ""`). We must not credit
+                #       `floor_name` (a slower check genuinely caps the merge), but must not frame
+                #       an untunable managed check as attackable here either — `_floor_note` owns
+                #       the managed cap's disclosure via its dedicated "no workflow file to speed up
+                #       here `X`" phrasing. So the role line names the slowest TYPICAL check and
+                #       stays silent on the floor, which `_floor_note` sets straight.
+                #   (c) nothing out-floors `floor_name` → it genuinely sets the floor; keep the
+                #       plain ", which sets the wall-clock floor" (as before).
+                #
+                # SPINE-DISCLOSURE NOTE (not a disclosure mechanism of its own). This clause's tail
+                # phrasing is NOT one `verify_report._SPINE_FLOOR_NAME_RE` reads, and it adds no new
+                # spine-disclosure obligation: `check_spine_heavy_check_disclosed` keys on each
+                # DRILLED pole's binding floor re-derived from `populations`, independent of this
+                # text. A file-backed `_bf` that must be disclosed there is disclosed by ITS OWN
+                # drilled-pole header (a heavy concurrent check is normally a pole) — NOT by the gate
+                # pole's `_floor_note`, which is suppressed whenever this clause fires (`binding_s >=
+                # pole_p` for the gate). `verify_report` is untouched by this change, so the
+                # obligation set and the satisfaction set are exactly `main`'s.
+                _others = [c for c in floor_pool
+                           if _clean_label(_check_name(c)) != gate_check]
+                _bf = (_binding_floor(_others, p.get("_cooccur"),
+                                      int(p.get("_gating_n") or 0))
+                       if (not floor_lowered and _others) else None)
+                # `_bf_caveat` is non-empty ONLY when `_pole_headline`'s bimodal override fired —
+                # `_bf` is a genuine fast-median bimodal whose SLOW mode is a hidden ceiling
+                # (`_bf_hd` == that slow mode). Require it: the clause's wording asserts a "bimodal
+                # slow mode … on slow-mode PRs", so it must NOT fire for a UNIMODAL `_bf` whose
+                # plain p50 merely out-ranks `floor_name` (a heavy path-conditional/minority check
+                # from `floor_pool` that isn't in the typical `src` — the lightdash `E2E` class).
+                # Such a check doesn't run on a TYPICAL PR, so it does not out-floor the typical
+                # wait the role line describes; `floor_name` genuinely sets that floor (outcome c),
+                # and the heavy check's own gating is disclosed on its DRILLED pole, not here.
+                # Without this guard the clause would print "bimodal slow mode … on slow-mode PRs"
+                # for a check that is neither (silent-failure-hunter).
+                _bf_hd, _bf_caveat = _pole_headline(_bf) if _bf is not None else (0.0, "")
+                _bf_outfloors = (_bf is not None and bool(_bf_caveat)
+                                 and _clean_label(_check_name(_bf)) != floor_name
+                                 and _bf_hd > (slowest_p50 or 0.0) + 0.5)
+                if _bf_outfloors and str(_bf.get("workflow_file") or ""):
+                    _bf_name = _clean_label(_check_name(_bf))
+                    _sets_floor = (f"; but `{_bf_name}`'s bimodal slow mode "
+                                   f"(~{_clock(_bf_hd)}) runs longer, so it — not "
+                                   f"`{floor_name}` — sets the wall-clock floor on slow-mode PRs")
+                elif _bf_outfloors:
+                    # Managed/external `_bf` (no `workflow_file`) out-floors `floor_name`. Don't
+                    # credit `floor_name`, and don't frame the untunable check as attackable — but
+                    # DO name it as the real cap, using `_floor_note`'s "no workflow file to speed
+                    # up here `X`" phrasing (the form `verify_report._SPINE_FLOOR_NAME_RE` reads).
+                    # This DISCLOSES the managed ceiling on the spine even when the gate pole's own
+                    # `_floor_note` is suppressed (`binding_s >= pole_p`, which always holds when
+                    # this clause fires), closing the managed-floor disclosure gap rather than
+                    # leaving the capping check named nowhere.
+                    _bf_name = _clean_label(_check_name(_bf))
+                    _sets_floor = (f"; but a concurrent check with no workflow file to speed up "
+                                   f"here, `{_bf_name}` (~{_clock(_bf_hd)}), runs longer — so it, "
+                                   f"not `{floor_name}`, caps the wall-clock floor on slow-mode PRs")
+                else:
+                    _sets_floor = "" if floor_lowered else ", which sets the wall-clock floor"
                 role = (f"**The check most PRs gate on.** A typical PR waits on this most "
                         f"often; the slowest concurrent check is `{floor_name}` "
                         f"(~{slowest_dur}){_sets_floor}.")
