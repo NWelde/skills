@@ -24,43 +24,72 @@ sys.path.insert(0, str(_SCRIPTS))
 
 import blocking_path as bp  # noqa: E402  (uniquely-named module; no cross-skill clash)
 
-# Assembled at import time, never written as a literal: GitHub's own push protection
-# rejects a push whose files CONTAIN a Slack-token-shaped string - fake or not. (The rest of
-# the shapes below are inert enough to store verbatim; this one is not.)
-_FAKE_SLACK = "xox" + "b-2411000000-2411000000-AbCdEfGhIjKlMnOpQrStUvWx"
+# Every PROVIDER-SHAPED fixture below is assembled at import time from halves that are
+# each inert on their own - none is written as a literal, and each split breaks the
+# provider prefix the detectors key on. Two scanners have already proven why: GitHub's
+# push protection rejects a push whose files CONTAIN a Slack-token-shaped string (fake or
+# not), and GitHub secret scanning raised an "Action needed: possible valid secret" alert
+# on the Google-key literal this file used to carry. A fixture that LOOKS like a
+# credential to us looks like one to every scanner that reads the shipped tree.
+#
+# `_fixture()` rather than a bare `"a" + "b"`: adjacent string literals are folded into
+# the finished value at compile time, so a static analyzer that evaluates constant
+# expressions reconstructs exactly the string we are hiding. A call is not folded.
+#
+# The remaining fixtures - the generic hex/opaque values and the `Bearer` payload - carry
+# no provider prefix and match no scanner's shape, so they stay verbatim. Do not
+# "simplify" the assembled ones back into literals.
+def _fixture(*parts: str) -> str:
+    return "".join(parts)
+
+
+_FAKE_SLACK = _fixture("xox", "b-2411000000-2411000000-AbCdEfGhIjKlMnOpQrStUvWx")
+_FAKE_GHP = _fixture("ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
+_FAKE_GHO = _fixture("gho_", "9zYx8Wv7Ut6Sr5Qp4On3Ml2Kj1Ih0Gf9Ed8")
+_FAKE_GH_PAT = _fixture("github_", "pat_11ABCDEFG0aBcDeFgHiJkL_mNoPqRsTuVwXyZ012345")
+_FAKE_AWS = _fixture("AKIA", "IOSFODNN7EXAMPLE")  # AWS's documented example key
+_FAKE_AWS_SESSION = _fixture("ASIA", "Y34FZKBOKMUTVV7A")
+_FAKE_JWT = _fixture("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", ".",
+                     "eyJzdWIiOiIxMjM0NTY3ODkwIn0", ".",
+                     "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
+_FAKE_GOOGLE = _fixture("AIza", "SyD-1234567890abcdefghijklmnopqrstu")
+_FAKE_NPM = _fixture("npm_", "9f3a1c7e5b2d4086abcd1234")
+_FAKE_NPM_PUBLISH = _fixture("npm_", "1a2b3c4d5e6f7g8h9i0jKLMNOPQRSTUVWXYZ")
+_FAKE_DOCKER = _fixture("dckr_", "pat_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123")
+_FAKE_OPENAI = _fixture("sk-", "proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4")
+_FAKE_PEM_HEADER = _fixture("-----BEGIN RSA ", "PRIVATE KEY-----")
 
 # (label, line as it appears in a log, the secret substring that must not survive, kind)
 _SECRET_LINES = [
     ("github classic token",
-     "fatal: could not read Password for 'https://ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8@github.com'",
-     "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8", "github-token"),
+     f"fatal: could not read Password for 'https://{_FAKE_GHP}@github.com'",
+     _FAKE_GHP, "github-token"),
     ("github oauth token",
-     "env GH_TOKEN=gho_9zYx8Wv7Ut6Sr5Qp4On3Ml2Kj1Ih0Gf9Ed8 exported by setup step",
-     "gho_9zYx8Wv7Ut6Sr5Qp4On3Ml2Kj1Ih0Gf9Ed8", "github-token"),
+     f"env GH_TOKEN={_FAKE_GHO} exported by setup step",
+     _FAKE_GHO, "github-token"),
     ("github fine-grained PAT",
-     "curl -H 'Authorization: token github_pat_11ABCDEFG0aBcDeFgHiJkL_mNoPqRsTuVwXyZ012345'",
-     "github_pat_11ABCDEFG0aBcDeFgHiJkL_mNoPqRsTuVwXyZ012345", "github-token"),
+     f"curl -H 'Authorization: token {_FAKE_GH_PAT}'",
+     _FAKE_GH_PAT, "github-token"),
     ("aws long-term access key",
-     "aws_access_key_id AKIAIOSFODNN7EXAMPLE used for the cache bucket",
-     "AKIAIOSFODNN7EXAMPLE", "aws-access-key"),
+     f"aws_access_key_id {_FAKE_AWS} used for the cache bucket",
+     _FAKE_AWS, "aws-access-key"),
     ("aws session access key",
-     "assumed role -> ASIAY34FZKBOKMUTVV7A (expires in 3600s)",
-     "ASIAY34FZKBOKMUTVV7A", "aws-access-key"),
+     f"assumed role -> {_FAKE_AWS_SESSION} (expires in 3600s)",
+     _FAKE_AWS_SESSION, "aws-access-key"),
     ("slack bot token",
      f"notify.sh: posting with {_FAKE_SLACK}", _FAKE_SLACK, "slack-token"),
     ("jwt",
-     "auth ok eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk done",
-     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-     "jwt"),
+     f"auth ok {_FAKE_JWT} done",
+     _FAKE_JWT, "jwt"),
     ("google api key",
-     "GOOGLE_MAPS=AIzaSyD-1234567890abcdefghijklmnopqrstu in the test env",
-     "AIzaSyD-1234567890abcdefghijklmnopqrstu", "google-api-key"),
+     f"GOOGLE_MAPS={_FAKE_GOOGLE} in the test env",
+     _FAKE_GOOGLE, "google-api-key"),
     ("private key header",
-     "-----BEGIN RSA PRIVATE KEY----- written to /tmp/deploy.pem",
-     "-----BEGIN RSA PRIVATE KEY-----", "private-key"),
+     f"{_FAKE_PEM_HEADER} written to /tmp/deploy.pem",
+     _FAKE_PEM_HEADER, "private-key"),
     ("generic assignment",
-     "  NPM_TOKEN=npm_9f3a1c7e5b2d4086abcd1234 (from the org secret)",
-     "npm_9f3a1c7e5b2d4086abcd1234", "credential"),
+     f"  NPM_TOKEN={_FAKE_NPM} (from the org secret)",
+     _FAKE_NPM, "credential"),
     ("generic colon form",
      "config: api-key: 8f2b91aa5c7d3e40 loaded",
      "8f2b91aa5c7d3e40", "credential"),
@@ -70,14 +99,14 @@ _SECRET_LINES = [
      "> Authorization: Bearer 7c1d0e9f8a6b5c4d3e2f1a09 (retrying)",
      "7c1d0e9f8a6b5c4d3e2f1a09", "credential"),
     ("npm publish token",
-     "npm notice using npm_1a2b3c4d5e6f7g8h9i0jKLMNOPQRSTUVWXYZ for registry auth",
-     "npm_1a2b3c4d5e6f7g8h9i0jKLMNOPQRSTUVWXYZ", "npm-token"),
+     f"npm notice using {_FAKE_NPM_PUBLISH} for registry auth",
+     _FAKE_NPM_PUBLISH, "npm-token"),
     ("docker hub pat",
-     "docker login -u ci -p dckr_pat_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123",
-     "dckr_pat_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123", "docker-token"),
+     f"docker login -u ci -p {_FAKE_DOCKER}",
+     _FAKE_DOCKER, "docker-token"),
     ("llm api key",
-     "OPENAI probe failed for sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4",
-     "sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2M3n4", "llm-api-key"),
+     f"OPENAI probe failed for {_FAKE_OPENAI}",
+     _FAKE_OPENAI, "llm-api-key"),
 ]
 
 # Lines the mask must leave BYTE-IDENTICAL. Ordinary CI text that superficially rhymes
@@ -126,10 +155,10 @@ def test_every_credential_shape_is_masked_with_its_kind():
 def test_masking_keeps_the_surrounding_evidence_readable():
     # Evidence stays interpretable: only the secret is replaced, never the whole line,
     # and a generic `key=value` keeps its KEY (which is half the diagnostic value).
-    out = bp._redact_secrets("  NPM_TOKEN=npm_9f3a1c7e5b2d4086abcd1234 (from the org secret)")
+    out = bp._redact_secrets(f"  NPM_TOKEN={_FAKE_NPM} (from the org secret)")
     assert out == "  NPM_TOKEN=[REDACTED:credential] (from the org secret)"
     out2 = bp._redact_secrets(
-        "aws_access_key_id AKIAIOSFODNN7EXAMPLE used for the cache bucket")
+        f"aws_access_key_id {_FAKE_AWS} used for the cache bucket")
     assert out2 == "aws_access_key_id [REDACTED:aws-access-key] used for the cache bucket"
 
 
