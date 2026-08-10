@@ -49,6 +49,56 @@ External contributions are welcome and follow the standard fork flow:
   `python3 -m pytest -v` runs in both places, so you can reproduce CI locally
   before you push.
 
+## Registry security scanning
+
+Skill registries publish third-party security audits of every skill they list, and
+a skill can fail one without failing anything in this repo — the text a skill ships
+is the thing being scanned, so an illustrative example can read to a scanner as the
+attack it describes. `.github/workflows/registry-scan.yml` runs one of those
+scanners (Snyk Agent Scan) over the installable trees under `skills/` on every
+internal pull request, on pushes to `main`, weekly on a schedule, and on demand, so
+a violation fails our build instead of appearing as a public FAIL badge days after
+release.
+
+Two things about that gate are worth knowing before you rely on it.
+
+**It reproduces one scanner, not all of them.** Registries run several. This gate
+covers Snyk Agent Scan only. It says nothing about Gen Agent Trust Hub — which
+publishes no rule catalog and no CLI, and whose verdicts are LLM-generated and not
+reproducible from one run to the next — or about Socket. A green check means "Snyk
+Agent Scan finds nothing we have not accepted", not "every registry scanner will
+pass".
+
+**Only critical findings block.** The scanner sorts findings into a critical class
+(`E`-codes) and a warning class (`W`-codes). A critical finding fails the build. A
+warning never does — warnings on these skills are usually accurate descriptions of
+what the skills legitimately do, such as W011 "exposure to untrusted third-party
+content", which is what reading a repository's own CI configuration and job logs
+looks like to a scanner. They are judged by a human, not by CI.
+
+Warnings are never hidden, though. Every run surfaces the full finding set three
+ways, because "does not block" must not quietly become "does not appear":
+
+- **Annotations** on the checks tab, one per warning — also readable through the
+  checks API, which is how an automated review agent picks them up.
+- **A job summary table** listing every finding, its code, severity, and skill.
+- **A `registry-scan-findings` artifact** holding the scanner's raw JSON, kept for
+  14 days. Review agents and tooling should read this rather than scraping the log:
+  `gh run download <run-id> --name registry-scan-findings`.
+
+If you are adding a warning code to the ignore list, it must be a `W`-code from
+[the scanner's published catalog](https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md),
+and it goes in both the workflow and `tests/test_registry_scan_workflow.py`. An
+`E`-code can never go in the ignore list — that would disarm the gate while leaving
+it green, and the tests fail if one appears.
+
+The gate needs a `SNYK_TOKEN` repository secret (a free Snyk account). Without it
+the job fails loudly rather than passing quietly — a skipped security scan reported
+as green is the exact failure this gate exists to prevent. Fork pull requests cannot
+reach repository secrets, so they get a separate, clearly named check that reports
+the coverage gap; a maintainer re-runs the scan on an internal branch before merging
+fork changes under `skills/`.
+
 ## Adding or changing detection patterns
 
 The pattern catalog is
