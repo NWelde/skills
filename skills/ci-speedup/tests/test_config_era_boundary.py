@@ -1948,3 +1948,51 @@ def test_spine_guard_is_registered():
     names = {c.name for c in vr.run_checks("# x\n", None, None, skill_repo=None)}
     assert ("the per-PR chain/makespan spine is bound to the kept config era "
             "(no dropped-era PR blends in)") in names
+
+
+# ── The era age phrase is anchored to the AUDIT, not to render-time `now()` (PR #11) ──────────────
+
+def _post_only_doc(boundary: str) -> dict:
+    """`_era_doc` plus a `post_only` straddle whose boundary is `boundary` — the shape that
+    renders the "`<wf>` changed ~N days ago — narrowed to the current configuration." note."""
+    doc = _era_doc()
+    doc["pr_critical_path"]["config_eras"] = [{
+        "workflow_file": _CI, "rule": "post_only", "boundary": boundary,
+        "post_count": 9, "pre_count": 11, "kept_era": "post", "spine_relevant": True,
+    }]
+    return doc
+
+
+def test_era_age_is_measured_to_scanned_at_not_render_time():
+    """The '~N days ago' in the era disclosure counts from the workflow's last change to the
+    AUDIT (`scanned_at` — the same instant the metadata table stamps as `Audit | ran`), not to
+    whenever someone happens to re-render. Anchoring it to `now()` made a re-render of archived
+    findings both self-contradictory (a report stamped `ran 2026-07-18` claiming the workflow
+    changed "~N days ago" counted to today) and non-reproducible: the bytes drifted a day at a
+    time, which is what the `examples/` freshness guard (tests/test_example_freshness.py) trips
+    on. `scanned_at` is 2026-07-18 and the boundary 10 days before it, so this is ~10 days
+    FOREVER — a re-anchor to render time makes this test go red on the next render, not silently
+    re-stale the committed examples."""
+    report = bp.render(_post_only_doc("2026-07-08T00:00:00Z"))
+    assert "changed ~10 days ago" in report, report[:2000]
+    assert bp._CONFIG_ERA_NARROWED_MARKER in report
+
+
+def test_era_age_still_honours_an_explicit_captured_at():
+    """`--captured-at` (the log-fetch instant, always >= `scanned_at`) still wins when the caller
+    supplies one — the fallback only fills the gap, it does not override."""
+    report = bp.render(_post_only_doc("2026-07-08T00:00:00Z"),
+                       captured_at="2026-07-20T00:00:00Z")
+    assert "changed ~12 days ago" in report, report[:2000]
+
+
+def test_era_age_falls_back_to_render_time_when_the_doc_stamps_no_scanned_at():
+    """No `scanned_at` and no `--captured-at` (a hand-built / legacy doc) keeps the historical
+    `now()` behaviour: an age phrase measured to render time is still better than losing the
+    disclosure's age entirely, so `_age_anchor` returns "" rather than a bogus instant."""
+    doc = _post_only_doc("2026-07-08T00:00:00Z")
+    doc.pop("scanned_at")
+    assert bp._age_anchor(doc, "") == ""
+    report = bp.render(doc)
+    assert bp._CONFIG_ERA_NARROWED_MARKER in report
+    assert "changed ~10 days ago" not in report   # counted to today, not to the removed stamp
