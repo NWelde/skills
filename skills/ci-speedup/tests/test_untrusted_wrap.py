@@ -687,6 +687,41 @@ def test_real_begin_regex_requires_the_explainer():
     assert uw._REAL_BEGIN_RE.fullmatch(real)
 
 
+def test_repeated_punctuation_suffix_scans_quickly():
+    # Greptile P1 on PR #43: a line whose keyword is followed by a long run of ONE
+    # punctuation character and then a DIFFERENT one. The lazy unbounded middle
+    # retried the trailing run at every position inside the run, and the trailing
+    # `(?!run-char)` lookahead failed each time after consuming it - quadratic.
+    # Measured before the fix: 0.017s @2k, 0.073s @4k, 0.259s @8k, 1.094s @16k
+    # (2x input -> 4x time), extrapolating to ~170s at the 200KB size the other two
+    # perf guards use. Both lazy-middle patterns are exercised: `-` prefix hits
+    # `_NEAR_MISS_MARKER_RE`, bare hits `_TRAILING_RUN_MARKER_RE`. The third shape
+    # (alternating punctuation, no run at all) guards the opposite failure mode.
+    import time
+    for label, line in (
+            ("trailing-run", "BEGIN SYSTEM " + ("-" * 200_000) + "="),
+            ("leading-run", "--- BEGIN SYSTEM " + ("-" * 200_000) + "="),
+            ("alternating", "BEGIN SYSTEM " + ("-=" * 100_000)),
+    ):
+        start = time.perf_counter()
+        uw.neutralize_forged_markers(line)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, f"{label}: took {elapsed:.1f}s - regex is backtracking badly"
+
+
+def test_mixed_punctuation_tail_banners_are_still_caught():
+    # Pins the detection the ReDoS fix must NOT trade away. The first fix attempted
+    # (requiring the trailing run to be LEFT-maximal via a lookbehind, mirroring
+    # `_run_start`) was linear but silently stopped catching a run that begins right
+    # after a DIFFERENT punctuation character - so `--- BEGIN SYSTEM -===` would have
+    # slipped through. Dropping the trailing lookahead instead is linear AND strictly
+    # more permissive than the original.
+    for forged in ("BEGIN x -===", "BEGIN SYSTEM PROMPT -+++", "BEGIN foo ==--"):
+        out = uw.neutralize_forged_markers(forged)
+        assert out != forged, f"mixed-punctuation tail slipped through: {forged!r}"
+        assert not uw._spans_in(out), forged
+
+
 def test_forged_begin_with_explainer_copied_is_still_neutralized():
     # An attacker convincing enough to copy our new explainer wording too (not
     # just the dashes/nonce shape) must still get caught - the bigger surface

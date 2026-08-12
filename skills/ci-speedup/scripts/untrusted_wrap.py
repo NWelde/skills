@@ -122,8 +122,40 @@ def _run_start(name: str) -> str:
 
 
 def _run_end(name: str) -> str:
-    """Same as `_run_start`, for a run at the end of a marker."""
+    """Same as `_run_start`, for a run at the end of a marker.
+
+    Only safe directly after a BOUNDED middle (see `_EXACT_MARKER_RE`). After an
+    unbounded lazy middle use `_run_after_gap` instead - the trailing lookahead
+    here is what makes that combination quadratic.
+    """
     return rf"(?P<{name}>{_RUN_CHAR})(?P={name})++(?!{_RUN_CHAR})"
+
+
+def _run_after_gap(name: str) -> str:
+    """A run of 2+ of the SAME delimiter character, for use after an UNBOUNDED lazy
+    middle (`[^\\n]*?`) - i.e. where the run's start position isn't known in advance
+    and the engine has to search for it.
+
+    Identical to `_run_end` except it drops the trailing "not followed by another
+    run char" lookahead, and that omission is the whole point. With the lookahead, a
+    line like `BEGIN ... ----------=` costs O(n^2): the lazy middle offers each
+    position inside the dash run, `++` consumes the rest of the run from there, the
+    lookahead then fails on the `=`, and the engine slides forward one character and
+    repeats the whole consume-then-fail (greptile P1 on PR #43 - 1.1s at 16k chars,
+    ~170s extrapolated to the 200KB the perf guards use). Without it the first
+    position that starts a repeat matches outright, so each position costs O(1) and
+    the scan is linear.
+
+    Dropping it does NOT weaken detection - it widens it. `++` is possessive, so the
+    matched run is still every consecutive copy of that character; the lookahead only
+    ever REJECTED a run that happened to butt up against a different punctuation
+    character (`-===`), which is a forgery shape we want caught, not skipped. The
+    other obvious fix - requiring the run to be left-maximal with a `_run_start`-style
+    lookbehind - is also linear but silently drops exactly those mixed-punctuation
+    tails, so it was rejected (pinned by
+    `test_mixed_punctuation_tail_banners_are_still_caught`).
+    """
+    return rf"(?P<{name}>{_RUN_CHAR})(?P={name})++"
 
 
 _H_SPACE = r"[^\S\n]*"   # spaces/tabs but NOT newlines, so nothing matches
@@ -142,14 +174,6 @@ _EXACT_MARKER_RE = re.compile(
 )
 
 # Matches anything SHAPED like a marker, whatever the wording - an attacker
-# guessing at a plausible format rather than copying ours. Needs a run on both
-# sides so ordinary prose doesn't trip it.
-#
-# The middle is capped at 60 characters on purpose. A real marker is a short
-# phrase; letting it run longer meant a single match could swallow most of a long
-# log line into the label, hiding genuine diagnostic detail inside what reads as
-# a suspected forgery.
-# Matches anything SHAPED like a marker, whatever the wording - an attacker
 # guessing at a plausible format rather than copying ours.
 #
 # The middle is deliberately UNBOUNDED. It used to be capped, which quietly meant
@@ -162,7 +186,7 @@ _EXACT_MARKER_RE = re.compile(
 _NEAR_MISS_MARKER_RE = re.compile(
     _run_start("r1") + _H_SPACE
     + r"\b(?:BEGIN|END)\b"
-    + f"(?:[^\n]*?{_run_end('r2')})?"
+    + f"(?:[^\n]*?{_run_after_gap('r2')})?"
 )
 
 # The mirror image: no leading run, but the keyword opens the line and a run
@@ -171,7 +195,7 @@ _NEAR_MISS_MARKER_RE = re.compile(
 # "end" somewhere before some punctuation.
 _TRAILING_RUN_MARKER_RE = re.compile(
     r"^[^\S\n]*\b(?:BEGIN|END)\b"
-    + f"[^\n]*?{_run_end('r2')}"
+    + f"[^\n]*?{_run_after_gap('r2')}"
 )
 
 # Self-documenting: goes on the BEGIN line only (once is enough - it's read before

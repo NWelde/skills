@@ -74,7 +74,19 @@ unversioned and updates by reinstall from `main`.
   rule — the function is a pure leaf-utility transform, not renderer logic) and
   applies it in the same order the renderer does. New regression test
   (`test_gap_fill_evidence_grounded_passes_on_a_neutralized_forged_marker`).
-  Masking (#12) is unchanged; this is additive, not a replacement.
+  Review also caught a quadratic scan in the two marker patterns whose lazy
+  unbounded middle is followed by a run: on `BEGIN … ----------=` (a long run of
+  one punctuation character then a different one) the engine re-consumed the run
+  from every position inside it, only to fail the trailing "not followed by a run
+  char" lookahead each time — 1.1s at 16k chars, ~170s at 200KB, i.e. one crafted
+  log line could stall report rendering. Those two patterns now use
+  `_run_after_gap`, which drops that lookahead: linear, and strictly *wider*
+  detection (the lookahead only ever rejected a run butting against different
+  punctuation, e.g. `-===`, which is a forgery shape worth catching). Both the
+  perf bound and the mixed-punctuation detection are pinned by tests, the latter
+  specifically to reject the tempting left-maximal-lookbehind fix that is linear
+  but silently drops those tails. Masking (#12) is unchanged; this is additive,
+  not a replacement.
 
 ### Changed
 
