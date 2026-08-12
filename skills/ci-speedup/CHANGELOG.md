@@ -11,19 +11,6 @@ unversioned and updates by reinstall from `main`.
 
 ## [Unreleased]
 
-### Fixed
-
-- **2026-08-11** — **The config-era disclosure's "changed ~N days ago" is now
-  measured to the audit, not to render time.** `blocking_path._age_anchor` falls
-  back to the doc's `scanned_at` — the same instant the metadata table stamps as
-  `Audit | ran` — when no `--captured-at` is supplied, instead of dropping
-  through to `datetime.now()`. Re-rendering an existing `findings.json` used to
-  age the workflow-change boundary to *today*, so an archived audit stamped
-  `ran 2026-07-24` claimed its workflow "changed ~128 days ago" when it was ~110
-  at audit time: internally inconsistent, and non-reproducible (the bytes drifted
-  a day at a time, which made the new `examples/` freshness guard go red the day
-  after each re-render). The two shipped examples are re-rendered accordingly.
-
 ### Fixed (pre-flip audit wave 2)
 
 - **2026-07-22** — **Catalog deep-links now use GitHub's real GFM anchor rule.**
