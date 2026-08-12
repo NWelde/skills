@@ -6525,23 +6525,6 @@ def _iso_age_phrase(iso_from: str, iso_to: str = "") -> str:
     return "less than an hour ago"
 
 
-def _age_anchor(doc: dict[str, Any], captured_at: str) -> str:
-    """The instant the config-era '~N days ago' phrases are measured TO.
-
-    `--captured-at` (the log-fetch time) when the caller supplied one; otherwise the audit's
-    own `scanned_at` — the SAME instant the metadata table stamps as `Audit | ran <date>`.
-    Falling straight through to render-time `now()` (the `_iso_age_phrase` default) is wrong
-    for any render of already-collected findings: re-rendering an archived `findings.json`
-    would age the boundary to TODAY, so a report stamped `ran 2026-07-24` claims the workflow
-    "changed ~128 days ago" when it was ~110 days at audit time — internally inconsistent, and
-    non-reproducible (the bytes change every day, which is what broke the examples/ freshness
-    guard). Anchoring to `scanned_at` keeps the disclosure honest AND makes a render of fixed
-    findings deterministic. Empty when the doc stamps no `scanned_at` — `_iso_age_phrase` then
-    keeps its historical `now()` behaviour rather than losing the age phrase entirely.
-    """
-    return captured_at or str(doc.get("scanned_at") or "")
-
-
 def _era_other_checks_clause(e: dict[str, Any], lead: str, tail: str) -> str:
     """Issue #69: the sentence naming the checks the OTHER configuration adds/removes — the checks
     `collect_runs._era_scope_enumeration` bound OUT of this single-era report (stamped as
@@ -6998,7 +6981,7 @@ def _render_static_only(doc: dict[str, Any], captured_at: str = "",
         out += ["---", "", *_fileless_lines]
     # Issue #66: a config-era boundary can be stamped even on a static-only report; surface it
     # so a straddle is never silently dropped just because the static path won the short-circuit.
-    _era_lines = _config_era_disclosure_lines(cp, _age_anchor(doc, captured_at))
+    _era_lines = _config_era_disclosure_lines(cp, captured_at)
     if _era_lines:
         out += ["---", "", *_era_lines]
     out += _data_sources_footer(doc, repo)
@@ -7059,7 +7042,7 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
         # BOTH degenerate arms (mirroring the static-only guard above and the fileless handling), so
         # a straddle is never silently dropped just because a shorter render path won the
         # short-circuit — else a post_only sample looks full / a disclosed_pre sample looks current.
-        _deg_era_lines = _config_era_disclosure_lines(cp, _age_anchor(doc, captured_at))
+        _deg_era_lines = _config_era_disclosure_lines(cp, captured_at)
         if _deg_fileless_lines or _deg_era_lines:
             # `_strip_emdashes` at this early-return boundary mirrors the main render exit:
             # this path bypasses that terminal scrub, so without it the typographic dashes in the
@@ -7868,7 +7851,7 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
         _lead_block,
         _model_check,
         # Config-era caveat: qualifies the headline number (folded, not a separate quote).
-        _config_era_disclosure_lines(cp, _age_anchor(doc, captured_at)),
+        _config_era_disclosure_lines(cp, captured_at),
         # Fileless/managed status-check disclosure (PR-lifetime status-gating latency).
         _fileless_disclosure_lines(cp),
         # "After the gate" runner-minute line.
