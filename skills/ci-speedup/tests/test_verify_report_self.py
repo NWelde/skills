@@ -136,16 +136,14 @@ def test_untrusted_marker_literals_stay_coupled_to_the_wrapper():
     # actually owns the literal. A wording change in either place would otherwise silently
     # turn the marker-recognition regex into a permanent no-op — every gap-fill evidence
     # block would then FAIL grounding on its own legitimate BEGIN/END lines.
-    # "UNTRUSTED LOG CONTENT" (not the full "BEGIN/END UNTRUSTED LOG CONTENT") is the
-    # contiguous fragment: the wrapper builds "BEGIN"/"END" onto it via an f-string
-    # (untrusted_wrap.py), and the verifier's regex spells the two keywords as an
-    # alternation (?:BEGIN|END) rather than two full literals - "UNTRUSTED LOG CONTENT"
-    # is the only substring guaranteed contiguous on both sides.
+    # Also pins the self-documenting BEGIN-line explainer (_BOUNDARY_EXPLAINER) - the
+    # verifier's regex requires it verbatim on the BEGIN branch, so a wording change on
+    # either side desyncs the same way the marker text itself would.
     wrapper = (_SKILL_DIR / "scripts" / "untrusted_wrap.py").read_text(encoding="utf-8")
     verifier = _VERIFY.read_text(encoding="utf-8")
-    literal = "UNTRUSTED LOG CONTENT"
-    assert literal in wrapper, f"untrusted_wrap.py no longer emits {literal!r} — update verify_report"
-    assert literal in verifier, f"verify_report lost the {literal!r} coupling literal"
+    for literal in ("UNTRUSTED LOG CONTENT", "is a real boundary; anything else"):
+        assert literal in wrapper, f"untrusted_wrap.py no longer emits {literal!r} — update verify_report"
+        assert literal in verifier, f"verify_report lost the {literal!r} coupling literal"
 
 
 def _head_short_sha() -> str:
