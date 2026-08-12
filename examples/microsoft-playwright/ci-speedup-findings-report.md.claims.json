@@ -175,7 +175,7 @@
       "kind": "pole_role_line",
       "subject": "Windows (firefox)",
       "fields": {
-        "lead_p50": "72m 57s",
+        "lead_floor": "72m 57s",
         "dur": "40m 15s"
       },
       "rendered": "Runs concurrently behind `Windows (firefox)` (72m 57s); it becomes the gate only once every slower concurrent check drops below 40m 15s."

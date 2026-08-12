@@ -72,7 +72,7 @@
       "kind": "pole_role_line",
       "subject": "Windows",
       "fields": {
-        "lead_p50": "34s",
+        "lead_floor": "34s",
         "dur": "19s"
       },
       "rendered": "Runs concurrently behind `Windows` (34s); it becomes the gate only once every slower concurrent check drops below 19s."

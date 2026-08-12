@@ -12,7 +12,8 @@ catch it.
 This guard closes that gap: for each committed `examples/<repo>/findings.json`, it
 re-renders with the CURRENT `blocking_path.py` (no `gh` calls — a fresh render is a
 pure, local, offline recomputation from already-collected data) and checks the
-result (a) matches the committed `.md` byte-for-byte, provenance stamp aside, and
+result (a) matches the committed `.md` byte-for-byte, provenance stamp and the
+render-time-relative config-era age phrases aside, and
 (b) passes `verify_report`'s content invariants.
 """
 
@@ -39,9 +40,29 @@ _EXAMPLES = _REPO / "examples"
 # nothing else did. Normalize it out before comparing.
 _PROVENANCE_RE = re.compile(r"\(skill commit `[^`]*`(?:, scripts tree `[^`]*`)?\)")
 
+# The config-era disclosure's age phrase ("`tests.yaml` changed ~110 days ago — narrowed to
+# the current configuration."). `blocking_path._iso_age_phrase` measures it to `--captured-at`
+# when the caller passes one and otherwise to render-time `now()`, so a re-render of a FIXED
+# findings.json counts the same workflow-change boundary to TODAY: the number ticks up by one
+# every day and a byte comparison would go red the day after each re-render, reporting drift
+# that is really just the calendar. Normalize it out, exactly as the provenance stamp above is.
+# The alternatives `_iso_age_phrase` can return are covered too, so a boundary that stops
+# parsing ("recently") is not mistaken for staleness either.
+# TRADE-OFF, on purpose: this is the one span of the report this guard does NOT pin, so the
+# age printed in the committed examples is whatever the day of the last re-render made it and
+# may read as inconsistent with the Audit row's `ran` date. Everything else still compares
+# byte-for-byte.
+_ERA_AGE_RE = re.compile(
+    r"changed (?:~\d+ (?:day|hour)s? ago|less than an hour ago|recently)")
+
 
 def _sans_provenance(report: str) -> str:
-    return _PROVENANCE_RE.sub("(skill commit `X`, scripts tree `X`)", report)
+    """Blank the two spans that legitimately differ between a fresh render and the committed
+    bytes without the report being stale: the provenance stamp (it records the renderer's own
+    git state, so it changes whenever the scripts do) and the config-era age phrases (counted
+    to render time, so they change with the calendar)."""
+    report = _PROVENANCE_RE.sub("(skill commit `X`, scripts tree `X`)", report)
+    return _ERA_AGE_RE.sub("changed <AGE>", report)
 
 
 def _example_findings() -> list[Path]:
@@ -113,7 +134,8 @@ def fresh_reports(tmp_path_factory):
 
 def test_example_report_matches_a_fresh_render(fresh_reports):
     """A committed example must be exactly what today's renderer produces from its
-    committed findings.json — provenance stamp aside. Catches silent staleness."""
+    committed findings.json — provenance stamp and era age phrases aside (see
+    `_sans_provenance`). Catches silent staleness."""
     stale = []
     for repo, fj, _md, fresh, _claims in fresh_reports:
         committed_md = fj.parent / "ci-speedup-findings-report.md"
