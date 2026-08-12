@@ -13,7 +13,12 @@ Exit 0 if all checks pass, 1 otherwise. Each check prints PASS/FAIL + detail.
 
 Standalone by design: no imports of blocking_path.py/scan.py/config (so it has no
 PyYAML/config-collision dependency and can run anywhere a report lands - including
-the e2e harness and CI). The report it validates is the measurement-spine report:
+the e2e harness and CI), with ONE bounded exception (issue #29): it imports
+untrusted_wrap.py's neutralize_forged_markers, a pure leaf-utility transform with no
+rendering/config dependency of its own, from its sibling `scripts/` dir (always
+shipped alongside this file in every installed skill copy). See that import site's
+comment for why this doesn't reopen the verifier-trusts-the-renderer risk the
+no-import rule exists to avoid. The report it validates is the measurement-spine report:
 a wall-clock critical-path drill, RCA-only - every recognized root cause hands off
 via an agent prompt and the report never prescribes a fix.
 
@@ -41,6 +46,22 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+# Bounded exception to "this file never imports the renderer" (see the module
+# docstring / _UNTRUSTED_MARKER_RE's own comment): `untrusted_wrap.py` is a leaf
+# utility module with no dependency on blocking_path.py's actual rendering logic,
+# so importing its `neutralize_forged_markers` here doesn't reintroduce the
+# verifier-trusts-the-renderer's-bugs risk the no-import rule protects against.
+# The alternative — duplicating ~100 lines of Unicode-normalization / homoglyph
+# logic as an independent twin — is real drift risk on security-relevant code: a
+# future fix to a new evasion here wouldn't reach a hand-copied twin until
+# someone remembered to port it. `_ground_transform` below needs this to mirror
+# what the renderer actually PRINTS for a log line containing a forged marker
+# (issue #29's own grounding-check regression: a genuinely-quoted, correctly
+# neutralized evidence line was failing grounding because this file only knew
+# about `_fence_safe`'s transforms, not this one).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import untrusted_wrap as uw  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -1930,10 +1951,12 @@ _LLM_EVIDENCE_FENCE_RE = re.compile(
     r"verbatim from the captured job log[^\n]*\n+```text\n(.*?)\n```", re.DOTALL)
 
 # Twin of untrusted_wrap.py's own _REAL_BEGIN_RE/_REAL_END_RE (issue #29) - SHAPE only, no
-# nonce-issuance check. This file never imports untrusted_wrap or blocking_path (see the
-# module docstring's independent-verification rule), so it can't drift onto the renderer's
-# own bug - hence a duplicated twin here, pinned to untrusted_wrap.py's literal wording by
-# test_verify_report_self.py, same as every other renderer<->verifier coupling in this file.
+# nonce-issuance check, and still an independently duplicated twin (not imported) even
+# though `_ground_transform` below now imports `untrusted_wrap.neutralize_forged_markers`
+# for a DIFFERENT reason (mirroring a normalization transform, not a marker-recognition
+# assertion) - see that import site's comment for the bounded scope of the exception. This
+# regex is pinned to untrusted_wrap.py's literal wording by test_verify_report_self.py,
+# same as every other renderer<->verifier coupling in this file.
 # `_evidence_fence` wraps every gap-fill evidence fence in one of these two lines as its
 # FIRST and LAST line; recognized here and excluded from the verbatim-log check below.
 # Matched by PATTERN, never by position - if the wrap were ever dropped from the renderer,
@@ -1955,14 +1978,18 @@ _UNTRUSTED_MARKER_RE = re.compile(
 def _ground_transform(text: str) -> str:
     """Apply to EACH LOG LINE the SAME transforms the renderer applies to an evidence line embedded
     in the report, so a substring compare is honest: `_fence_safe` (the verbatim twin of
-    `blocking_path._fence_safe` — defuse >=3-backtick runs, strip control chars) then flatten every
-    typographic dash to an ASCII hyphen (via `_TYPOGRAPHIC_DASHES`). The transform is applied
-    PER LOG LINE, never to the whole collapsed log: whole-log newline collapse let fabricated text
-    SPLICED across two adjacent log lines pass as "verbatim" (#110 bot review) — the gap-fill
-    contract quotes verbatim log LINES, so each evidence line must be a substring of a single
-    transformed log line. No third transform is invented — both are the renderer's own, already
-    mirrored in this file."""
-    corpus = _fence_safe(text)
+    `blocking_path._fence_safe` — defuse >=3-backtick runs, strip control chars), THEN
+    `untrusted_wrap.neutralize_forged_markers` (issue #29 — imported, not twinned; see the
+    import-site comment for why) so a log line that itself contains marker-shaped text matches
+    what the renderer actually PRINTS for it (the neutralized/defused form), not the raw text —
+    without this a genuinely-quoted, correctly-neutralized evidence line fails grounding as if it
+    were fabricated, THEN flatten every typographic dash to an ASCII hyphen (via
+    `_TYPOGRAPHIC_DASHES`, the renderer's own whole-report em-dash sanitizer, which runs last).
+    The transform is applied PER LOG LINE, never to the whole collapsed log: whole-log newline
+    collapse let fabricated text SPLICED across two adjacent log lines pass as "verbatim" (#110
+    bot review) — the gap-fill contract quotes verbatim log LINES, so each evidence line must be
+    a substring of a single transformed log line."""
+    corpus = uw.neutralize_forged_markers(_fence_safe(text))
     for dash in _TYPOGRAPHIC_DASHES:
         corpus = corpus.replace(dash, "-")
     return corpus
