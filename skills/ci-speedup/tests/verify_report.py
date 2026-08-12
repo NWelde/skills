@@ -1520,6 +1520,135 @@ def _external_check_misbound_offenders(findings_path: Path | None) -> list[str] 
 # `test_phase0_literals_stay_coupled_to_the_renderer` so a reword breaks both sides in lockstep.)
 _NO_PER_STEP_DRILL = "No per-step breakdown was captured"
 
+# ── Aggregation-gate poles (issue #1) ────────────────────────────────────────────────────
+# A success-aggregation gate is the trivial job that exists ONLY to `needs:` a set of real
+# jobs so one check can be the single required status check (next.js' `thank you, build`:
+# job `buildPassed`, `needs: [deploy-target, build, build-wasm, build-native]`, P50 3s).
+# `blocking_path._agg_gate_shape` detects that shape and renders the honest upstream story
+# INSTEAD of a drill + "optimize this step" prompt — so such a pole legitimately carries no
+# agent prompt, and `check_speed_poles_complete`'s prompt requirement must not false-FAIL it.
+# The exemption is NOT taken on the report's word: the shape is RE-DERIVED from findings.json
+# (`workflow_job_graph` + `pr_critical_path`), and the rendered section must also show the
+# renderer's aggregation framing — findings-derived structure AND honest rendering, both.
+# The paired invariant lives in `check_aggregation_gate_poles_never_prescribe`.
+# (Literals pinned to the renderer by `test_phase0_literals_stay_coupled_to_the_renderer`.)
+_AGG_GATE_ROLE_MARKER = "**Aggregation gate"
+_AGG_GATE_POINTER_MARKER = "**➡️ Where the wait actually is:**"
+_VR_AGG_GATE_TRIVIAL_S = 30.0
+
+
+def _agg_gate_pole_keys(findings_path: Path | None) -> set[tuple[str, str]]:
+    """`{(wf_base, _cmp_name(check))}` for every `pr_critical_path.poles[*]` matching the
+    aggregation-gate shape, re-derived from findings.json alone — mirroring
+    `blocking_path._agg_gate_shape` (a) trivial P50, (b) terminal job whose transitive
+    `needs:` closure (>= 2 jobs) covers every non-terminal job in its workflow, (c) no
+    sampled step above the trivial threshold, (d) >= 1 upstream member with a measured check.
+
+    Deliberately re-derived (never read off the rendered report): the render is what this
+    guard is auditing. The renderer's additional carve-outs (a modal-chain member, or a pole
+    that matched a log detector / carries a routed structural lever) can only make the
+    renderer render MORE than this set — and those poles all carry a prompt, so they never
+    reach the exemption's `bare` list anyway."""
+    if not findings_path:
+        return set()
+    data, err = _load_findings_doc(findings_path)
+    if err:
+        return set()
+    graph = _as_dict(data.get("workflow_job_graph"))
+    cp = _as_dict(data.get("pr_critical_path"))
+    checks = [_as_dict(c) for c in _as_list(cp.get("checks"))]
+    out: set[tuple[str, str]] = set()
+    for pole in _as_list(cp.get("poles")):
+        pole = _as_dict(pole)
+        if (_num(pole.get("p50_s")) or 0.0) > _VR_AGG_GATE_TRIVIAL_S:
+            continue
+        wf = str(pole.get("workflow_file") or "")
+        jobs = _as_dict(graph.get(wf))
+        if not jobs:
+            continue
+        check = str(pole.get("check") or "")
+        jid = str(pole.get("job") or "")
+        if jid not in jobs:
+            cands = [k for k, meta in jobs.items()
+                     if _vr_job_produces_check(str(_as_dict(meta).get("name") or k),
+                                               bool(_as_dict(meta).get("matrix")), check)]
+            if len(cands) != 1:
+                continue
+            jid = cands[0]
+        needs_of = {k: [str(n) for n in _as_list(_as_dict(m).get("needs"))]
+                    for k, m in jobs.items()}
+        depended_on = {n for ns in needs_of.values() for n in ns}
+        if jid in depended_on:
+            continue
+        closure: set[str] = set()
+        frontier = list(needs_of.get(jid) or [])
+        while frontier:
+            n = frontier.pop()
+            if n in closure or n not in jobs:
+                continue
+            closure.add(n)
+            frontier.extend(needs_of.get(n) or [])
+        if len(closure) < 2 or not {k for k in jobs if k in depended_on} <= closure:
+            continue
+        if any((_num(_as_dict(s).get("p50_s")) or 0.0) > _VR_AGG_GATE_TRIVIAL_S
+               for s in _as_list(pole.get("steps"))):
+            continue
+        measured = any(
+            str(c.get("workflow_file") or "") == wf
+            and _vr_job_produces_check(
+                str(_as_dict(jobs.get(j)).get("name") or j),
+                bool(_as_dict(jobs.get(j)).get("matrix")),
+                str(c.get("name") or c.get("check") or ""))
+            for j in closure for c in checks)
+        if measured:
+            out.add((_wf_base(wf), _cmp_name(check)))
+    return out
+
+
+def check_aggregation_gate_poles_never_prescribe(
+        report: str, findings_path: Path | None) -> Check:
+    """An aggregation-gate pole must render the honest upstream story and NOTHING that tells
+    the reader to optimize a job that runs no work (issue #1).
+
+    Two directions, both re-derived from findings.json (`_agg_gate_pole_keys`):
+
+    - A pole rendered with the aggregation framing must genuinely BE one structurally, and
+      must carry the "where the wait actually is" pointer at the slowest upstream member —
+      framing without the structure, or without the pointer, is a dead end.
+    - A pole rendered with the aggregation framing must carry NO `🤖 Prompt for your coding
+      agent`: that prompt asks the reader to capture timing and speed up a 3-second no-op,
+      which is exactly the inert advice this shape exists to suppress. (The complementary
+      exemption in `check_speed_poles_complete` lets such a pole ship without a prompt; this
+      is the invariant that keeps the exemption from being a hole.)"""
+    name = "aggregation-gate poles tell the upstream story, never an optimize-this prompt"
+    framed = [(wf, check, body) for wf, check, body in _pole_header_sections(report)
+              if _AGG_GATE_ROLE_MARKER in body]
+    if not framed:
+        return Check(name, True, "no aggregation-gate pole rendered", skipped=True)
+    keys = _agg_gate_pole_keys(findings_path)
+    if findings_path and not keys:
+        return Check(name, False,
+                     f"{len(framed)} pole(s) render the aggregation-gate framing, but findings.json "
+                     "supports NO pole of that shape (re-derived from workflow_job_graph + "
+                     "pr_critical_path) - the framing must never be applied to a pole that isn't "
+                     "structurally a `needs:`-everything success sink")
+    bad: list[str] = []
+    for wf, check, body in framed:
+        where = f"`{wf}` ▸ {check}"
+        if findings_path and (_wf_base(wf), _cmp_name(check)) not in keys:
+            bad.append(f"{where}: framed as an aggregation gate but findings don't re-derive "
+                       "that shape for it")
+        if "Prompt for your coding agent" in body:
+            bad.append(f"{where}: carries an agent prompt over a job that runs no work - "
+                       "the sink must point at its slowest upstream member instead")
+        if _AGG_GATE_POINTER_MARKER not in body:
+            bad.append(f"{where}: no upstream pointer - the reader is left with a role line "
+                       "and nowhere to go")
+    if bad:
+        return Check(name, False, "; ".join(bad[:4]))
+    return Check(name, True, f"{len(framed)} aggregation-gate pole(s): each re-derives from the "
+                 "job graph, points at its slowest upstream member, and prescribes nothing")
+
 
 def check_speed_poles_complete(report: str, findings_path: Path | None) -> Check:
     """The report must drill one fully-formed long pole per independent gating check
@@ -1648,8 +1777,24 @@ def check_speed_poles_complete(report: str, findings_path: Path | None) -> Check
         return Check(name, False, f"long pole(s) {stunted} carry NO per-step breakdown - a "
                      "bare/stunted pole (a timeline with no drill, per SKILL.md 5a), not the "
                      "same drill as pole 1 (it hands off a prompt over an empty drill)")
+    # AGGREGATION-GATE exemption (issue #1). A pole whose job exists only to `needs:` the
+    # rest of its workflow (a 3s success sink) renders the honest upstream story INSTEAD of a
+    # drill + prompt — a prompt there would tell the reader to speed up a job that runs no
+    # work. Exempt ONLY when the shape re-derives from findings.json AND the section actually
+    # carries the renderer's aggregation framing; `check_aggregation_gate_poles_never_prescribe`
+    # holds the other half (such a pole must carry the upstream pointer and no prompt), so the
+    # exemption can't launder a genuinely stunted pole.
+    # Keyed by the section BODY, never by ordinal: `_pole_sections` and `_pole_header_sections`
+    # split on the same header line and so yield byte-identical bodies, but their header
+    # patterns differ (the latter also requires the `` `wf` ▸ check `` shape) — a header that
+    # ever fails the stricter pattern would shift the ordinals and move the exemption onto a
+    # DIFFERENT pole. Matching on bodies cannot drift that way.
+    _agg_keys = _agg_gate_pole_keys(findings_path)
+    _agg_exempt_bodies = {body for wf, check, body in _pole_header_sections(report)
+                          if _AGG_GATE_ROLE_MARKER in body
+                          and (_wf_base(wf), _cmp_name(check)) in _agg_keys}
     bare = [i + 1 for i, s in enumerate(sections)
-            if "Prompt for your coding agent" not in s]
+            if "Prompt for your coding agent" not in s and s not in _agg_exempt_bodies]
     if bare:
         return Check(name, False, f"long pole(s) {bare} lack an agent prompt - a bare/"
                      "stunted pole, not the same drill as pole 1")
@@ -3288,8 +3433,12 @@ def check_saving_within_measured_compute(report: str, findings_path: Path | None
     `runner_minute_spine` rows (`billable_equiv_min_per_month`, the sampled-and-extrapolated cost the
     spine already stamps and `check_runner_minute_spine_contract` re-derives), matched to the
     finding's `affected_jobs` by workflow_file + job base name (matrix `(variant)` stripped, the same
-    `_cmp_name`/base join the spine uses). A finding whose jobs ALL resolve to spine rows must have
-    saving <= their summed billable compute (directional upper bound + tolerance; L6). SKIPs loud when
+    `_cmp_name`/base join the spine uses), resolving a finding's YAML job key against the spine's
+    `name:`-overridden display name through the scanned `workflow_job_graph` (issue #2) so a
+    same-workflow match always beats the cross-workflow same-name fallback (which stays on the
+    LITERAL base — graph aliases never widen it). A finding whose jobs ALL resolve to spine rows
+    must have saving <= their summed billable compute (directional upper bound + tolerance; L6).
+    SKIPs loud when
     there is no render-ready cost spine, or when savings exist but NONE of them resolve any affected
     job to a spine row — the check bounded nothing, so it SKIPs loud rather than pass green (the
     fragile-join failure mode: if the spine's job-naming ever drifts from `affected_jobs`, every
@@ -3315,6 +3464,48 @@ def check_saving_within_measured_compute(report: str, findings_path: Path | None
     def _base(job: str) -> str:
         # Strip a trailing matrix `(variant)` so a finding's bare job name matches its expanded legs.
         return _cmp_name(re.sub(r"\s*\([^()]*\)\s*$", "", str(job or "")).strip())
+
+    # YAML KEY ↔ `name:` OVERRIDE (issue #2). A finding names its job by YAML key (`lint`), but the
+    # spine records the job under its rendered DISPLAY name (`Lint project (depot-windows-2022)`) —
+    # the key misses the join entirely. Resolve both identities through the scanned
+    # `workflow_job_graph` (`{wf: {job_id: {name, ...}}}`, already stamped on the artifact, so no
+    # producer change): key → declared `name:`, and DISPLAY name → key for the reverse direction.
+    # Candidates stay per-workflow, so a same-workflow resolution is always tried before the
+    # cross-workflow same-name fallback below — biome's OPT33 on `lint` bound the unrelated
+    # `pull_request_markdown.yml` job literally named `lint` (553 min/mo) instead of its own job's
+    # 13,381.6, and false-FAILed. An artifact with no graph keeps the bare-name behavior.
+    # Graph-resolved aliases are SAME-WORKFLOW ONLY — they never widen the cross-workflow fallback,
+    # which stays on the LITERAL base exactly as before this fix. An alias is evidence about THIS
+    # workflow's job ("`lint` here renders as `Lint project`"); carrying it into a foreign workflow
+    # would let a job with no spine row of its own bind an unrelated namesake's compute and INFLATE
+    # the upper bound, masking an oversized finding. Unresolvable stays an honest coverage gap.
+    graph = _as_dict(data.get("workflow_job_graph"))
+
+    def _identities(wf: str, job: str) -> list[str]:
+        """Job bases `job` may appear under in `wf`'s spine rows, literal first (so an already-
+        matching name keeps today's binding), then the graph-resolved counterpart identity.
+        Only valid WITHIN `wf` — the cross-workflow fallback must not use these aliases.
+        An AMBIGUOUS display name (two job keys in `wf` rendering to the same name) yields no
+        alias: the spine indexes by that one name, so aliasing a key onto it would bound the
+        finding by BOTH jobs' summed compute and inflate the ceiling. Ambiguity stays an honest
+        coverage gap, same as the cross-workflow rule above."""
+        b = _base(job)
+        out = [b] if b else []
+        jobs_in_wf = _as_dict(graph.get(wf))
+        names: dict[str, int] = {}
+        for jid, info in jobs_in_wf.items():
+            nm = _base(_as_dict(info).get("name") or jid)
+            if nm:
+                names[nm] = names.get(nm, 0) + 1
+        for jid, info in jobs_in_wf.items():
+            nm = _base(_as_dict(info).get("name") or jid)
+            if names.get(nm, 0) > 1:
+                continue  # collision: this display name identifies more than one job — no alias.
+            # key → its `name:` override, and display name → its key; both directions, one pass.
+            for alias in ((nm,) if _base(jid) == b else ((_base(jid),) if nm == b else ())):
+                if alias and alias not in out:
+                    out.append(alias)
+        return out
 
     compute: dict[tuple[str, str], float] = {}
     for r in rows:
@@ -3357,16 +3548,27 @@ def check_saving_within_measured_compute(report: str, findings_path: Path | None
         seen: set[str] = set()
         for j in jobs:
             b = _base(j)
-            if not b or b in seen:
+            if not b:
                 continue
-            seen.add(b)
+            # Same-workflow identities first (literal, then graph-resolved) — a job that resolves
+            # in its OWN workflow never reaches the cross-workflow fallback, so a foreign namesake
+            # can't win. `compute` already sums a base's matrix legs, so the resolved display name
+            # brings the whole job's compute (all legs) in one figure.
+            cands = _identities(wf, j)
+            key = next(((wf, c) for c in cands if (wf, c) in compute), None)
+            ident = key[1] if key else b
+            if ident in seen:
+                continue
+            seen.add(ident)
             distinct += 1
-            key = (wf, b)
-            if key in compute:
+            if key:
                 matched += 1
                 bound += compute[key]
             else:
                 # Job base present under ANY workflow file (a reusable-workflow caller loses the wf).
+                # LITERAL base only — graph aliases are same-workflow evidence and must not widen
+                # this cross-workflow match (see `_identities`); a job with no row in its own
+                # workflow stays an honest coverage gap rather than binding a foreign namesake.
                 alt = [v for (w, jb), v in compute.items() if jb == b]
                 if alt:
                     matched += 1
@@ -5462,7 +5664,14 @@ _SPINE_FLOOR_NAME_RE = re.compile(
     # check is `X`") NAMES the pole's floor on the spine, but its phrasing differs from the floor-note
     # forms above — without it a legitimately-disclosed floor read as a silent spine drop (a
     # wording-coupled false FAIL on the frequency-gate shape; caught on out-of-sample dogfood repos).
-    r"|slowest concurrent check is)"
+    r"|slowest concurrent check is"
+    # A BELOW-gate drilled pole's role line ("Runs concurrently behind `X` (…); it becomes the gate
+    # only once every slower concurrent check drops below …") NAMES the check `X` this pole runs
+    # behind — the slowest concurrent check above it, which the renderer selects by effective floor
+    # (`_eff_floor_s`), i.e. the pole's binding floor. Without this the floor a pole names ONLY here
+    # read as a silent spine drop (the sibling-family shape: a below-gate pole's floor is a matrix leg
+    # of an already-drilled family, named nowhere else — a live-run false FAIL).
+    r"|Runs concurrently behind)"
     r",?\s*`([^`]+)`")
 
 
@@ -7480,6 +7689,7 @@ def run_checks(report, report_path, findings_path, skill_repo, clone=None):
         check_rendered_patterns_exist(report, findings_path),
         check_data_driven_have_signal(findings_path),
         check_speed_poles_complete(report, findings_path),
+        check_aggregation_gate_poles_never_prescribe(report, findings_path),
         check_pole_drill_belongs_to_its_job(report, findings_path),
         check_gap_fill_evidence_grounded(report, findings_path),
         check_dropped_check_not_framed_on_path(report, findings_path),

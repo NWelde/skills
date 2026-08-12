@@ -11,6 +11,198 @@ unversioned and updates by reinstall from `main`.
 
 ## [Unreleased]
 
+### Added
+
+- **2026-07-28** — **Credential-shaped strings are masked in every quoted log
+  line.** The report quotes verbatim job-log and workflow-YAML text as evidence,
+  and that is the artifact users commit and share; GitHub masks only the secrets
+  registered as repo/org secrets, so an accidentally-echoed token reached the
+  report in the clear (skills.sh Snyk W007, HIGH; issue #12). `_redact_secrets`
+  now runs inside `_fence_safe` — the single sink every evidence line, repo name
+  and agent-prompt line already flows through — replacing GitHub tokens, AWS
+  access keys, Slack tokens, JWTs, Google API keys, private-key headers and
+  `key=value` credential assignments with `[REDACTED:<kind>]` while keeping the
+  surrounding words, so the evidence stays readable. The LLM gap-fill's `cause`
+  and `breakdown` (markdown prose, which renders as markdown rather than fenced
+  text) are masked at their own site, and `_flatten_cell` — the appendix
+  `**Evidence:**` lines and the Tier-2 / structural rows, which quote workflow
+  YAML verbatim without passing through `_fence_safe` — is the third masked sink.
+  Shaped patterns only, no entropy heuristic: step names, durations, run URLs and
+  40-hex provenance shas render unchanged, and a value that is a *reference*
+  (`${{ secrets.X }}`, `${VAR}`, `%VAR%`) is left alone — that is what correct
+  workflow YAML looks like, and masking it would destroy the diagnostic and imply
+  a hardcoded token that isn't there. SKILL.md phase 4a and
+  `references/gap-fill.md` gained the matching instruction-level rule (never
+  quote a credential; mask it and note the mask), and the repo's `SECURITY.md`
+  documents the three-layer log-data model (W011).
+
+### Changed
+
+- **2026-07-30** — **Two gating poles ⇒ both get their own menu slot.** The
+  ≤4-option fold used to collapse the second pole into "Fix all," leaving no
+  way to pick pole 2 alone — a live user who had just fixed pole 1 had no
+  button for the other check. With exactly two poles the menu is now pole 1 /
+  pole 2 / "Fix both" / save, and the bill option folds out to the close
+  prose instead — named there either way (the source-backed `~N min/mo`
+  saving or the modeled pointer) so it stays reachable (≥3 poles keep the
+  old fold).
+
+- **2026-07-30** — **Era disclosures lead the close.** When the report's top
+  matter carries a config-era caveat — `disclosed_pre` (too few runs since the
+  workflow changed, so the numbers describe the PREVIOUS config), a narrowed
+  window, or `post_only_thin` (the new config measured on a thin post-change
+  sample, so the numbers are provisional) — the close states it before any
+  number, with re-audit guidance, and never presents a retired-era or provisional
+  number as current. The fast-CI "your CI is already in good shape" preface is
+  retained but now yields to an era caveat, so a sub-2-minute retired/provisional
+  number never reads as healthy. Live miss: a post-fix audit led with the pre-fix
+  merge wait and no era note, so the user read their freshly shipped speedup as
+  absent. Offsetting close-prose compressions keep SKILL.md under the 500-line
+  budget (no rule lost).
+
+- **2026-07-30** — **The `gh` gate is sandbox-aware.** In approval-gated agent
+  environments (Codex), the first restricted shell can't reach a keyring-held
+  credential, so `gh auth status` false-fails for a logged-in account. The gate
+  now retries with host access before concluding, and never reports auth
+  "expired" off a sandboxed probe (live Codex run 2026-07-30 told a logged-in
+  user to re-authenticate).
+- **2026-07-30** — **Verify-fail withholds the save option.** If phase-5
+  verification stays red after its one re-render retry, the close drops `None,
+  just save the report (.md)` and says why in one line — a report that failed
+  its own checker is never offered for saving (codifies behavior a live Codex
+  run improvised).
+
+### Fixed
+
+- **2026-07-30** — **Two more floor-ranking sites name the check that actually
+  caps the wait — the effective floor, not the p50-slowest sibling** (same class
+  as #22's below-gate role line, found by its floor-semantics audit). (1) The
+  SUCCESS-AGGREGATION-GATE pole names its slowest measured `needs:` upstream
+  member as the lever; it ranked candidates — both within a matrix job's legs and
+  across jobs — by bare `p50_s`, so a leg whose bimodal SLOW mode is the true
+  ceiling but whose blended p50 sits below a faster-median sibling went unnamed,
+  and the "Where the wait actually is" pointer sent the reader to the wrong lever
+  (at a duration smaller than the slow-mode header of the very pole it linked to).
+  Both picks now rank by — and the pointer renders — the seconds the member's own
+  drilled pole HEADER shows (`_pole_headline`, the bimodal-aware header duration),
+  so the sink, its pointer, and the linked pole all agree exactly. (This is the
+  member's slow mode when its median sits on the fast cluster — the case above —
+  but its p50 when the median already sits IN the slow cluster, where the header
+  keeps the p50; ranking/rendering by a bare `max(p50, high)` would there quote a
+  duration ABOVE the linked pole's header.) (2) The
+  FREQUENCY-GATE pole's role line ("**The check most PRs gate on.** … the slowest
+  concurrent check is `X`, which sets the wall-clock floor") named `X` from
+  `src[0]`, the p50-slowest typical check. That pick is STAMP-BOUND to the data
+  layer's p50-based `critical_path_check` (which is not bimodal-aware), so
+  re-ranking it would desync the headline from its stamp and break
+  `verify_report.check_headline_slowest_matches_stamp` — a joint re-rank is
+  genuinely unsafe. Instead the role line keeps the stamp-consistent p50 pick and
+  now handles the true ceiling beside it via `_binding_floor` (over the same full
+  concurrent set `_floor_note` uses) so `X` is NEVER credited with a floor a slower
+  sibling actually sets: (a) when a different **file-backed** concurrent check's
+  effective floor exceeds `X`'s p50, it names that TUNABLE check as the one that
+  sets the wall-clock floor on slow-mode PRs (the reader is told to attack it);
+  (b) when the check that out-floors `X` is MANAGED/external (no workflow file —
+  not tunable), the role line does not credit `X` and does not frame the managed
+  check as attackable, but DOES name it as the real cap using the "no workflow file
+  to speed up here `Z`" phrasing — honest about untunability AND the form the spine
+  parser (`verify_report._SPINE_FLOOR_NAME_RE`) reads, so the managed ceiling is
+  disclosed on the spine even when the gate pole's own `_floor_note` is suppressed
+  (`binding_s >= pole_p`); (c) when nothing out-floors `X`,
+  it keeps the plain "sets the wall-clock floor". The out-floor test uses
+  `_pole_headline` (the seconds the named check's own drilled header shows), not
+  frac-blind `_eff_floor_s`, so the quoted time matches the check's own drill and a
+  degenerate bimodal (missing `low_p50_s`/`slow_frac`) can't fire a phantom
+  slow-mode disclosure. The clause fires ONLY when `_pole_headline`'s bimodal
+  override actually fired (a genuine fast-median slow mode), so its "bimodal slow
+  mode … on slow-mode PRs" wording can never be printed for a UNIMODAL heavy
+  path-conditional check whose blended p50 merely out-ranks the slowest typical
+  check (the lightdash `E2E` class — such a check doesn't run on a typical PR, so
+  the typical floor is the slowest typical check, disclosed on its own drilled
+  pole). The clause adds no new spine-disclosure obligation:
+  `check_spine_heavy_check_disclosed` keys on drilled poles' binding floors
+  (independent of this clause text) and `verify_report` is untouched, so a
+  file-backed ceiling that must be disclosed is disclosed by its own drilled-pole
+  header exactly as on `main`. Leaves committed example reports valid (full suite
+  green, no re-render required).
+
+- **2026-07-30** — **A below-gate pole names the check that actually caps it —
+  the effective floor, not the p50-slowest sibling.** A drilled pole that runs
+  concurrently behind the gate gets a "Runs concurrently behind `X`; it becomes
+  the gate only once every slower concurrent check drops below …" role line. It
+  selected `X` by the bare blended `p50_s`, while every other floor path — and
+  `verify_report`'s spine-drop check — rank floors by the EFFECTIVE floor
+  (`_eff_floor_s`, `max(p50, bimodal high_p50_s)`). When a matrix leg's slow mode
+  is the true ceiling but its blended p50 sits below a faster-median sibling, the
+  role line named the wrong leg: it pointed at a shard that isn't the binding
+  floor, so the check that actually caps the wait was disclosed nowhere and the
+  report tripped its own verifier. Live miss: a report with a sharded family had
+  `shard 1/4` (highest p50) named while the binding floor under a second pole was
+  `shard 4/4` (highest slow-mode) — disclosed nowhere, a silent spine drop. The
+  role line now ranks concurrent checks by `_eff_floor_s` and shows the effective
+  floor duration, naming the exact capping leg; `verify_report`'s
+  `_SPINE_FLOOR_NAME_RE` now recognizes the "Runs concurrently behind `X`"
+  phrasing as a spine disclosure so a floor named only there counts. The
+  `pole_role_line` claim's field key is `lead_floor` (was `lead_p50`): the value
+  is the effective floor (a slow mode, not necessarily a median), so the old key
+  misnamed it.
+
+- **2026-07-28** — **An aggregation-gate pole tells the honest upstream story
+  instead of prompting the reader to optimize a 3-second no-op** (issue #1). Many
+  repos make one trivial job the single required status check: it runs no work,
+  `needs:` everything else in its workflow, and exists only so branch protection
+  has one name to require (vercel/next.js `thank you, build` — job `buildPassed`,
+  `needs: [deploy-target, build, build-wasm, build-native]`, body `run: exit 1`,
+  P50 **3s**). Because it gates every PR it was correctly crowned Long pole 1 by
+  frequency — and then rendered with a drill placeholder plus a "capture timing,
+  then optimize this step" agent prompt: correct data, inert advice, at the first
+  thing a reader sees. `blocking_path._agg_gate_shape` now detects the shape at
+  render time from data the artifact already stamps (`workflow_job_graph` + the
+  check spine — no producer change): trivial P50 (<= 30s, below any real hosted
+  job's checkout+setup floor), a *terminal* job whose transitive `needs:` closure
+  (>= 2 jobs) covers every non-terminal job in its workflow (uncovered siblings
+  must themselves be terminal — the shape of an `if:`-conditional peer sink like
+  `publishRelease`), no sampled step above that threshold, and at least one
+  upstream member with measured timing. Such a pole now renders a role line
+  saying what it is — its wait IS its `needs:` upstream — names the slowest
+  measured upstream member with its P50, and points at the pole that drills it
+  (an anchor when it renders, otherwise the check name and what a re-run does —
+  never a dead link), with **no drill, no floor note and no agent prompt**.
+  Structure, not duration, is the test: a real 3s `lint` job with no `needs:`
+  coverage renders byte-identically to before. Crowning and ranking are
+  unchanged, a sink that is a modal-chain member keeps its chain-stage framing
+  (no double-framing), and a pole with a matched log-detector leaf or a routed
+  structural lever keeps its drill (there the advice is not inert, and dropping
+  it would lose a measured lever). `verify_report` gained the matching pair:
+  `check_speed_poles_complete` exempts such a pole from the every-pole-has-a-
+  prompt rule, and the new `check_aggregation_gate_poles_never_prescribe` fails
+  any aggregation-framed pole that carries a prompt, omits the upstream pointer,
+  or whose shape does not re-derive from `findings.json` — so the exemption can
+  never launder a genuinely stunted pole. ARCHITECTURE §12.6b documents the
+  shape; SKILL.md 5b carries the matching self-audit carve-out.
+
+- **2026-07-28** — **The physical-bound sizing guard now joins a finding's jobs
+  through the scanned job graph, never a cross-workflow name match** (issue #2).
+  `verify_report.check_saving_within_measured_compute` matched a finding's
+  `affected_jobs` (YAML keys) against the cost spine's job names (rendered
+  `name:` display names, one row per matrix leg). A `name:`-overridden job missed
+  that join entirely and fell through to the cross-workflow same-name fallback,
+  which bound an UNRELATED job in another workflow that happened to share the bare
+  name — on biomejs/biome, OPT33's `lint` in `pull_request.yml` (real compute
+  13,381.6 min/mo across two matrix legs) bound `pull_request_markdown.yml`'s
+  553.0 min/mo `lint`, and a correctly-sized 3,187.9 min/mo credit false-FAILed
+  the gate. The join now resolves key ↔ `name:` in BOTH directions through the
+  artifact's own `workflow_job_graph`, tries every same-workflow identity before
+  the cross-workflow fallback, and sums all matrix legs of the resolved job.
+  Graph-resolved aliases are SAME-WORKFLOW ONLY — the cross-workflow fallback
+  still matches the literal base, so a job with no spine row in its own workflow
+  can never bind an unrelated namesake's compute and inflate the upper bound. An
+  affected job genuinely absent from the spine still surfaces as a coverage gap,
+  and an artifact with no job graph keeps the previous bare-name behavior. An
+  AMBIGUOUS display name — two job keys in one workflow rendering to the same
+  `name:`, hence one shared spine row — yields no alias, so a finding is never
+  bounded by its twin's compute.
+
 ### Fixed (pre-flip audit wave 2)
 
 - **2026-07-22** — **Catalog deep-links now use GitHub's real GFM anchor rule.**

@@ -278,17 +278,86 @@ def _defuse_backtick_runs(s: str) -> str:
     return _FENCE_RUN_RE.sub(lambda m: "'" * len(m.group(0)), s)
 
 
+# Credential masking (#12, skills.sh Snyk W007). The quoted evidence is verbatim
+# third-party job-log / workflow-YAML text, and the report is the artifact users commit
+# and share. GitHub masks the secrets it KNOWS about (registered ones) in its own log
+# output — that stays the first layer — but an accidentally-echoed unregistered token
+# reaches the captured log in the clear. So mask credential-SHAPED strings here too,
+# deterministically, at the same sink that defuses backtick runs.
+#
+# SHAPED patterns only, deliberately: no entropy heuristic. A report whose step names,
+# durations, run URLs or 40-hex provenance shas came back `[REDACTED:...]` would be
+# useless, and a bare sha is not a credential. Each entry masks its WHOLE match.
+_SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"
+                                r"|\bgithub_pat_[A-Za-z0-9_]{20,}")),
+    ("aws-access-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    ("private-key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{30,}")),
+    ("docker-token", re.compile(r"\bdckr_pat_[A-Za-z0-9_-]{20,}")),
+    # OpenAI / Anthropic style. Anchored on the `sk-` prefix AND a >=20-char alphanumeric
+    # tail, so a hyphenated step name can't reach it.
+    ("llm-api-key", re.compile(r"\bsk-(?:proj-|ant-[a-z0-9]+-|live-|test-)?[A-Za-z0-9]{20,}")),
+)
+# The un-shaped catch-all: `<key> = <value>` / `<key>: <value>`. Only the VALUE is masked
+# (the key name is half the diagnostic value of the line). The key may carry the usual
+# env-var prefix (`NPM_TOKEN=`, `GH_API_KEY:`) — the plain `\btoken\b` form would miss
+# every real-world log line, since `_` is a word char. An HTTP auth SCHEME word may sit
+# between the separator and the value (`Authorization: Bearer <opaque>` is the single most
+# common real form, and the value — not the scheme — is the credential). The value must be
+# >=8 chars AND (a digit anywhere OR >=16 chars), so ordinary prose (`token: yes`,
+# `authorization: required`) and timing lines are left alone. The lookahead makes the mask
+# idempotent.
+_ASSIGN_SECRET_RE = re.compile(
+    r"(?i)\b(?:[A-Za-z0-9]+[._-])*"
+    r"(?:token|secret|password|passwd|api[_-]?key|authorization|bearer)\b\s*[=:]\s*"
+    r"(?:(?:bearer|basic|token)\s+)?"
+    r"(?!\[REDACTED:)(\S{8,})")
+# A value that is a variable REFERENCE, not a value: `${{ secrets.X }}` (the actions
+# expression, with or without inner spaces), `${VAR}`, `$VAR`, `%VAR%`. These are exactly
+# what a correctly-written workflow YAML line looks like, and they are the lines the
+# catalog detectors quote as evidence — masking them would destroy the diagnostic and
+# falsely suggest the repo hardcodes a token.
+_ASSIGN_VAR_REF_RE = re.compile(r"^(?:\$\{\{?[^}]*\}?\}|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%)")
+
+
+def _redact_secrets(s: str) -> str:
+    """Mask credential-shaped substrings in one line of untrusted third-party text,
+    replacing each with `[REDACTED:<kind>]` and KEEPING the surrounding words so the
+    evidence stays interpretable. Idempotent, and a no-op on text with no credential
+    shape in it (the overwhelmingly common case)."""
+    for kind, pat in _SECRET_PATTERNS:
+        s = pat.sub(f"[REDACTED:{kind}]", s)
+
+    def _assign(m: "re.Match[str]") -> str:
+        val = m.group(1)
+        if not (len(val) >= 16 or any(c.isdigit() for c in val)):
+            return m.group(0)          # `password: changeme` — prose, not a credential
+        if _ASSIGN_VAR_REF_RE.match(val):
+            return m.group(0)          # `TOKEN: ${{secrets.X}}` — a reference, not a value
+        return m.group(0)[: m.start(1) - m.start(0)] + "[REDACTED:credential]"
+
+    return _ASSIGN_SECRET_RE.sub(_assign, s)
+
+
 def _fence_safe(s: object) -> str:
     """Make one line of repo-controlled free text safe to drop into a ```text fence (a
     waterfall label, a verbatim log/YAML evidence line): defuse >=3-backtick runs, collapse
     any embedded newline/CR run to a single space (a name/step/log line is ONE line — an
     embedded newline could otherwise become its own all-backtick line and close the fence),
-    and strip dangerous control chars (tab kept). BYTE-IDENTICAL for clean single-line input
-    (no >=3-backtick run, no newline, no control char) — every normal name/label/evidence
-    line passes through unchanged."""
+    strip dangerous control chars (tab kept), and mask credential-shaped strings (#12).
+    BYTE-IDENTICAL for clean single-line input (no >=3-backtick run, no newline, no control
+    char, no credential shape) — every normal name/label/evidence line passes through
+    unchanged. This is the ONE chokepoint every verbatim log/YAML line, every repo-controlled
+    name and every agent-prompt line already flows through (directly, or via `_clean_label` /
+    `_safe_span` / `_fence_body`), so the mask covers the whole class by construction instead
+    of site by site."""
     s = _FENCE_CTRL_RE.sub("", str(s))
     s = re.sub(r"[\r\n]+", " ", s)
-    return _defuse_backtick_runs(s)
+    return _redact_secrets(_defuse_backtick_runs(s))
 
 
 def _safe_span(s: object) -> str:
@@ -689,6 +758,155 @@ def _floor_note(pole: dict[str, Any],
         f"`{_clean_label(_check_name(floor_next))}` ({_clock(_eff_floor_s(floor_next))}); below "
         "that the gate moves and further savings are runner-minutes, not wall-clock."
         + _recoverable_reconciliation(addr_leg, _tw), ""]
+
+
+# ── Aggregation gate (the degenerate chain SINK) ─────────────────────────────────────
+# A "success-aggregation gate" is the trivial job whose ONLY purpose is to `needs:` a set
+# of real jobs so that ONE check can be the single required status check — vercel/next.js'
+# `thank you, build` (job `buildPassed`: `needs: [deploy-target, build, build-wasm,
+# build-native]`, body `run: exit 1` behind an `if:`, P50 3s, required). Crowning it is
+# CORRECT data (it literally gates every PR), but drilling it and handing the reader a
+# "capture timing, then optimize this step" prompt is INERT advice: there is nothing inside
+# a 3-second no-op to speed, and moving it off the PR path defeats the reason it exists.
+# Its wait IS its `needs:` upstream, so the honest lever is the slowest upstream member.
+#
+# THRESHOLD. `_AGG_GATE_TRIVIAL_S` = 30s: a hosted-runner job that does any real work
+# (checkout + toolchain setup alone) clears 30s comfortably, so a check whose P50 sits under
+# it did nothing but wait on `needs:`. Duration ALONE never matches — it is one necessary
+# condition of a STRUCTURAL test (terminal node + covers every non-terminal job in its
+# workflow); a genuinely fast real job (a 3s lint) fails the structure test and keeps
+# today's rendering.
+_AGG_GATE_TRIVIAL_S = 30.0
+
+
+def _agg_job_produces_check(job_name: str, is_matrix: bool, check: str) -> bool:
+    """True iff a workflow job whose display `name:` is `job_name` (matrix-flagged iff
+    `is_matrix`) produces the check-run named `check`. Mirrors the scanned check->job
+    matching used elsewhere in the pipeline (exact display name; a matrix `name:` template
+    with `${{ … }}` holes compiled to `.+?`; a static matrix job's `Name (leg…)` legs). An
+    ENTIRELY-placeholder template is refused — a match-anything `^.+?$` would bind any
+    check-run and let this gate name an unrelated check as "the slowest upstream member"."""
+    if not job_name:
+        return False
+    if job_name == check:
+        return True
+    if "${{" in job_name:
+        parts = re.split(r"\$\{\{.*?\}\}", job_name)
+        if not any(p.strip() for p in parts):
+            return False  # degenerate all-placeholder template
+        return bool(re.match("^" + ".+?".join(re.escape(p) for p in parts) + "$", check))
+    if is_matrix:
+        return bool(re.match("^" + re.escape(job_name) + r"(?: \(.*\))?$", check))
+    return False
+
+
+def _agg_gate_shape(pole: dict[str, Any], job_graph: dict[str, Any] | None,
+                    checks: list[dict[str, Any]],
+                    timeline: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The aggregation-gate shape for `pole`, or None when it doesn't match.
+
+    ALL of the following must hold (structure first — duration alone never matches):
+
+    (a) TRIVIAL — the check's headline P50 is <= `_AGG_GATE_TRIVIAL_S` (see above).
+    (b) TERMINAL SINK COVERING ITS WORKFLOW — the pole's job is a terminal node (no job in
+        the workflow `needs:` it) and its TRANSITIVE `needs:` closure contains every
+        NON-terminal job in that workflow. Uncovered siblings must themselves be terminal,
+        which is exactly the shape of an `if:`-conditional peer (next.js' `publishRelease`,
+        `deploy-tarball`): a conditional peer sink is never something the gate could
+        `needs:`, so "effectively all the other jobs" is expressed STRUCTURALLY rather than
+        by reading `if:` (which the scanned graph does not carry). The closure must hold
+        >= 2 jobs, so a single-parent `needs: [build]` stage — a chain member, not an
+        aggregation sink — never matches.
+    (c) NO SUBSTANTIVE WORK OF ITS OWN — step data is used only as a DISQUALIFIER, because
+        it usually does not exist for a check like this (a 3s gate is never drilled). When
+        per-step data IS present and any step exceeds the trivial threshold, the job does
+        real work and the shape is refused. With no step data, (a)+(b) stand on their own
+        and the rendered role line discloses that.
+    (d) A NAMED, MEASURED UPSTREAM — at least one member of the `needs:` closure resolves to
+        a measured check. Without one there is no honest "the real lever is over there" to
+        point at, so the pole keeps today's rendering rather than trading an inert prompt
+        for a contentless role line.
+
+    Returns `{"job_id", "upstream" (job ids), "slowest" (the measured check dict),
+    "unmeasured" (upstream display names with no measured check), "steps_known"}`."""
+    head_s, _ = _pole_headline(pole)
+    if head_s > _AGG_GATE_TRIVIAL_S:
+        return None
+    wf = str(pole.get("workflow_file") or "")
+    jobs = _as_dict(_as_dict(job_graph).get(wf))
+    if not jobs:
+        return None  # no scanned graph for this workflow — the shape is unknowable
+    check = str(pole.get("check") or "")
+    jid = str(pole.get("job") or "")
+    if jid not in jobs:
+        # The pole's `job` may be a DISPLAY name (or absent); resolve it back to the YAML key.
+        cands = [k for k, meta in jobs.items()
+                 if _agg_job_produces_check(str(_as_dict(meta).get("name") or k),
+                                            bool(_as_dict(meta).get("matrix")), check)]
+        if len(cands) != 1:
+            return None  # unresolvable or ambiguous identity — never guess
+        jid = cands[0]
+    needs_of = {k: [str(n) for n in _as_list(_as_dict(m).get("needs"))]
+                for k, m in jobs.items()}
+    depended_on = {n for ns in needs_of.values() for n in ns}
+    if jid in depended_on:
+        return None  # something `needs:` it — a chain stage, not a terminal sink
+    closure: set[str] = set()
+    frontier = list(needs_of.get(jid) or [])
+    while frontier:
+        n = frontier.pop()
+        if n in closure or n not in jobs:
+            continue
+        closure.add(n)
+        frontier.extend(needs_of.get(n) or [])
+    if len(closure) < 2:
+        return None
+    non_terminal = {k for k in jobs if k in depended_on}
+    if not non_terminal <= closure:
+        return None
+    _step_durs = [_num(_as_dict(s).get("dur_s"))
+                  for s in _as_list(_as_dict(timeline).get("steps"))]
+    _step_durs += [_num(_as_dict(s).get("p50_s")) for s in _as_list(pole.get("steps"))]
+    if any((d or 0.0) > _AGG_GATE_TRIVIAL_S for d in _step_durs):
+        return None  # it does substantive work of its own
+    # Resolve each upstream job to its measured check(s) IN THE SAME WORKFLOW — a
+    # cross-workflow same-name check is a different job entirely.
+    slowest: dict[str, Any] | None = None
+    unmeasured: list[str] = []
+    for j in sorted(closure):
+        meta = _as_dict(jobs.get(j))
+        nm = str(meta.get("name") or j)
+        matched = [_as_dict(c) for c in checks
+                   if str(_as_dict(c).get("workflow_file") or "") == wf
+                   and _agg_job_produces_check(nm, bool(meta.get("matrix")),
+                                               _check_name(_as_dict(c)))]
+        if not matched:
+            unmeasured.append(nm)
+            continue
+        # Rank the upstream members by the SECONDS their own drilled pole HEADER would show
+        # (`_pole_headline(c)[0]`, the bimodal-aware header duration), NOT the bare p50. Both
+        # max() calls: WITHIN a matrix job's legs (`top`) and ACROSS jobs (`slowest`). Selecting
+        # by p50 named the p50-slowest sibling while the member that actually CAPS the sink's
+        # `needs:` wait is the one whose bimodal SLOW mode is the true ceiling (a matrix leg whose
+        # blended p50 sits below a faster-median sibling but whose slow mode exceeds it) — so the
+        # sink pointed the reader at the wrong lever, and the pole it links to (headlined at its
+        # slow mode) showed a longer time than the sink named (issue #22 class). We rank by
+        # `_pole_headline`, NOT `_eff_floor_s`: for a member whose median sits on the FAST cluster
+        # `_pole_headline` returns the slow mode (== `_eff_floor_s`, the #22 case we must catch),
+        # but for a member whose median ALREADY sits in the SLOW cluster it returns the p50 that
+        # its header shows (`_eff_floor_s` would over-state that to the high mode). Ranking AND
+        # rendering by the header value keeps the pick, its quoted duration, and the linked pole's
+        # header in exact agreement — `_eff_floor_s` would quote a duration ABOVE the linked pole's
+        # header on a slow-median member (greptile P1).
+        top = max(matched, key=lambda c: _pole_headline(c)[0])
+        if slowest is None or _pole_headline(top)[0] > _pole_headline(slowest)[0]:
+            slowest = top
+    if slowest is None:
+        return None
+    return {"job_id": jid, "upstream": sorted(closure), "slowest": slowest,
+            "unmeasured": unmeasured,
+            "steps_known": bool(_as_list(_as_dict(timeline).get("steps"))
+                                or _as_list(pole.get("steps")))}
 
 
 # Wall-clock severity dot for a long-pole title, by the gate's measured P50 wait:
@@ -2780,7 +2998,12 @@ def _llm_analysis_block(a: dict[str, Any], cross_run_rendered: bool = False) -> 
     suppresses that section, so the citation must be suppressed too, or it dangles)."""
     if not isinstance(a, dict):
         return []
-    cause = str(a.get("cause", "")).strip()
+    # `cause`/`breakdown` are LLM prose ABOUT the log, so they can echo a credential the
+    # log carried. They render as markdown (not in a fence), so they don't pass through
+    # `_fence_safe` — mask them here. The `evidence` lines and the `prompt` do go through
+    # `_fence_safe`/`_fence_body`; these two fields are the only untrusted-derived text
+    # that bypasses it, which makes this the second (and last) masking chokepoint.
+    cause = _redact_secrets(str(a.get("cause", "")).strip())
     breakdown = a.get("breakdown") or []
     evidence = a.get("evidence") or []
     if not (cause or breakdown or evidence):
@@ -2798,9 +3021,9 @@ def _llm_analysis_block(a: dict[str, Any], cross_run_rendered: bool = False) -> 
         out += ["**Where the time likely goes (LLM reading of the log):**", ""]
         for row in breakdown:
             if isinstance(row, (list, tuple)) and len(row) >= 2:
-                out.append(f"- {row[0]} - {row[1]}")
+                out.append(_redact_secrets(f"- {row[0]} - {row[1]}"))
             else:
-                out.append(f"- {row}")
+                out.append(_redact_secrets(f"- {row}"))
         out.append("")
     if evidence:
         out += ["**Evidence — verbatim from the captured job log:**", "",
@@ -4493,9 +4716,15 @@ def _flatten_cell(text: str) -> str:
     """A markdown table cell can't contain a raw newline or an unescaped pipe — and a
     >=3-backtick run in the repo evidence text that flows through here (structural /
     workflow-YAML `evidence`) would break out of a ```text fence elsewhere in the report
-    AND desync `verify_report`'s fence split, so defuse it here too. No-op on clean cells."""
-    return _defuse_backtick_runs(
-        re.sub(r"\s+", " ", str(text)).replace("|", "\\|").strip())
+    AND desync `verify_report`'s fence split, so defuse it here too. No-op on clean cells.
+
+    This is the THIRD untrusted-text sink (with `_fence_safe` and `_llm_analysis_block`):
+    the appendix `**Evidence:**` lines and the Tier-2 / structural rows quote workflow-YAML
+    verbatim through here WITHOUT going through `_fence_safe`, and a hardcoded token in a
+    workflow file is the most likely place a credential is quoted from — so mask here too
+    (#12). Masking is a no-op on clean cells, so the byte-identity contract holds."""
+    return _redact_secrets(_defuse_backtick_runs(
+        re.sub(r"\s+", " ", str(text)).replace("|", "\\|").strip()))
 
 
 def _dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -8168,6 +8397,20 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
         head_s, bi_caveat = _pole_headline(p)
         dur = _clock(head_s)
         _raw_check = str(p.get("check", ""))
+        # AGGREGATION-GATE (success-sink) detection — issue #1, see `_agg_gate_shape`. Three
+        # deliberate carve-outs: a modal-chain MEMBER keeps the chain-stage framing (the chain
+        # rendering wins; never double-frame), and a pole carrying real measured content of its
+        # own — a matched log-detector leaf, or a structural lever routed to it — keeps today's
+        # rendering, because there the drill/prompt is NOT inert and suppressing it would
+        # silently drop a measured lever that renders nowhere else.
+        _agg_key = pole_owner_keys.get(id(p))
+        _agg = None
+        if (not (chain_active and _raw_check in set(_chain_modal))
+                and _pole_leaves[id(p)][1] is None
+                and not _structural_for_pole(p, all_findings)):
+            _agg = _agg_gate_shape(
+                p, doc.get("workflow_job_graph"), list(checks or src),
+                steps.get(_agg_key) if _agg_key is not None else None)
         if chain_active and _raw_check in set(_chain_modal):
             # ENG-1 PR-N2: a chain MEMBER must never carry the concurrent
             # framing — `needs:` serializes it; its time ADDS to the headline
@@ -8183,6 +8426,47 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
                     "the chain wait in the headline rather than overlapping it; "
                     "time cut here helps until the next-longest competing path "
                     "gates instead.")))
+        elif _agg:
+            # AGGREGATION GATE (issue #1). Crowning it is correct — it really is the check
+            # most PRs gate on — but its wait is NOT its own: it is the `needs:` upstream it
+            # aggregates. Say that, name the slowest measured upstream member, and (below)
+            # render NO drill and NO "optimize this step" prompt for the sink itself.
+            _ag_slow = _clean_label(_check_name(_agg["slowest"]))
+            # Render the member's own drilled-pole HEADER duration (`_pole_headline(...)[0]`), not
+            # the bare p50 and not `_eff_floor_s` — it MUST agree with the selection above (which
+            # ranks by the same header value) or the sink would name a member `X` yet quote a
+            # duration SMALLER than an unnamed sibling, and it MUST equal the header of the very
+            # pole its "Where the wait actually is" pointer links to. `_eff_floor_s` (always the
+            # high mode) satisfies neither on a member whose median already sits IN the slow
+            # cluster: there `_pole_headline` shows the p50 the linked pole's header shows, while
+            # `_eff_floor_s` would over-quote the high mode above it (issue #22 / greptile P1).
+            _ag_dur = _clock(_pole_headline(_agg["slowest"])[0])
+            # BOTH caveats compose — they are independent, and neither may silently drop the
+            # other. "Runs no work of its own" rests on the measured P50 plus the `needs:`
+            # structure whenever no per-step data was captured, so that basis is disclosed on
+            # its own terms even when an unmeasured upstream member is ALSO disclosed (an
+            # `elif` hid the weaker basis exactly when the sample was thinnest — greptile P1).
+            _ag_tail = ""
+            if _agg["unmeasured"]:
+                _ag_tail += (f" ({_count_noun(len(_agg['unmeasured']), 'upstream job')} had no "
+                             "measured check timing in this sample, so the slowest upstream "
+                             "member could be a heavier one.)")
+            if not _agg["steps_known"]:
+                _ag_tail += (" (No per-step data was captured for this check; the shape is read "
+                             "from its `needs:` structure and its measured P50.)")
+            role = cs.add(claims.Claim(
+                kind="pole_role_line", subject=check,
+                fields={"dur": dur, "job_id": str(_agg["job_id"]),
+                        "upstream_n": len(_agg["upstream"]),
+                        "upstream_slowest": _ag_slow, "upstream_dur": _ag_dur},
+                rendered=_strip_emdashes(
+                    f"**Aggregation gate — it exists to be the single required check.** Its "
+                    f"job (`{_agg['job_id']}`) runs no work of its own ({dur}); it `needs:` "
+                    f"{_count_noun(len(_agg['upstream']), 'upstream job')} so one check can "
+                    f"stand for all of them. So its {dur} is not the wait — the wait IS that "
+                    f"`needs:` upstream, whose slowest measured member is `{_ag_slow}` "
+                    f"(~{_ag_dur}). That member, not this check, is the lever."
+                    + _ag_tail)))
         elif p is blocker:
             if not npop:
                 # Claims layer (pole_role_line): the blocker pole's role label.
@@ -8203,7 +8487,92 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
                 # one "the slowest"; that would contradict the headline's truthful split.
                 # Quote `floor_name`'s OWN time (`slowest_dur`); it only "sets the wall-clock
                 # floor" when it isn't a non-universal check (else a median PR finishes sooner).
-                _sets_floor = "" if floor_lowered else ", which sets the wall-clock floor"
+                #
+                # Effective-floor honesty (issue #22 class). `floor_name`/`slowest_dur` come from
+                # `src[0]` — the p50-slowest TYPICAL check — and are STAMP-BOUND to the data
+                # layer's p50-based `critical_path_check`
+                # (`verify_report.check_headline_slowest_matches_stamp`). Re-ranking THIS pick to
+                # the effective floor would desync the headline from its stamp (which is NOT
+                # bimodal-aware), so we keep the p50 pick and instead DISCLOSE the true ceiling
+                # beside it: when we would otherwise credit `floor_name` with setting the
+                # wall-clock floor (`not floor_lowered`), consult `_binding_floor` over the
+                # concurrent set (the pole itself excluded, mirroring `_floor_note`). `_others` is
+                # the FULL concurrent set minus the gate (managed checks INCLUDED), exactly
+                # `_floor_note`'s pool, so `_bf` is the SAME binding floor `_floor_note` computes —
+                # the two can never name different checks as the cap.
+                #
+                # Gate AND quote by `_pole_headline(_bf)[0]` (the seconds `_bf`'s OWN drilled-pole
+                # header would show), NOT frac-blind `_eff_floor_s` — the same choice site A makes.
+                # `_pole_headline` returns the slow mode only for a WELL-FORMED bimodal whose median
+                # sits on the fast cluster (`hi and lo and frac and hi > p50*1.15 and p50 <= mid`),
+                # else the p50. So (i) the quoted duration equals `_bf`'s own header (no "names a
+                # check at a time its drill contradicts"), and (ii) a DEGENERATE bimodal (missing
+                # `low_p50_s`/`slow_frac`, or `slow_frac == 0`) can't fire a phantom "slow mode on
+                # ~0% of runs" — `_eff_floor_s` would, reading only `high_p50_s`.
+                #
+                # Three outcomes, so `floor_name` is NEVER credited with a floor a slower sibling
+                # actually sets (greptile: "managed floor is misattributed"):
+                #   (a) `_bf` out-floors `floor_name` AND is FILE-BACKED → name it as the tunable
+                #       ceiling to attack ("sets the wall-clock floor on slow-mode PRs").
+                #   (b) `_bf` out-floors `floor_name` but is MANAGED/external (no `workflow_file`)
+                #       → DROP the floor claim entirely (`_sets_floor = ""`). We must not credit
+                #       `floor_name` (a slower check genuinely caps the merge), but must not frame
+                #       an untunable managed check as attackable here either — `_floor_note` owns
+                #       the managed cap's disclosure via its dedicated "no workflow file to speed up
+                #       here `X`" phrasing. So the role line names the slowest TYPICAL check and
+                #       stays silent on the floor, which `_floor_note` sets straight.
+                #   (c) nothing out-floors `floor_name` → it genuinely sets the floor; keep the
+                #       plain ", which sets the wall-clock floor" (as before).
+                #
+                # SPINE-DISCLOSURE NOTE (not a disclosure mechanism of its own). This clause's tail
+                # phrasing is NOT one `verify_report._SPINE_FLOOR_NAME_RE` reads, and it adds no new
+                # spine-disclosure obligation: `check_spine_heavy_check_disclosed` keys on each
+                # DRILLED pole's binding floor re-derived from `populations`, independent of this
+                # text. A file-backed `_bf` that must be disclosed there is disclosed by ITS OWN
+                # drilled-pole header (a heavy concurrent check is normally a pole) — NOT by the gate
+                # pole's `_floor_note`, which is suppressed whenever this clause fires (`binding_s >=
+                # pole_p` for the gate). `verify_report` is untouched by this change, so the
+                # obligation set and the satisfaction set are exactly `main`'s.
+                _others = [c for c in floor_pool
+                           if _clean_label(_check_name(c)) != gate_check]
+                _bf = (_binding_floor(_others, p.get("_cooccur"),
+                                      int(p.get("_gating_n") or 0))
+                       if (not floor_lowered and _others) else None)
+                # `_bf_caveat` is non-empty ONLY when `_pole_headline`'s bimodal override fired —
+                # `_bf` is a genuine fast-median bimodal whose SLOW mode is a hidden ceiling
+                # (`_bf_hd` == that slow mode). Require it: the clause's wording asserts a "bimodal
+                # slow mode … on slow-mode PRs", so it must NOT fire for a UNIMODAL `_bf` whose
+                # plain p50 merely out-ranks `floor_name` (a heavy path-conditional/minority check
+                # from `floor_pool` that isn't in the typical `src` — the lightdash `E2E` class).
+                # Such a check doesn't run on a TYPICAL PR, so it does not out-floor the typical
+                # wait the role line describes; `floor_name` genuinely sets that floor (outcome c),
+                # and the heavy check's own gating is disclosed on its DRILLED pole, not here.
+                # Without this guard the clause would print "bimodal slow mode … on slow-mode PRs"
+                # for a check that is neither (silent-failure-hunter).
+                _bf_hd, _bf_caveat = _pole_headline(_bf) if _bf is not None else (0.0, "")
+                _bf_outfloors = (_bf is not None and bool(_bf_caveat)
+                                 and _clean_label(_check_name(_bf)) != floor_name
+                                 and _bf_hd > (slowest_p50 or 0.0) + 0.5)
+                if _bf_outfloors and str(_bf.get("workflow_file") or ""):
+                    _bf_name = _clean_label(_check_name(_bf))
+                    _sets_floor = (f"; but `{_bf_name}`'s bimodal slow mode "
+                                   f"(~{_clock(_bf_hd)}) runs longer, so it — not "
+                                   f"`{floor_name}` — sets the wall-clock floor on slow-mode PRs")
+                elif _bf_outfloors:
+                    # Managed/external `_bf` (no `workflow_file`) out-floors `floor_name`. Don't
+                    # credit `floor_name`, and don't frame the untunable check as attackable — but
+                    # DO name it as the real cap, using `_floor_note`'s "no workflow file to speed
+                    # up here `X`" phrasing (the form `verify_report._SPINE_FLOOR_NAME_RE` reads).
+                    # This DISCLOSES the managed ceiling on the spine even when the gate pole's own
+                    # `_floor_note` is suppressed (`binding_s >= pole_p`, which always holds when
+                    # this clause fires), closing the managed-floor disclosure gap rather than
+                    # leaving the capping check named nowhere.
+                    _bf_name = _clean_label(_check_name(_bf))
+                    _sets_floor = (f"; but a concurrent check with no workflow file to speed up "
+                                   f"here, `{_bf_name}` (~{_clock(_bf_hd)}), runs longer — so it, "
+                                   f"not `{floor_name}`, caps the wall-clock floor on slow-mode PRs")
+                else:
+                    _sets_floor = "" if floor_lowered else ", which sets the wall-clock floor"
                 role = (f"**The check most PRs gate on.** A typical PR waits on this most "
                         f"often; the slowest concurrent check is `{floor_name}` "
                         f"(~{slowest_dur}){_sets_floor}.")
@@ -8264,25 +8633,38 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
             def _cn(c: dict[str, Any]) -> str:
                 return _clean_label(str(c.get("name") or c.get("check") or ""))
             _pole_wf = str(p.get("workflow_file", ""))
+            # Rank the concurrent checks above this pole by their EFFECTIVE floor
+            # (`_eff_floor_s`, bimodal-aware `max(p50, high_p50_s)`) — the SAME notion
+            # every other floor path and verify_report's spine-drop check use — NOT the
+            # bare p50. Selecting by p50 named the p50-slowest sibling of a matrix while
+            # the check that actually CAPS the wait was a DIFFERENT leg whose bimodal SLOW
+            # mode is the effective ceiling (e.g. `guard shard 4/4`: blended p50 below
+            # `1/4` but slow-mode above `1/4`'s). The report then named a shard that isn't the
+            # binding floor, so the floor went undisclosed and verify_report FAILed.
             above = sorted(
                 (c for c in src
-                 if (_num(c.get("p50_s")) or 0.0) > head_s and _cn(c) != check
+                 if _eff_floor_s(c) > head_s and _cn(c) != check
                  and not _same_matrix(check, _cn(c),
                                       _pole_wf, str(c.get("workflow_file", "")))),
-                key=lambda c: -(_num(c.get("p50_s")) or 0.0))
+                key=lambda c: -_eff_floor_s(c))
             if above:
                 lead = above[0]
+                _lead_floor = _clock(_eff_floor_s(lead))
                 # Claims layer (pole_role_line family): `subject` is the interpolated
-                # lead-check name (the concurrent check this pole runs behind). Wrap in
+                # lead-check name (the concurrent check this pole runs behind), valued at
+                # its effective floor. The field key is `lead_floor` (NOT `lead_p50`): the
+                # value is `_eff_floor_s(lead)` — the bimodal-aware `max(p50, high_p50_s)`,
+                # which can be the slow mode, not the median — so a `p50` key would misname
+                # it and invite a consumer to read a floor as a median. Wrap in
                 # `_strip_emdashes` for parity with the headline claims, so the manifest's
                 # `rendered` matches the em-dash-stripped report text; the report-wide strip
                 # is idempotent, so this stays byte-identical.
                 role = cs.add(claims.Claim(
                     kind="pole_role_line", subject=_cn(lead),
-                    fields={"lead_p50": _clock(_num(lead.get("p50_s"))), "dur": dur},
+                    fields={"lead_floor": _lead_floor, "dur": dur},
                     rendered=_strip_emdashes(
                         f"Runs concurrently behind `{_cn(lead)}` "
-                        f"({_clock(_num(lead.get('p50_s')))}); it becomes the gate only "
+                        f"({_lead_floor}); it becomes the gate only "
                         f"once every slower concurrent check drops below {dur}.")))
             else:
                 role = (f"Runs concurrently — becomes the gate once the slower checks "
@@ -8377,6 +8759,41 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
             out += [_LEAF_CROWN_MARKER.format(fk=str(leaf.get("fix_key", ""))), ""]
         if bi_caveat:
             out += [bi_caveat, ""]
+        if _agg:
+            # AGGREGATION GATE (issue #1): the section ENDS at the honest pointer. No
+            # per-step drill and no "capture timing, then optimize this step" agent prompt
+            # for the sink itself — both are inert over a job that runs no work, and the
+            # prompt actively misdirects (there is nothing to speed, and moving it off the
+            # PR path defeats the single-required-check job it does). The `_floor_note`
+            # ("what a change here can buy") is skipped for the same reason: a change HERE
+            # buys nothing, which is exactly what the role line just said. The reader is
+            # pointed at the pole that drills the slowest upstream member, or told which
+            # check it is when it isn't among the rendered poles (never a dead link).
+            # IDENTITY, not presentation: the pole this links to is matched on the RAW check
+            # name + workflow file — the same (name, file) identity the spine carries. Matching
+            # on the CLEANED display label instead would fold two distinct checks whose labels
+            # normalize together (`@scope/lint` and `lint` both clean to `lint`) and link the
+            # gate's pointer at an unrelated pole's drill (greptile P2; the #13 name-join
+            # lesson). `_ag_slow` stays the DISPLAY label only.
+            _ag_wf = str(_agg["slowest"].get("workflow_file") or p.get("workflow_file") or "")
+            _ag_raw = _check_name(_agg["slowest"])
+            _ag_pole_i = next(
+                (j for j, pw in enumerate(pole_wfs, 1)
+                 if _check_name(pw) == _ag_raw
+                 and str(pw.get("workflow_file") or "") == _ag_wf), None)
+            if _ag_pole_i is not None:
+                out += [f"**➡️ Where the wait actually is:** [Long pole {_ag_pole_i}]"
+                        f"(#pole-{_ag_pole_i}) drills `{_ag_slow}` ({_ag_dur}) - the slowest "
+                        "measured member of this gate's `needs:` upstream. Attack it there; "
+                        "this check follows it down for free.", ""]
+            else:
+                out += [f"**➡️ Where the wait actually is:** `{_ag_slow}` ({_ag_dur}), the "
+                        "slowest measured member of this gate's `needs:` upstream. It is not "
+                        "among the long poles drilled in this report (it ranks below them, or "
+                        "its own job timing wasn't sampled), so there is no step-level drill "
+                        "for it here - a re-run that samples it will drill it. Attack it "
+                        "there; this check follows it down for free.", ""]
+            continue
         out += _floor_note(p, floor_pool)
         # A data-driven match is on-path only if ANY joined finding is NOT `spine_rare`; a match
         # made up solely of presence-demoted (opt-in/rare) findings is still coverage, but the

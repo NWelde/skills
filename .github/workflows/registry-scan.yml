@@ -1,0 +1,233 @@
+name: Registry scan
+
+# Runs the same third-party security scanner that skill registries publish audits from
+# (Snyk Agent Scan) against the installable skill trees under `skills/`, so a rule violation
+# fails our build instead of appearing as a public FAIL badge days after release.
+#
+# WHAT THIS DOES NOT COVER. Registries run more than one scanner. This gate reproduces exactly
+# one of them (Snyk Agent Scan). It says nothing about Gen Agent Trust Hub — which publishes no
+# rule catalog and no CLI, and whose verdicts are LLM-generated and not reproducible — or about
+# Socket. A green check here means "Snyk Agent Scan finds nothing we have not accepted". It does
+# not mean every registry scanner will pass.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The scanner's rule catalog changes without any commit of ours: a renamed, retired, or newly
+  # added rule can turn a shipped skill red on its own. The weekly run is what notices.
+  schedule:
+    - cron: "23 7 * * 1" # Mondays, 07:23 UTC
+  workflow_dispatch:
+
+# One in-flight run per ref per event — a new push cancels the previous, still-running run for
+# that branch. `github.event_name` is in the key because a push to main and the weekly scheduled
+# run share `refs/heads/main`: without it, a push would cancel the scheduled run, and a cancelled
+# run notifies nobody. The schedule is the only trigger that notices a rule-catalog change that
+# needed no commit of ours, so it must not be silently cancellable.
+concurrency:
+  group: registry-scan-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the gate only reads the checked-out code.
+permissions:
+  contents: read
+
+env:
+  # THE GATING RULE (owner ruling, 2026-08-10): this build fails on Snyk Agent Scan's critical
+  # class only — the E-codes. Warning-class findings (W-codes) never fail CI.
+  #
+  # They are not hidden, though; "does not block" must not decay into "does not appear". Every
+  # W finding is surfaced three ways on every run: a `::warning::` annotation on the checks tab
+  # (queryable through the checks API, which is what a review agent reads), a table in the job
+  # summary, and the raw finding set uploaded as the `registry-scan-findings` artifact. A human
+  # or a review agent judges them; CI does not block on them.
+  #
+  # The scanner has no severity threshold — `--ignore-issues-codes` is its only gating knob — so
+  # the rule is expressed by enumerating the W class. This is every W-code published in
+  # https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md. It is a class rule, not
+  # fifteen individual judgements, so it carries no per-code justification. W011 "exposure to
+  # untrusted third-party content", the one that fires on these skills today, is an accurate
+  # description of what they do: they read a repository's own CI configuration, workflow files,
+  # and job logs, none of which the skill authored.
+  #
+  # NO E-CODE MAY EVER APPEAR HERE — that would silently disarm the gate, and
+  # tests/test_registry_scan_workflow.py fails if one does. When the scanner publishes a new
+  # W-code it will fail this build once; adding it here is the conscious update that follows.
+  IGNORED_ISSUE_CODES: W001,W007,W008,W009,W011,W012,W013,W014,W015,W016,W017,W018,W019,W020,W021
+
+  # The scanner reads skills out of a directory of `<name>/SKILL.md` subdirectories. This is the
+  # installable tree: exactly what the `skills` CLI copies onto a user's machine and what a
+  # registry publishes.
+  SCAN_PATH: skills
+
+jobs:
+  scan:
+    name: registry scan
+    # This repo dogfoods StarSling runners for its own CI (matching ci.yml). The runner is
+    # self-hosted, so never execute untrusted fork-PR code on it, and repository secrets —
+    # SNYK_TOKEN included — are not available to fork PRs anyway. Fork PRs get the
+    # `fork-not-scanned` job below, which reports the coverage gap instead of a green check.
+    runs-on: starsling-ubuntu-24.04
+    # The scan talks to a network service. A stalled request would otherwise hold a self-hosted
+    # runner for the six-hour GitHub default with no signal.
+    timeout-minutes: 20
+    # Public repo only. On any private staging copy of this tree (e.g. a pre-launch mirror),
+    # running the scan would send UNRELEASED skill text to a third-party scanner API — for a new
+    # skill, the verdict minted on that first contact is the one it wears, so the scan is held
+    # until launch. The guard also keeps a mirror's missing/foreign SNYK_TOKEN from painting
+    # every staged PR red with a scan that was never supposed to run there.
+    if: >-
+      github.repository == 'starslingdev/skills' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      # Third-party actions are pinned to a commit SHA (the tag comment is for humans only) so a
+      # moved/compromised tag can't silently change what runs in CI.
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The scanner reads the working tree only — no history needed, unlike ci.yml's
+          # provenance guard.
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      # A missing token must never look like a clean scan. This is the whole point of the gate:
+      # the failure we are guarding against is a security finding nobody saw, and a silently
+      # skipped security scan is that same failure wearing a green check. On internal pushes and
+      # PRs the secret is expected to exist, so its absence is a red build, not a quiet skip.
+      - name: Require SNYK_TOKEN
+        run: |
+          if [ -z "${SNYK_TOKEN}" ]; then
+            echo "::error title=REGISTRY SCAN DID NOT RUN::SNYK_TOKEN is not set. No skill was scanned. This is a coverage gap, not a clean result."
+            echo "================================================================"
+            echo "  REGISTRY SCAN DID NOT RUN — NOTHING WAS SCANNED"
+            echo ""
+            echo "  SNYK_TOKEN is not set, so the scanner could not contact Snyk"
+            echo "  and no skill under '${SCAN_PATH}' was analysed. Do NOT read this"
+            echo "  run as 'scanned, clean' — it is a coverage gap."
+            echo ""
+            echo "  Fix: add a SNYK_TOKEN repository secret. Get the token from a"
+            echo "  free Snyk account at https://app.snyk.io/account (API Token ->"
+            echo "  KEY -> click to reveal), then add it under Settings -> Secrets"
+            echo "  and variables -> Actions -> New repository secret."
+            echo "================================================================"
+            exit 1
+          fi
+          echo "SNYK_TOKEN is set — the scan below is a real scan."
+
+      # A gate that scans nothing is a gate that passes. The token check above catches one way
+      # that happens; this catches the other. The scanner reads a directory of `<name>/SKILL.md`
+      # subdirectories, so if SCAN_PATH is renamed, moved, or restructured (a `skills/<category>/`
+      # nesting, say), the scanner finds zero skills, reports nothing, exits 0, and this check
+      # goes green having analysed no skill at all. The red-proof below cannot catch that: it
+      # scans its own temp fixture and never touches SCAN_PATH.
+      - name: Require the scan path to contain skills
+        run: |
+          count=$(find "${SCAN_PATH}" -mindepth 2 -maxdepth 2 -name SKILL.md | wc -l | tr -d ' ')
+          if [ "${count}" -eq 0 ]; then
+            echo "::error title=REGISTRY SCAN HAS NOTHING TO SCAN::No '<name>/SKILL.md' found under '${SCAN_PATH}'. The scanner would find zero skills and exit 0. This is a coverage gap, not a clean result."
+            exit 1
+          fi
+          echo "Found ${count} skill(s) under '${SCAN_PATH}' to scan."
+
+      - name: Install uv
+        run: python -m pip install --disable-pip-version-check uv
+
+      # A check that cannot fail is not a check. This scans a throwaway skill built in a temp
+      # directory whose text carries the exact violation class that got a shipped skill flagged,
+      # and it fails this job unless the scanner reports the finding AND exits non-zero. It also
+      # catches the other direction: if the rule is renamed or retired in a catalog revamp, this
+      # step goes red and we find out from our own CI instead of from a public audit page.
+      # The offending string is assembled at runtime — committing one is the thing we're guarding
+      # against — so nothing in this repository contains it. It runs the gate's real flags,
+      # IGNORED_ISSUE_CODES included, so an ignore list that grew to swallow the anchor rule
+      # would fail here rather than quietly neutering the gate.
+      - name: Prove the gate can go red
+        run: python .github/scripts/registry_scan_redprove.py
+
+      # Two passes, on purpose, and exactly two — the scanner is a network service, so every
+      # invocation costs. `--ignore-issues-codes` filters findings out of the printed report as
+      # well as out of the exit status, so the gating pass below is structurally incapable of
+      # showing a warning: it runs with the very flags that hide them. This pass carries no
+      # ignore list and is the only one that sees everything.
+      #
+      # It emits `--json` rather than the rich report because the JSON is what the next step
+      # turns into annotations, a summary table, and an artifact — and because the scanner's own
+      # printer silently drops the codes W003-W006 from the result, mutating it in place as it
+      # prints. JSON skips the printer entirely, so it is strictly the more complete output.
+      - name: Scan (all findings, unfiltered)
+        continue-on-error: true
+        run: |
+          echo "Scanning '${SCAN_PATH}' with no ignore list — every finding the scanner has."
+          uvx snyk-agent-scan@latest scan "${SCAN_PATH}" --json > registry-scan-findings.json
+
+      # Warnings never fail this build, so they must be impossible to miss instead. This writes
+      # each one to the checks tab as an annotation (where a review agent can query it), to the
+      # job summary as a table, and leaves the raw set for the artifact upload below. It never
+      # gates — it fails only if the scan output is unparseable, because silent surfacing looks
+      # exactly like a clean scan.
+      - name: Surface findings (annotations, summary, artifact)
+        run: python .github/scripts/registry_scan_report.py registry-scan-findings.json
+
+      - name: Upload the finding set
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: registry-scan-findings
+          path: registry-scan-findings.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      # The authoritative gate, and the only step that fails on a finding. `--ci` turns any
+      # remaining finding into exit 1; with the W class ignored, "remaining" means the critical
+      # E-class, plus the scanner's own X-class runtime failures, which are deliberately NOT
+      # ignored — a scan that broke is not a scan that passed.
+      # `--dangerously-run-mcp-servers` is required by `--ci`; it only affects MCP server configs,
+      # and this path contains skill directories only, so nothing is executed.
+      - name: Gate on critical findings
+        run: |
+          uvx snyk-agent-scan@latest scan "${SCAN_PATH}" \
+            --ci \
+            --verbose \
+            --dangerously-run-mcp-servers \
+            --ignore-issues-codes "${IGNORED_ISSUE_CODES}"
+
+  fork-not-scanned:
+    # The name is the message: this check being green must not read as "scanned, clean".
+    name: registry scan NOT RUN (fork PR — no scan coverage)
+    # Inverse of the guard above: fork PRs cannot reach repository secrets, so the scanner has no
+    # token and cannot run. Failing an external contributor's PR for infrastructure they have no
+    # way to fix would be hostile, so this reports rather than blocks — but it reports loudly, and
+    # a maintainer must re-run the scan on an internal branch before merging any change to
+    # `skills/` that came from a fork.
+    # Both halves are load-bearing. On a push, a schedule, or a manual dispatch there is no
+    # `github.event.pull_request`, so the second clause alone would be true (null != repo) and
+    # this job would post a green "fork PR — no scan coverage" check next to a real scan that
+    # did run — the exact misreading the job's name exists to prevent.
+    if: >-
+      github.repository == 'starslingdev/skills' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Report the coverage gap
+        run: |
+          echo "::warning title=REGISTRY SCAN DID NOT RUN::Fork PRs have no SNYK_TOKEN, so no skill was scanned on this PR. This is a coverage gap, not a clean result — a maintainer must re-run the scan on an internal branch before merging changes under skills/."
+          echo "================================================================"
+          echo "  REGISTRY SCAN DID NOT RUN — NOTHING WAS SCANNED"
+          echo ""
+          echo "  This pull request comes from a fork. Fork runs have no access"
+          echo "  to the SNYK_TOKEN secret, so the registry scanner could not run"
+          echo "  and no skill was analysed."
+          echo ""
+          echo "  This is a coverage gap, NOT a clean result. Before merging any"
+          echo "  change under skills/ from a fork, a maintainer must push the"
+          echo "  branch to this repository and let the 'registry scan' job run."
+          echo "================================================================"

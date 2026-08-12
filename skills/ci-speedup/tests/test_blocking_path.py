@@ -2846,6 +2846,121 @@ def test_second_pole_role_names_the_real_slowest_concurrent_check_above_it():
     assert "Runs concurrently behind `changed-tests`" in md
 
 
+def _doc_sibling_floor() -> dict:
+    """A two-pole shape reproducing the sibling-family spine-drop bug (a live-run false FAIL):
+    a matrix-sharded family `web-tests (shard N)` where pole 1 is the p50-slowest leg (`shard 1`,
+    drilled at the top) but the leg that actually CAPS the second pole is `shard 4` — a DIFFERENT
+    leg whose bimodal SLOW mode (245s / 4m 05s) is the effective ceiling even though its blended
+    p50 (227s) sits BELOW shard 1's (234s). The second pole `typecheck` runs concurrently behind
+    the family. Generic shapes only — no real repo's check names or logs. `populations` make each
+    pole the per-PR slowest on 6 of 12 sampled PRs, with shard 4 co-occurring on the majority of
+    `typecheck`'s gating PRs so verify_report re-derives it as `typecheck`'s binding floor."""
+    def leg(n: int, p50: float, hi: float | None = None) -> dict:
+        c = {"name": f"web-tests (shard {n})", "p50_s": p50,
+             "workflow_file": ".github/workflows/ci.yml"}
+        if hi is not None:
+            c["bimodal"] = {"low_p50_s": 180.0, "high_p50_s": hi, "slow_frac": 0.55}
+        return c
+    checks = [leg(1, 234.0), leg(4, 227.0, hi=245.0), leg(2, 226.0), leg(3, 221.0),
+              {"name": "typecheck", "p50_s": 206.0, "workflow_file": ".github/workflows/ci.yml"}]
+    pops = []
+    for _ in range(6):   # shard 1 is the per-PR slowest here (pole 1's gating PRs)
+        pops.append([0.05, [["web-tests (shard 1)", 234.0], ["web-tests (shard 4)", 200.0],
+                            ["web-tests (shard 2)", 190.0], ["typecheck", 150.0]]])
+    for _ in range(6):   # typecheck is the per-PR slowest here; shard 4 co-occurs (its floor)
+        pops.append([0.05, [["typecheck", 206.0], ["web-tests (shard 4)", 200.0],
+                            ["web-tests (shard 1)", 190.0], ["web-tests (shard 2)", 180.0]]])
+    return {
+        "repo": "o/r", "scanned_at": "2026-06-08T00:00:00Z",
+        "data_sources": {"runs_sampled": 100, "jobs_sampled": 300, "workflows_analyzed": 2},
+        "pr_critical_path": {
+            "sampled_pr_count": 12, "sample_target": 12, "sample_complete": True,
+            "checks": checks, "populations": pops,
+            "poles": [
+                {"check": "web-tests (shard 1)", "p50_s": 234.0,
+                 "workflow_file": ".github/workflows/ci.yml", "job": "web-tests (shard 1)",
+                 "dominant_step": "run tests", "dominant_p50_s": 120.0,
+                 "steps": [{"step": "run tests", "category": "test", "p50_s": 120.0},
+                           {"step": "Build", "category": "build", "p50_s": 40.0}]},
+                {"check": "typecheck", "p50_s": 206.0,
+                 "workflow_file": ".github/workflows/ci.yml", "job": "typecheck",
+                 "dominant_step": "tsc", "dominant_p50_s": 150.0,
+                 "steps": [{"step": "tsc", "category": "test", "p50_s": 150.0},
+                           {"step": "Build", "category": "build", "p50_s": 40.0}]}]}}
+
+
+def test_below_gate_pole_role_names_effective_floor_not_p50_slowest_sibling():
+    # Regression (sibling-family spine drop): a below-gate pole's role line must NAME the check that
+    # actually caps it — the EFFECTIVE-slowest concurrent check (`_eff_floor_s`, bimodal-aware) — not
+    # the bare-p50-slowest sibling leg. `shard 1` has the highest blended p50 (234s) but `shard 4`'s
+    # slow mode (245s / 4m 05s) is the true binding floor; selecting by p50 named `shard 1`, leaving
+    # the real floor (`shard 4`) disclosed nowhere and tripping verify_report's spine-drop check.
+    md = bp.render(_doc_sibling_floor(), {}, {}, {}, "2026-06-08")
+    assert "Runs concurrently behind `web-tests (shard 4)` (4m 05s)" in md   # the effective floor
+    assert "Runs concurrently behind `web-tests (shard 1)`" not in md        # NOT the p50-slowest leg
+
+
+def _spine_drop_line(report: str, findings: dict, tmp_path: Path) -> str:
+    """Run verify_report.py's CLI with --findings and return the spine-drop (#6) check line."""
+    import subprocess
+    verify = Path(__file__).resolve().parent / "verify_report.py"
+    rp = tmp_path / "report-2026-05-29.md"
+    rp.write_text(report, encoding="utf-8")
+    fp = tmp_path / "findings.json"
+    fp.write_text(json.dumps(findings), encoding="utf-8")
+    out = subprocess.run([sys.executable, str(verify), "--report", str(rp), "--findings", str(fp)],
+                         capture_output=True, text=True).stdout
+    for ln in out.splitlines():
+        if "binding floor is disclosed on the spine" in ln:
+            return ln
+    raise AssertionError(f"no spine-drop check line in verify_report output:\n{out}")
+
+
+def test_sibling_floor_disclosure_passes_verify_report_end_to_end(tmp_path: Path):
+    # End-to-end coupling: the rendered sibling-family report (fixed renderer names `shard 4`) must
+    # PASS verify_report's spine-drop check, and a report that DROPS that disclosure must still FAIL
+    # — so a renderer wording drift can't silently slip past the gate, and the gate can't be softened
+    # into always-passing. Ties the SAME rendered bytes to the actual verifier CLI.
+    doc = _doc_sibling_floor()
+    md = bp.render(doc, {}, {}, {}, "2026-06-08")
+    assert _spine_drop_line(md, doc, tmp_path).split(None, 1)[0] == "PASS"
+    # Drop the disclosure: strip `shard 4` from the pole role line (simulate the pre-fix p50 pick,
+    # which named `shard 1` and left `shard 4` disclosed nowhere). The gate must catch it.
+    dropped = md.replace("Runs concurrently behind `web-tests (shard 4)`",
+                         "Runs concurrently behind `web-tests (shard 1)`")
+    assert dropped != md
+    fail_line = _spine_drop_line(dropped, doc, tmp_path)
+    assert fail_line.split(None, 1)[0] == "FAIL"
+    assert "web-tests (shard 4)" in fail_line   # names the exact dropped binding floor
+
+
+def test_below_gate_pole_role_admits_sibling_below_headline_when_slow_mode_exceeds_it():
+    # Predicate-change regression (the OTHER half of the fix): the fix switched the role line's
+    # membership FILTER — not only the sort key — from bare `p50_s > head_s` to
+    # `_eff_floor_s(c) > head_s`. A concurrent sibling whose BLENDED p50 sits BELOW the below-gate
+    # pole's headline (so the OLD filter EXCLUDED it outright, dropping it from `above` entirely)
+    # but whose bimodal SLOW mode exceeds that headline is now admitted and, as the effective-
+    # slowest, named. Pre-fix, such a check was invisible to the role line and the pole named the
+    # p50-slowest ADMITTED sibling instead — a strictly worse miss than the reordering case, since
+    # the true cap was excluded, not merely out-ranked. Generic shapes only.
+    doc = _doc_sibling_floor()
+    # `lint-heavy`: a different-family concurrent check whose blended p50 (200s) is BELOW the
+    # below-gate pole `typecheck`'s headline (206s) — so `p50 > head_s` is FALSE — but whose slow
+    # mode (260s / 4m 20s) is above it AND above every shard's effective floor (shard 4 == 245s).
+    # It must be a TYPICAL-PR check (present in `populations`) to reach the role line's candidate
+    # set at all, so add it to every sampled PR at a per-PR value that never unseats the winner.
+    cp = doc["pr_critical_path"]
+    cp["checks"].append(
+        {"name": "lint-heavy", "p50_s": 200.0, "workflow_file": ".github/workflows/ci.yml",
+         "bimodal": {"low_p50_s": 150.0, "high_p50_s": 260.0, "slow_frac": 0.55}})
+    for _share, cks in cp["populations"]:
+        cks.append(["lint-heavy", 200.0])
+    md = bp.render(doc, {}, {}, {}, "2026-06-08")
+    assert "Runs concurrently behind `lint-heavy` (4m 20s)" in md   # admitted by the eff-floor filter
+    assert "Runs concurrently behind `web-tests (shard 4)`" not in md  # no longer the effective max
+    assert "Runs concurrently behind `web-tests (shard 1)`" not in md  # never the p50-slowest pick
+
+
 def test_unmatched_pole_still_gets_crossrun_check_and_agent_prompt():
     # A pole whose log matches NO catalog detector must still be a complete finding:
     # a cross-run check on its dominant step + an agent prompt - not a bare timeline.
@@ -5517,6 +5632,176 @@ def test_headline_floor_is_slowest_check_not_the_frequency_gate():
     assert "(the gate)" not in toc_rows[0], toc_rows[0]
 
 
+def test_frequency_gate_role_line_discloses_bimodal_effective_floor():
+    # Issue #22 class, site B. The frequency-gate pole's role line ("**The check most PRs gate
+    # on.** … the slowest concurrent check is `X`, which sets the wall-clock floor") named `X`
+    # from `src[0]` — the p50-slowest TYPICAL check — and credited it with setting the wall-clock
+    # floor. But `src[0]`/`floor_name` is STAMP-BOUND to the data layer's p50-based
+    # `critical_path_check`, so it must NOT be re-ranked here. Instead, when a DIFFERENT concurrent
+    # check's bimodal SLOW mode floors the merge higher, the role line must disclose that true
+    # ceiling beside the p50 pick rather than silently crediting `floor_name`.
+    #
+    # `tests-web` (255s) is the frequency gate; `heavy` (900s, on 20/20) is the p50-slowest typical
+    # check = `floor_name` = the stamp; `flaky` (blended p50 600s, on 20/20) is bimodal with a
+    # 1200s slow mode — the real effective floor (20m), above `heavy`'s 15m.
+    doc = _doc_one_pole()
+    cp = doc["pr_critical_path"]
+    cp["checks"] = [
+        {"name": "tests-web", "p50_s": 255.0,
+         "workflow_file": ".github/workflows/pipeline.yml"},
+        {"name": "heavy", "p50_s": 900.0, "present_on": 20,
+         "workflow_file": ".github/workflows/heavy.yml"},
+        {"name": "flaky", "p50_s": 600.0, "present_on": 20,
+         "workflow_file": ".github/workflows/flaky.yml",
+         "bimodal": {"low_p50_s": 300.0, "high_p50_s": 1200.0, "slow_frac": 0.4}},
+        {"name": "lint", "p50_s": 100.0, "present_on": 20},
+    ]
+    # 20 per-PR populations, all four checks present on every PR (so `flaky` co-occurs on a
+    # majority of `tests-web`'s gating PRs and is its binding floor), `tests-web` still the
+    # most-gating.
+    cp["populations"] = [[0.05, [["heavy", 900.0], ["flaky", 600.0],
+                                 ["tests-web", 255.0], ["lint", 100.0]]]] * 20
+    md = bp.render(doc, {"pipeline": _IMPORT_BOUND_LOG}, {},
+                   {"pipeline": "https://github.com/o/r/actions/runs/1"}, "2026-06-08")
+    role = next(l for l in md.split("\n") if "The check most PRs gate on." in l)
+    # The p50 pick is unchanged (stamp-safe): `heavy` at its 15m p50 is still named the slowest
+    # concurrent check.
+    assert "the slowest concurrent check is `heavy` (~15m 00s)" in role
+    # GREEN: the bimodal true ceiling is disclosed beside it (em dashes normalized to hyphens by
+    # the report-wide strip). `flaky`'s 20m slow mode sets the floor, not `heavy`.
+    assert "but `flaky`'s bimodal slow mode (~20m 00s) runs longer, so it" in role
+    assert "sets the wall-clock floor on slow-mode PRs" in role
+    # RED against the pre-fix renderer: it credited `heavy` with setting the wall-clock floor and
+    # named `flaky` nowhere in the role line.
+    assert "(~15m 00s), which sets the wall-clock floor." not in role
+    # The stamp bind still holds: the headline names `heavy` (= critical_path_check), unchanged.
+    head = next(l for l in md.split("\n") if "until all checks finish" in l)
+    assert "the slowest check a typical PR waits on is `heavy`" in head
+    # And the effective floor is disclosed on the spine too (the pole's floor note names `flaky`),
+    # so this correction adds no silent spine drop.
+    assert "`flaky`" in md
+
+
+def test_frequency_gate_role_line_managed_floor_disclosed_not_misattributed():
+    # Issue #22 class, site B — the managed-floor edge (greptile). The file-backed disclosure clause
+    # frames the named check as the one to ATTACK ("sets the wall-clock floor on slow-mode PRs"), so
+    # it must be a tunable, file-backed check. When the binding floor is a MANAGED/external check (no
+    # `workflow_file`) that out-floors `floor_name`, the role line must (i) NOT credit `floor_name`
+    # (the lower p50 sibling) with setting the floor, (ii) NOT frame the untunable managed check as
+    # attackable, yet (iii) still NAME the managed check as the real cap so it isn't disclosed
+    # nowhere — using the "no workflow file to speed up here `X`" phrasing, which is BOTH honest
+    # about untunability AND the form `verify_report._SPINE_FLOOR_NAME_RE` reads (so the managed cap
+    # lands in the spine-disclosed set even when the gate pole's own `_floor_note` is suppressed
+    # because `binding_s >= pole_p`). Same fixture as the file-backed test, but `flaky` carries NO
+    # `workflow_file`.
+    doc = _doc_one_pole()
+    cp = doc["pr_critical_path"]
+    cp["checks"] = [
+        {"name": "tests-web", "p50_s": 255.0,
+         "workflow_file": ".github/workflows/pipeline.yml"},
+        {"name": "heavy", "p50_s": 900.0, "present_on": 20,
+         "workflow_file": ".github/workflows/heavy.yml"},
+        {"name": "flaky", "p50_s": 600.0, "present_on": 20,   # MANAGED: no workflow_file
+         "bimodal": {"low_p50_s": 300.0, "high_p50_s": 1200.0, "slow_frac": 0.4}},
+        {"name": "lint", "p50_s": 100.0, "present_on": 20},
+    ]
+    cp["populations"] = [[0.05, [["heavy", 900.0], ["flaky", 600.0],
+                                 ["tests-web", 255.0], ["lint", 100.0]]]] * 20
+    md = bp.render(doc, {"pipeline": _IMPORT_BOUND_LOG}, {},
+                   {"pipeline": "https://github.com/o/r/actions/runs/1"}, "2026-06-08")
+    role = next(l for l in md.split("\n") if "The check most PRs gate on." in l)
+    # `heavy` is still named the slowest concurrent (typical) check — the stamp-consistent p50 pick.
+    assert "the slowest concurrent check is `heavy` (~15m 00s)" in role
+    # `heavy` is NOT credited with setting the floor, and the managed check is NOT framed as tunable.
+    assert "which sets the wall-clock floor" not in role
+    assert "bimodal slow mode" not in role
+    # The managed `flaky` IS named as the real cap, with the untunable "no workflow file" framing.
+    assert "no workflow file to speed up here, `flaky` (~20m 00s)" in role
+    assert "caps the wall-clock floor on slow-mode PRs" in role
+    # And that phrasing is the form the spine parser reads, so the managed cap is disclosed on the
+    # spine (not dropped) — the managed-floor disclosure gap is fully closed.
+    import verify_report as _vr
+    assert "flaky" in {_n for _n in _vr._spine_disclosed_names(md)}
+
+
+def test_frequency_gate_role_line_ignores_degenerate_bimodal_floor():
+    # Issue #22 class, site B — the degenerate-bimodal edge. The clause gates + quotes by
+    # `_pole_headline(_bf)[0]` (the seconds `_bf`'s own drilled header shows), NOT frac-blind
+    # `_eff_floor_s` (which reads only `high_p50_s`). A malformed bimodal dict — `slow_frac == 0`,
+    # or missing `slow_frac`/`low_p50_s` — has no genuine slow MODE: `_pole_headline` returns the
+    # p50, so the clause must NOT emit a phantom "slow mode on ~0% of runs" disclosure. `flaky`
+    # here is file-backed with a degenerate bimodal (high 1200s but no honest slow mode); its p50
+    # (600s) is below `heavy`'s (900s), so it does not out-floor `heavy` on any honest reading.
+    for _bad_bimodal in ({"low_p50_s": 300.0, "high_p50_s": 1200.0, "slow_frac": 0.0},
+                         {"low_p50_s": 300.0, "high_p50_s": 1200.0},          # missing slow_frac
+                         {"high_p50_s": 1200.0, "slow_frac": 0.4}):           # missing low_p50_s
+        doc = _doc_one_pole()
+        cp = doc["pr_critical_path"]
+        cp["checks"] = [
+            {"name": "tests-web", "p50_s": 255.0,
+             "workflow_file": ".github/workflows/pipeline.yml"},
+            {"name": "heavy", "p50_s": 900.0, "present_on": 20,
+             "workflow_file": ".github/workflows/heavy.yml"},
+            {"name": "flaky", "p50_s": 600.0, "present_on": 20,
+             "workflow_file": ".github/workflows/flaky.yml", "bimodal": _bad_bimodal},
+            {"name": "lint", "p50_s": 100.0, "present_on": 20},
+        ]
+        cp["populations"] = [[0.05, [["heavy", 900.0], ["flaky", 600.0],
+                                     ["tests-web", 255.0], ["lint", 100.0]]]] * 20
+        md = bp.render(doc, {"pipeline": _IMPORT_BOUND_LOG}, {},
+                       {"pipeline": "https://github.com/o/r/actions/runs/1"}, "2026-06-08")
+        role = next(l for l in md.split("\n") if "The check most PRs gate on." in l)
+        # `heavy` genuinely sets the floor (nothing out-floors it once the degenerate bimodal is
+        # discounted); the plain phrasing stands, and no phantom "20m slow mode" is emitted.
+        assert "the slowest concurrent check is `heavy` (~15m 00s), which sets the wall-clock " \
+            "floor." in role, (_bad_bimodal, role)
+        assert "bimodal slow mode" not in role, (_bad_bimodal, role)
+        assert "20m 00s" not in role, (_bad_bimodal, role)
+
+
+def test_frequency_gate_role_line_never_calls_a_unimodal_floor_bimodal():
+    # Issue #22 class, site B — the UNIMODAL out-flooring edge (silent-failure-hunter). The
+    # clause's wording asserts "bimodal slow mode ... on slow-mode PRs", so it must fire ONLY when
+    # `_bf` is a genuine fast-median bimodal (the `_pole_headline` override fired). A heavy
+    # path-conditional/minority check drawn from the full floor pool (the lightdash `E2E` class)
+    # can be the pole's BINDING FLOOR yet be UNIMODAL: its blended p50 out-ranks the slowest
+    # TYPICAL check, but it has no slow MODE and it doesn't run on a typical PR. The role line must
+    # credit the slowest typical check (`base`) with the typical wall-clock floor and NOT print a
+    # phantom "bimodal slow mode" for the unimodal `E2E` (whose own gating is disclosed on its
+    # drilled pole). `E2E`'s per-PR values sit BELOW the gate on the gate's own gating PRs (so the
+    # gate wins them and `E2E` co-occurs as a floor candidate) while its stamped p50 is high.
+    doc = _doc_one_pole()
+    cp = doc["pr_critical_path"]
+    cp["checks"] = [
+        {"name": "tests-web", "p50_s": 255.0, "present_on": 20,
+         "workflow_file": ".github/workflows/pipeline.yml"},
+        {"name": "base", "p50_s": 400.0, "present_on": 20,
+         "workflow_file": ".github/workflows/base.yml"},
+        {"name": "E2E", "p50_s": 1000.0, "present_on": 6,          # UNIMODAL, minority-presence
+         "workflow_file": ".github/workflows/e2e.yml"},
+        {"name": "lint", "p50_s": 100.0, "present_on": 20},
+    ]
+    pops = []
+    for i in range(20):
+        if i < 6:   # tests-web (the gate) wins; E2E present but LOW-valued here → co-occurs
+            pops.append([0.05, [["tests-web", 700.0], ["base", 400.0],
+                                ["E2E", 300.0], ["lint", 100.0]]])
+        else:       # base wins; E2E absent → E2E is a global minority (6/20)
+            pops.append([0.05, [["base", 450.0], ["tests-web", 255.0], ["lint", 100.0]]])
+    cp["populations"] = pops
+    md = bp.render(doc, {"pipeline": _IMPORT_BOUND_LOG}, {},
+                   {"pipeline": "https://github.com/o/r/actions/runs/1"}, "2026-06-08")
+    role = next(l for l in md.split("\n") if "The check most PRs gate on." in l)
+    # `base` (the slowest TYPICAL check) genuinely sets the typical floor; plain phrasing stands.
+    assert "the slowest concurrent check is `base` (~6m 40s), which sets the wall-clock floor." \
+        in role, role
+    # RED against the pre-guard renderer: it printed "`E2E`'s bimodal slow mode (~16m 40s) ... on
+    # slow-mode PRs" — false on both counts (`E2E` is unimodal and runs on a minority, not a "slow
+    # mode"). The clause must not name `E2E` at all here.
+    assert "bimodal slow mode" not in role, role
+    assert "`E2E`" not in role, role
+
+
 def test_headline_floor_excludes_partial_presence_slowest_check():
     # OneSignal/OneSignal-Android-SDK class: the slowest TYPICAL check (`Claude Code Review`,
     # a managed app check at 944.5s) ran on only 12/20 PRs; `build` (619.5s) ran on 20/20.
@@ -6725,3 +7010,293 @@ def test_single_backtick_name_stays_symmetric_between_heading_and_verifier():
     assert bp._clean_label("run `unit` tests") == "run 'unit' tests"
     assert bp._clean_label("x ``y`` z") == "x ''y'' z"
     assert bp._clean_label("guard shard 2/4") == "guard shard 2/4"
+
+
+# ── Aggregation-gate poles (issue #1) ─────────────────────────────────────────────────
+# A success-aggregation gate is the trivial job that exists ONLY to `needs:` a set of real
+# jobs so ONE check can be the single required status check (vercel/next.js `thank you,
+# build`: job `buildPassed`, `needs: [deploy-target, build, build-wasm, build-native]`, body
+# `run: exit 1`, P50 3s, required). Crowning it by frequency is CORRECT data; drilling it and
+# prompting "capture timing, then optimize this step" is inert advice over a 3-second no-op.
+# The renderer must instead tell the honest upstream story and point at the slowest member.
+
+_AGG_DEPLOY = ".github/workflows/deploy.yml"
+_AGG_CI = ".github/workflows/ci.yml"
+
+
+def _agg_gate_doc() -> dict:
+    """Two workflows. `deploy.yml` carries the SINK (`thank you, build`, 3s, terminal, its
+    transitive `needs:` covering every non-terminal job) plus a conditional peer sink
+    (`Potentially publish release`, terminal and uncovered — the `publishRelease` shape).
+    `ci.yml` carries the near-miss: a real 3s `lint` job that `needs:` nothing."""
+    return {
+        "repo": "acme/site", "repo_visibility": "public",
+        "scanned_at": "2026-07-28T00:00:00Z", "commit_sha": "09e8243",
+        "skill_commit_sha": "dd51d85", "findings": [],
+        "data_sources": {"runs_sampled": 20, "jobs_sampled": 60, "workflows_analyzed": 2},
+        "workflow_job_graph": {
+            _AGG_DEPLOY: {
+                "target": {"name": "deploy-target", "needs": []},
+                "build": {"name": "build", "needs": ["target"]},
+                "matrixgen": {"name": "generate-native-matrix", "needs": ["target"]},
+                "native": {"name": "stable - ${{ matrix.target }}", "matrix": True,
+                           "needs": ["target", "matrixgen"]},
+                "publish": {"name": "Potentially publish release",
+                            "needs": ["target", "build", "native"]},
+                "gate": {"name": "thank you, build", "needs": ["target", "build", "native"]},
+            },
+            _AGG_CI: {
+                "lint": {"name": "lint", "needs": []},
+                "unit": {"name": "unit", "needs": []},
+            },
+        },
+        "pr_critical_path": {
+            "sampled_pr_count": 20, "sample_target": 20, "sample_complete": True,
+            "check_present_n_pr": 20, "critical_path_check": "unit",
+            "poles": [
+                {"check": "unit", "p50_s": 600.0, "workflow_file": _AGG_CI, "job": "unit",
+                 "dominant_step": "Run tests", "dominant_p50_s": 480.0,
+                 "steps": [{"step": "Checkout", "category": "setup", "p50_s": 20.0},
+                           {"step": "Run tests", "category": "test", "p50_s": 480.0}]},
+                {"check": "thank you, build", "p50_s": 3.0, "workflow_file": _AGG_DEPLOY,
+                 "job": "gate", "timing_source": "pr_check_runs", "steps": []},
+                {"check": "lint", "p50_s": 3.0, "workflow_file": _AGG_CI, "job": "lint",
+                 "dominant_step": "Run eslint", "dominant_p50_s": 2.0,
+                 "steps": [{"step": "Run eslint", "category": "lint", "p50_s": 2.0}]},
+            ],
+            "checks": [
+                {"name": "unit", "p50_s": 600.0, "present_on": 20, "workflow_file": _AGG_CI},
+                {"name": "stable - x86_64-linux", "p50_s": 355.0, "present_on": 20,
+                 "workflow_file": _AGG_DEPLOY},
+                {"name": "build", "p50_s": 240.0, "present_on": 20,
+                 "workflow_file": _AGG_DEPLOY},
+                {"name": "deploy-target", "p50_s": 19.0, "present_on": 20,
+                 "workflow_file": _AGG_DEPLOY},
+                {"name": "thank you, build", "p50_s": 3.0, "present_on": 20,
+                 "workflow_file": _AGG_DEPLOY},
+                {"name": "lint", "p50_s": 3.0, "present_on": 20, "workflow_file": _AGG_CI},
+            ],
+            "populations": [],
+        },
+    }
+
+
+def _pole_section(md: str, check: str) -> str:
+    """The `## … Long pole N: … ▸ <check>` section body for `check`."""
+    i = md.index(f"▸ `{check}`")
+    i = md.rindex("\n## ", 0, i)
+    j = md.find("\n## ", i + 4)
+    return md[i:j if j != -1 else len(md)]
+
+
+def test_aggregation_gate_pole_tells_the_upstream_story_not_a_prompt():
+    # The whole fix (issue #1): the `needs:`-everything 3s sink renders the honest role line,
+    # names its slowest MEASURED upstream member, points the reader there — and carries NO
+    # drill and NO "optimize this step" agent prompt.
+    md = bp.render(_agg_gate_doc(), {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    assert "**Aggregation gate" in sec
+    assert "it exists to be the single required check" in sec
+    assert "runs no work of its own" in sec
+    # The slowest upstream is the matrix leg (355s), resolved through the `${{ }}` name
+    # template — not the sink's own 3s and not the unrelated `unit` pole in the other workflow.
+    assert "`stable - x86_64-linux` (~5m 55s)" in sec
+    assert "**➡️ Where the wait actually is:**" in sec
+    # The two inert artifacts are gone.
+    assert "🤖 Prompt for your coding agent" not in sec
+    assert "Level 2" not in sec
+    assert "before optimizing" not in sec
+    # The OTHER poles are untouched — each still drills and hands off.
+    assert "🤖 Prompt for your coding agent" in _pole_section(md, "unit")
+
+
+def test_aggregation_gate_pole_role_line_is_a_registered_claim():
+    # Claims parity: the role line is a `pole_role_line` Claim whose rendered sentence appears
+    # verbatim in the report, exactly like its neighbouring role lines.
+    md = bp.render(_agg_gate_doc(), {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    cs = bp._LAST_CLAIMS
+    agg = [c for c in cs.claims
+           if c.kind == "pole_role_line" and "Aggregation gate" in c.rendered]
+    assert len(agg) == 1
+    assert agg[0].subject == "thank you, build"
+    assert agg[0].fields["upstream_slowest"] == "stable - x86_64-linux"
+    for c in cs.claims:
+        assert c.rendered in md, f"claim not byte-identical in the report: {c.rendered!r}"
+
+
+def test_aggregation_gate_near_miss_renders_byte_identically(monkeypatch):
+    # A real 3s `lint` job with NO `needs:` coverage must keep today's rendering exactly —
+    # duration alone never triggers the framing. Pinned byte-for-byte against the renderer
+    # with detection disabled (the pre-fix behaviour).
+    doc = _agg_gate_doc()
+    after = _pole_section(bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {}), "lint")
+    monkeypatch.setattr(bp, "_agg_gate_shape", lambda *a, **k: None)
+    before = _pole_section(bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {}), "lint")
+    assert after == before
+    assert "**Aggregation gate" not in after
+    assert "🤖 Prompt for your coding agent" in after
+
+
+def test_aggregation_gate_yields_to_the_chain_member_framing(monkeypatch):
+    # A sink that IS a modal-chain member keeps the chain-stage rendering (`thank you, next`
+    # as stage 3/3): the chain model already frames it as serialized, and double-framing it
+    # would contradict that. Pinned byte-for-byte against detection-disabled rendering.
+    doc = _agg_gate_doc()
+    doc["pr_critical_path"]["chain_summary"] = {
+        "modal_chain": ["build", "stable - x86_64-linux", "thank you, build"],
+        "chain_p50_s": 598.0}
+    after = _pole_section(bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {}),
+                          "thank you, build")
+    monkeypatch.setattr(bp, "_agg_gate_shape", lambda *a, **k: None)
+    before = _pole_section(bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {}),
+                           "thank you, build")
+    assert after == before
+    assert "Stage 3/3 of the" in after and "gate chain" in after
+    assert "**Aggregation gate" not in after
+
+
+def test_agg_gate_shape_structural_conditions():
+    # The shape helper itself: each condition is load-bearing.
+    doc = _agg_gate_doc()
+    graph = doc["workflow_job_graph"]
+    checks = doc["pr_critical_path"]["checks"]
+    poles = {p["check"]: p for p in doc["pr_critical_path"]["poles"]}
+    hit = bp._agg_gate_shape(poles["thank you, build"], graph, checks)
+    assert hit and hit["job_id"] == "gate"
+    # The closure walks TRANSITIVELY: `matrixgen` is reached via `native`, so the
+    # conditional peer sink `publish` is the only uncovered job — and it is terminal.
+    assert hit["upstream"] == ["build", "matrixgen", "native", "target"]
+    assert bp._clean_label(bp._check_name(hit["slowest"])) == "stable - x86_64-linux"
+    # (a) duration: a job doing real work never matches on structure alone.
+    heavy = dict(poles["thank you, build"], p50_s=180.0)
+    assert bp._agg_gate_shape(heavy, graph, checks) is None
+    # (b) coverage: a non-terminal job outside the closure → not an aggregation sink.
+    gapped = json.loads(json.dumps(graph))
+    gapped[_AGG_DEPLOY]["extra"] = {"name": "extra", "needs": ["target"]}
+    gapped[_AGG_DEPLOY]["afterextra"] = {"name": "afterextra", "needs": ["extra"]}
+    assert bp._agg_gate_shape(poles["thank you, build"], gapped, checks) is None
+    # (b) a single-parent stage (a chain member's shape) needs >= 2 upstream jobs.
+    thin = json.loads(json.dumps(graph))
+    thin[_AGG_DEPLOY]["gate"]["needs"] = ["build"]
+    assert bp._agg_gate_shape(poles["thank you, build"], thin, checks) is None
+    # (b) the near-miss lint job: trivial, but `needs:` nothing.
+    assert bp._agg_gate_shape(poles["lint"], graph, checks) is None
+    # (c) step data DISQUALIFIES when it shows real work.
+    busy = dict(poles["thank you, build"],
+                steps=[{"step": "Run the suite", "p50_s": 400.0}])
+    assert bp._agg_gate_shape(busy, graph, checks) is None
+    # (d) no measured upstream check → nothing honest to point at.
+    assert bp._agg_gate_shape(poles["thank you, build"], graph,
+                              [c for c in checks
+                               if c["workflow_file"] != _AGG_DEPLOY]) is None
+    # No scanned graph for the workflow → the shape is unknowable, never guessed.
+    assert bp._agg_gate_shape(poles["thank you, build"], {}, checks) is None
+
+
+def test_aggregation_gate_discloses_both_thin_data_caveats():
+    # Both caveats are independent and BOTH must render: an unmeasured upstream member (the
+    # named "slowest" could be beaten by one with no timing) AND the absence of per-step data
+    # (which is what "runs no work of its own" rests on, together with the measured P50). An
+    # `elif` dropped the second exactly when the sample was thinnest.
+    md = bp.render(_agg_gate_doc(), {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    assert "had no measured check timing in this sample" in sec
+    assert "No per-step data was captured for this check" in sec
+
+
+def test_aggregation_gate_pointer_links_the_upstream_members_own_pole():
+    # When the slowest upstream member IS itself a rendered pole, the pointer links to THAT
+    # pole's anchor — matched on the raw check name + workflow file (the spine's identity),
+    # never on the cleaned display label, which can fold two distinct checks together.
+    doc = _agg_gate_doc()
+    doc["pr_critical_path"]["poles"].append(
+        {"check": "stable - x86_64-linux", "p50_s": 355.0, "workflow_file": _AGG_DEPLOY,
+         "job": "native", "dominant_step": "cargo build", "dominant_p50_s": 300.0,
+         "steps": [{"step": "cargo build", "category": "build", "p50_s": 300.0}]})
+    md = bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    n = int(re.search(r"## .*Long pole (\d+): .*▸ `stable - x86_64-linux`", md).group(1))
+    assert f"**➡️ Where the wait actually is:** [Long pole {n}](#pole-{n}) drills " \
+           f"`stable - x86_64-linux` (5m 55s)" in sec
+
+
+def test_aggregation_gate_names_upstream_member_by_effective_floor_not_bare_p50():
+    # Issue #22 class, site A. The success-sink names its slowest measured `needs:` upstream
+    # member as THE lever. It ranked candidates by BARE p50, so a matrix leg whose blended
+    # median sits below a faster-median sibling but whose bimodal SLOW mode is the true ceiling
+    # went unnamed — the sink pointed the reader at the wrong lever. A second matrix leg,
+    # `stable - aarch64-darwin`, has a LOWER blended p50 (300s) than `stable - x86_64-linux`
+    # (355s) but a bimodal high mode (520s) that is the real ceiling of the gate's wait. Its
+    # median (300s) sits on the FAST cluster (<= (180+520)/2 = 350s), so the member's own drilled
+    # HEADER shows the slow mode — both the WITHIN-matrix `top` pick and the ACROSS-jobs `slowest`
+    # pick must rank by that header value (`_pole_headline`, == the 520s slow mode here), and the
+    # rendered duration must be that header time (8m 40s), not a bare p50.
+    doc = _agg_gate_doc()
+    doc["pr_critical_path"]["checks"].append(
+        {"name": "stable - aarch64-darwin", "p50_s": 300.0, "present_on": 20,
+         "workflow_file": _AGG_DEPLOY,
+         "bimodal": {"low_p50_s": 180.0, "high_p50_s": 520.0, "slow_frac": 0.4}})
+    md = bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    # GREEN: the effective-floor winner is named at its slow-mode time.
+    assert "`stable - aarch64-darwin` (~8m 40s)" in sec
+    assert "**➡️ Where the wait actually is:**" in sec
+    assert "`stable - aarch64-darwin` (8m 40s)" in sec  # the pointer agrees
+    # RED against the pre-fix renderer: it named the p50-slowest leg as the lever, at its p50.
+    assert "`stable - x86_64-linux`" not in sec
+    assert "5m 55s" not in sec
+
+
+def test_aggregation_gate_pointer_agrees_with_slow_cluster_median_pole_header():
+    # Issue #22 class, site A — the divergence a bare `_eff_floor_s` render (greptile P1) leaves.
+    # When the winning member's MEDIAN already sits IN the slow cluster (a strict majority of runs
+    # slow), its own drilled pole HEADER shows its p50, NOT its bimodal high mode — `_pole_headline`
+    # keeps the p50 there (the median already reflects the slow mode; the high mode would over-state
+    # it). `_eff_floor_s` (always `max(p50, high)`) would quote the high mode, so the aggregation
+    # pointer would name a duration ABOVE the very pole header it links to. The pointer MUST quote
+    # the header value so the two agree.
+    doc = _agg_gate_doc()
+    # p50 500s sits ABOVE the midpoint (300+560)/2 = 430s -> slow-cluster median -> header = p50.
+    _bi = {"low_p50_s": 300.0, "high_p50_s": 560.0, "slow_frac": 0.6}
+    doc["pr_critical_path"]["checks"].append(
+        {"name": "stable - aarch64-darwin", "p50_s": 500.0, "present_on": 20,
+         "workflow_file": _AGG_DEPLOY, "bimodal": _bi})
+    doc["pr_critical_path"]["poles"].append(
+        {"check": "stable - aarch64-darwin", "p50_s": 500.0, "workflow_file": _AGG_DEPLOY,
+         "job": "native", "dominant_step": "cargo build", "dominant_p50_s": 400.0,
+         "bimodal": _bi, "steps": [{"step": "cargo build", "category": "build", "p50_s": 400.0}]})
+    md = bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    n = int(re.search(r"## .*Long pole (\d+): .*▸ `stable - aarch64-darwin` - (\d+m \d+s)",
+                      md).group(1))
+    hdr_dur = re.search(r"▸ `stable - aarch64-darwin` - (\d+m \d+s)", md).group(1)
+    assert hdr_dur == "8m 20s"                                    # header shows the p50, not 9m 20s
+    # GREEN: the pointer links the pole and quotes the SAME 8m 20s the header shows.
+    assert f"[Long pole {n}](#pole-{n}) drills `stable - aarch64-darwin` (8m 20s)" in sec
+    # RED against a bare `_eff_floor_s` render: it quoted the 9m 20s high mode, above the header.
+    assert "9m 20s" not in sec
+
+
+def test_aggregation_gate_cross_job_pick_ranks_by_header_not_p50():
+    # Issue #22 class, site A — guards the ACROSS-JOBS `slowest` comparison (`_agg_gate_shape`
+    # second `max`) INDEPENDENTLY of the within-matrix `top` pick (pr-test-analyzer). A non-matrix
+    # `build` job (p50 550s, no bimodal → header 550s) competes across jobs with a matrix leg
+    # `stable - x86_64-linux` (p50 300s, fast-median bimodal high 900s → header 900s). By bare p50
+    # `build` (550) out-ranks the leg (300) and would be named the lever at 9m 10s; by header the
+    # leg (900) is the true ceiling and must be named at 15m 00s. A regression that dropped
+    # `_pole_headline` from only the cross-job leg would be invisible to the other Site A tests
+    # (there the bimodal winner also wins on bare p50), so this fixture is the distinguishing case.
+    doc = _agg_gate_doc()
+    for c in doc["pr_critical_path"]["checks"]:
+        if c["name"] == "build":
+            c["p50_s"] = 550.0
+        if c["name"] == "stable - x86_64-linux":
+            c["p50_s"] = 300.0
+            c["bimodal"] = {"low_p50_s": 180.0, "high_p50_s": 900.0, "slow_frac": 0.4}
+    md = bp.render(doc, {}, {}, {}, "2026-07-28T00:00:00Z", {})
+    sec = _pole_section(md, "thank you, build")
+    # GREEN: the header-ranked cross-job winner is named at its slow-mode time.
+    assert "slowest measured member is `stable - x86_64-linux` (~15m 00s)" in sec, sec
+    # RED against a bare-p50 cross-job comparison: it named `build` at its 9m 10s p50.
+    assert "`build`" not in sec, sec
+    assert "9m 10s" not in sec, sec
