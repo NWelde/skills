@@ -127,6 +127,27 @@ def test_phase0_literals_stay_coupled_to_the_renderer():
         assert literal in verifier, f"verify_report lost the {literal!r} coupling literal"
 
 
+def test_untrusted_marker_literals_stay_coupled_to_the_wrapper():
+    # `check_gap_fill_evidence_grounded`'s `_UNTRUSTED_MARKER_RE` (issue #29) is a twin of
+    # untrusted_wrap.py's own real-marker shape, NOT blocking_path.py's source — the marker
+    # text is built in untrusted_wrap.wrap_untrusted_block, and blocking_path.py only calls
+    # it (via _evidence_fence). So this is a separate pin from
+    # test_phase0_literals_stay_coupled_to_the_renderer above, sourced from the file that
+    # actually owns the literal. A wording change in either place would otherwise silently
+    # turn the marker-recognition regex into a permanent no-op — every gap-fill evidence
+    # block would then FAIL grounding on its own legitimate BEGIN/END lines.
+    # "UNTRUSTED LOG CONTENT" (not the full "BEGIN/END UNTRUSTED LOG CONTENT") is the
+    # contiguous fragment: the wrapper builds "BEGIN"/"END" onto it via an f-string
+    # (untrusted_wrap.py), and the verifier's regex spells the two keywords as an
+    # alternation (?:BEGIN|END) rather than two full literals - "UNTRUSTED LOG CONTENT"
+    # is the only substring guaranteed contiguous on both sides.
+    wrapper = (_SKILL_DIR / "scripts" / "untrusted_wrap.py").read_text(encoding="utf-8")
+    verifier = _VERIFY.read_text(encoding="utf-8")
+    literal = "UNTRUSTED LOG CONTENT"
+    assert literal in wrapper, f"untrusted_wrap.py no longer emits {literal!r} — update verify_report"
+    assert literal in verifier, f"verify_report lost the {literal!r} coupling literal"
+
+
 def _head_short_sha() -> str:
     return subprocess.run(
         ["git", "-C", str(_REPO_ROOT), "rev-parse", "--short", "HEAD"],

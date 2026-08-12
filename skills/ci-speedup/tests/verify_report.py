@@ -1929,6 +1929,20 @@ _LLM_ANALYSIS_MARKER = "🤖 LLM root-cause analysis"           # `_llm_analysis
 _LLM_EVIDENCE_FENCE_RE = re.compile(
     r"verbatim from the captured job log[^\n]*\n+```text\n(.*?)\n```", re.DOTALL)
 
+# Twin of untrusted_wrap.py's own _REAL_BEGIN_RE/_REAL_END_RE (issue #29) - SHAPE only, no
+# nonce-issuance check. This file never imports untrusted_wrap or blocking_path (see the
+# module docstring's independent-verification rule), so it can't drift onto the renderer's
+# own bug - hence a duplicated twin here, pinned to untrusted_wrap.py's literal wording by
+# test_verify_report_self.py, same as every other renderer<->verifier coupling in this file.
+# `_evidence_fence` wraps every gap-fill evidence fence in one of these two lines as its
+# FIRST and LAST line; recognized here and excluded from the verbatim-log check below.
+# Matched by PATTERN, never by position - if the wrap were ever dropped from the renderer,
+# an ordinary log line sitting where a marker used to be no longer matches this regex and
+# correctly re-enters the verbatim check (probably failing it), instead of the drop going
+# unnoticed forever behind an unconditional first/last-line skip.
+_UNTRUSTED_MARKER_RE = re.compile(
+    r"^--- (?:BEGIN|END) UNTRUSTED LOG CONTENT \[[0-9a-f]{8}\] ---$")
+
 
 def _ground_transform(text: str) -> str:
     """Apply to EACH LOG LINE the SAME transforms the renderer applies to an evidence line embedded
@@ -1999,7 +2013,9 @@ def check_gap_fill_evidence_grounded(report: str, findings_path: Path | None) ->
         corpus_lines = [_ground_transform(ln) for ln in raw_log.splitlines()]
         for fence in _LLM_EVIDENCE_FENCE_RE.findall(body):
             for line in fence.split("\n"):
-                if line.strip() and not any(line in cl for cl in corpus_lines):
+                if not line.strip() or _UNTRUSTED_MARKER_RE.match(line):
+                    continue
+                if not any(line in cl for cl in corpus_lines):
                     offenders.append(f"{pole}: {line!r}")
     if offenders:
         return Check(name, False,
