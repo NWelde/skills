@@ -776,11 +776,32 @@ _ATTACKER_FILLED_PREFIXES = (
 # made the banner count matches while calling them files. Coverage still
 # degrades to PARTIAL on either — an unanchored step is a real hole — but the
 # report says which hole it is.
+# THREE channels, because "we did not scan this" and "we scanned this and
+# deliberately said nothing" are opposite claims about the same step, and the
+# report's loudest honesty banner ("…were NOT scanned … This is not a clean
+# result") is only true of one of them:
+#
+#   UNANCHORED  a `run:` step a detector matched but could not tie to a raw
+#               line. The banner was written for exactly this and keeps it.
+#   NOT_SCANNED a real coverage gap that is NOT an unanchorable run step — a
+#               computed `working-directory:`, a `ref:` chosen at run time,
+#               shell that would not parse. Still not a clean result; its own
+#               sentence, because the headline's wording does not describe it.
+#   SUPPRESSED  a finding the scanner reached and deliberately did not report,
+#               above all a fetch pinned to a full commit id. INFORMATIONAL:
+#               it must never touch coverage, or a repository that did exactly
+#               what the fix recipe says gets told its report is unreliable.
+_KIND_UNANCHORED = "unanchored-run-step"
+_KIND_NOT_SCANNED = "not-scanned"
+_KIND_SUPPRESSED = "suppressed"
+
 _DROPPED_MATCHES: list[dict[str, str]] = []
 
 
-def _record_dropped_match(file_path: Path, reason: str) -> None:
-    _DROPPED_MATCHES.append({"file": str(file_path), "reason": reason})
+def _record_dropped_match(file_path: Path, reason: str,
+                          kind: str = _KIND_UNANCHORED) -> None:
+    _DROPPED_MATCHES.append(
+        {"file": str(file_path), "reason": reason, "kind": kind})
 
 
 def _repo_relative(path: str, root: Path) -> str:
@@ -2078,6 +2099,64 @@ def _run_scalar_line_numbers(text: str) -> set[int]:
     return shell
 
 
+def _run_scalar_starts(text: str) -> set[int]:
+    """1-based line numbers where a `run:` scalar's shell BEGINS.
+
+    The companion to `_run_scalar_line_numbers`, which answers "is this line
+    shell" but not "is this line a different step's shell". Line adjacency
+    cannot answer the second question in either direction: two inline
+    `- run:` steps are adjacent lines in different steps, and a blank line
+    inside one block scalar makes one step's shell non-adjacent. Anything that
+    dies with its step — the working directory above all — has to key off this
+    set instead.
+    """
+    starts: set[int] = set()
+    lines = text.splitlines()
+    shell = _run_scalar_line_numbers(text)
+    for i, line in enumerate(lines):
+        m = _RUN_KEY_LINE_RE.match(line)
+        if m is None:
+            continue
+        rest = m.group(2).strip()
+        if rest and not _BLOCK_SCALAR_RE.match(rest):
+            starts.add(i + 1)             # inline scalar: the key's own line
+            continue
+        for j in range(i + 1, len(lines) + 1):   # block scalar: its first body line
+            if j + 1 in shell:
+                starts.add(j + 1)
+                break
+    return starts
+
+
+# `<<WORD` / `<<-'WORD'` — a heredoc opener.
+#
+# The lookarounds are load-bearing. `<<<` is a here-STRING: it carries its whole
+# value on the line and opens no body. Without `(?!<)` the search simply retried
+# at the second `<` and matched `<< abc` inside `sort <<< abc`, which suppressed
+# every command to the end of the step — losing real findings, silently.
+_HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _heredoc_delimiter(command: str) -> str | None:
+    """The word ending the here-doc this command opens, or None.
+
+    The OPERATOR has to be shell syntax, the DELIMITER does not:
+    `echo "use << EOF for heredocs"` mentions a here-doc inside a quoted string
+    and opens nothing, while `cat <<'EOF'` quotes its delimiter and opens one —
+    quoting the delimiter is the idiom, since it stops expansion in the body.
+    So the quote test is applied to the `<<` itself, using the syntax/data
+    split this file already computes once in `_shell_scan`, and the delimiter
+    is read from the raw text. Blanking all quoted text instead would miss
+    every `<<'EOF'` in the corpus.
+    """
+    syntax = [is_syntax for _ch, is_syntax in _shell_scan(command)]
+    for match in _HEREDOC_OPEN_RE.finditer(command):
+        at = match.start()
+        if at + 1 < len(syntax) and syntax[at] and syntax[at + 1]:
+            return match.group(2)
+    return None
+
+
 def _install_line(
     text: str, job_range: tuple[int, int] | None
 ) -> tuple[int, str, str] | None:
@@ -2576,6 +2655,7 @@ def _correlation_install_scripts_in_privileged_job(
             # The parsed scalar matched but no raw line did (a folded scalar).
             # Reported as a coverage gap rather than dropped silently.
             _DROPPED_MATCHES.append({
+                "kind": _KIND_UNANCHORED,
                 "file": str(file_path),
                 "reason": (
                     f"P14.25: jobs.{job_name} runs a script-executing install "
@@ -2644,6 +2724,1167 @@ def _correlation_install_scripts_in_privileged_job(
                 )
             ),
         )
+
+
+# --- P14.24: unverified remote code execution --------------------------------
+#
+# ONE vector, two shapes, because they are the same trust model: the job runs
+# code that a third party can change between now and the next run.
+#
+#   1. the piped installer — `curl … | bash`, `bash <(curl …)`, `deno run <url>`
+#   2. a MUTABLE git fetch executed out of — `git clone` / `git fetch` at a
+#      branch, tag, HEAD, or an abbreviated sha, followed by running a file
+#      from the fetched tree
+#
+# Shape 1 stays exactly where it was: the regex below is handed to the shared
+# `detect_yaml_run_injection` walker, so its matching, line attribution and
+# evidence are the code that was already shipping. It lives here rather than in
+# the catalog's METADATA because one entry carries one detector, and this entry
+# now needs two arms.
+#
+# A fetch pinned to a FULL 40-hex commit is IMMUTABLE and is never a finding —
+# that is the same trust model this catalog recommends for action pins, and
+# reporting it would tell a reader to fix what they already did right. A short
+# sha is not a pin: git re-resolves an abbreviated id at fetch time.
+_REMOTE_PIPE_TO_SHELL = (
+    r"(?:(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:bash|sh)\b"
+    r"|\b(?:bash|sh)\s+<\(\s*(?:curl|wget)\b"
+    r"|\bdeno\s+run\b[^\n]*https?://)"
+)
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_ABBREV_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,39}$")
+
+# `git clone` options that consume a separate VALUE argument. Getting this set
+# wrong would make an option's value look like the clone's URL or destination,
+# and the destination is what the whole connection test rests on.
+#
+# Options whose value is only ever ATTACHED (`--recurse-submodules=<pathspec>`,
+# `--also-filter-submodules`) must stay OUT: listed here they would eat the
+# following argument, shifting the URL, the destination and the ref by one and
+# leaving the correlation chasing a directory that does not exist.
+_CLONE_VALUE_OPTS = {
+    "-b", "--branch", "--revision", "--depth", "-o", "--origin", "-u",
+    "--upload-pack", "--reference", "--reference-if-able",
+    "--separate-git-dir", "--template", "-c", "--config", "-j", "--jobs",
+    "--filter", "--shallow-since", "--shallow-exclude", "--server-option",
+    "--bundle-uri",
+}
+# Interpreters that run a FILE named on their command line. `-m` is excluded
+# where it appears (a module name is not a path), except for the pip form
+# handled separately below.
+_INTERPRETERS = {
+    "python", "python2", "python3", "node", "nodejs", "bash", "sh", "zsh",
+    "ksh", "ruby", "perl", "php", "pwsh", "powershell",
+}
+# An interpreter reads its program from the command line (`-c`, `-e`, and the
+# perl one-liner combinations) or from stdin (`-`), rather than from a file
+# named as an argument. `-m` names a module, which is not a path either.
+_INLINE_SCRIPT_FLAGS = {
+    "-c", "-m", "-e", "-E", "-", "-pe", "-ne", "-p", "-n", "-ape", "-lpe",
+    "--eval", "--exec",
+}
+_SOURCE_CMDS = {"source", "."}
+# `pip install` options that consume a separate VALUE. Every one of these takes
+# a path or a name that pip reads or writes — never code pip executes.
+_PIP_VALUE_OPTS = {
+    "-r", "--requirement", "-t", "--target", "-c", "--constraint",
+    "-i", "--index-url", "--extra-index-url", "-f", "--find-links",
+    "--prefix", "--root", "--src", "--upgrade-strategy", "--no-binary",
+    "--only-binary", "--platform", "--python-version", "--implementation",
+    "--abi", "--cache-dir", "--log", "--proxy", "--retries", "--timeout",
+    "--exists-action", "--cert", "--client-cert", "--report", "--config-settings",
+}
+_LEADING_WRAPPERS = {"sudo", "command", "exec", "time", "nohup", "env"}
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Prefix for a directory whose real path is not knowable from the YAML. It
+# cannot collide with any real path, so paths under it match each other and
+# nothing else.
+_OPAQUE_DIR = "\x00wd:"
+# Expressions collapse to ONE TOKEN EACH, not one token for all of them. A
+# shared `$EXPR` made `${{ env.DIR_A }}` and `${{ env.DIR_B }}` the same
+# directory, so a clone into one paired with an execution from the other — a
+# chain the reader cannot find in their own YAML. Tokens are stable per
+# expression TEXT, so the same expression written twice is one place, which is
+# exactly as knowable as a named one.
+_EXPR_TOKEN_TEXT: dict[str, str] = {}
+_EXPR_TEXT_TOKEN: dict[str, str] = {}
+
+
+def _expression_token(text: str) -> str:
+    """A shlex-safe stand-in for `${{ … }}`, stable per expression text."""
+    key = " ".join(text.split())
+    token = _EXPR_TEXT_TOKEN.get(key)
+    if token is None:
+        # DELIMITED with the same NUL sentinel the opaque directories use.
+        # An undelimited `$EXPR0` followed by a literal digit — `${{ env.DIR }}2`
+        # — read back as `$EXPR02`, the lookup missed, and the scanner's own
+        # token reached the report. NUL cannot appear in YAML, so nothing a
+        # workflow contains can collide with it or be mistaken for it.
+        token = f"$EXPR{len(_EXPR_TEXT_TOKEN)}\x00"
+        _EXPR_TEXT_TOKEN[key] = token
+        _EXPR_TOKEN_TEXT[token] = key
+    return token
+
+
+_EXPR_TOKEN_RENDER_RE = re.compile(r"\$EXPR\d+\x00")
+
+
+def _reset_expression_tokens() -> None:
+    """Clear the per-scan token registry.
+
+    Module-level and never reset, it let one workflow's expression text render
+    inside another's finding, with which text leaked depending on file order.
+    """
+    _EXPR_TEXT_TOKEN.clear()
+    _EXPR_TOKEN_TEXT.clear()
+
+
+def _as_written(path: str) -> str:
+    """`path` with every scanner-internal stand-in put back as the YAML wrote it.
+
+    Nothing that reaches a reader may contain these. The opaque-directory
+    sentinel is a NUL byte, and it escaped into `derived_note`, findings.json
+    and the rendered markdown — the reader was shown a raw control character
+    where their own directory belonged.
+    """
+    shown = path.replace(_OPAQUE_DIR, "")
+    return _EXPR_TOKEN_RENDER_RE.sub(
+        lambda m: _EXPR_TOKEN_TEXT.get(m.group(0), m.group(0)), shown)
+# Does unreadable shell mention either half of the chain — a fetch, or something
+# that executes? If not, failing to read it costs this detector nothing.
+_CHAIN_RELEVANT_RE = re.compile(
+    # Command NAMES that fetch or execute…
+    r"\b(?:git|cd|source|pip|pip3|python[0-9.]*|node|nodejs|bash|sh|zsh|ksh"
+    r"|ruby|perl|php|pwsh|powershell)\b"
+    # …and the shape of an execution that names no command at all: a PATH
+    # invoked directly (`tools/setup.py --msg=…`). Without this arm a visible
+    # clone followed by an unparseable `tools/setup.py` produced zero findings
+    # AND zero gaps — a silent false clean on exactly the chain this vector
+    # exists to catch.
+    r"|(?:^|[;&|])\s*\.{0,2}/?[\w.@-]+/[\w./@-]+"
+    # …and a sourced path, which needs no extension and no command name:
+    # `. tools/env` is an execution the alternation above cannot see.
+    r"|(?:^|[;&|])\s*(?:\.|source)\s+\S*/")
+_UNPARSED_CD_RE = re.compile(r"(?:^|[;&|]\s*)\s*cd\s")
+# A whole `${{ … }}` expression. The runner substitutes it before the shell
+# sees it, so it is ONE word — see `_shell_tokens`.
+_EXPRESSION_TOKEN_RE = re.compile(r"\$\{\{.*?\}\}", re.S)
+# `$( … )` — a command substitution. Its body is a command whose OUTPUT becomes
+# a word; the words inside it are not this command's arguments. Left expanded,
+# `FILE=$(ls tools/x.sql)` had its assignment prefix stripped and the `ls`
+# arguments read as the command, so a path `ls` merely listed was reported as
+# executed. Process substitution `<( … )` is deliberately untouched: the piped
+# installer arm matches `bash <(curl …)` on the raw text.
+_COMMAND_SUBSTITUTION_RE = re.compile(r"\$\((?:[^()]|\([^()]*\))*\)", re.S)
+
+
+def _shell_tokens(segment: str) -> list[str]:
+    """`segment` split the way a shell would, or `[]` when it cannot be.
+
+    A segment carrying an unbalanced quote or a construct `shlex` refuses is
+    returned as no tokens at all: this detector only ever ADDS a finding when
+    it can see both halves of the chain, so an unparsable command simply
+    contributes nothing rather than being guessed at.
+
+    `${{ github.repository }}` collapses to a token that KEEPS its identity,
+    because it is the one expression whose value the scanner knows: it is the
+    repository being scanned, which is what makes a clone of it a self-clone.
+    Every other `${{ … }}` expression is collapsed to its OWN opaque token FIRST — one per
+    distinct expression text, never one shared by all of them. The runner
+    substitutes it before the shell ever sees it, so it is a single word; split
+    on its spaces it becomes three, every positional after it shifts, and the
+    clone's destination gets read out of the expression's insides. That is not
+    a missing destination but a WRONG one — and a wrong one is what a correct
+    40-hex pin on the real directory would then fail to match.
+    """
+    try:
+        collapsed = _SELF_REPO_EXPRESSION_RE.sub(_SELF_REPO_TOKEN, segment)
+        collapsed = _EXPRESSION_TOKEN_RE.sub(
+            lambda m: _expression_token(m.group(0)), collapsed)
+        return shlex.split(_COMMAND_SUBSTITUTION_RE.sub("$SUBST", collapsed),
+                           comments=False, posix=True)
+    except ValueError:
+        return []
+
+
+def _strip_command_prefix(tokens: list[str]) -> list[str]:
+    """Drop leading `VAR=value` assignments and command wrappers (`sudo`, …)."""
+    i = 0
+    while i < len(tokens) and (
+        _ASSIGNMENT_RE.match(tokens[i]) or tokens[i] in _LEADING_WRAPPERS
+    ):
+        i += 1
+    return tokens[i:]
+
+
+# Runner variables that are ABSOLUTE by GitHub's contract. Joining them onto a
+# step's `working-directory:` put them inside a checkout they have nothing to do
+# with — a `vale` binary downloaded from its own release page and sha-verified
+# was reported as executing "from" a docs checkout on a real repository.
+_RUNNER_ABSOLUTE_RE = re.compile(
+    r"^\$\{?(?:GITHUB_WORKSPACE|HOME|RUNNER_TEMP|RUNNER_WORKSPACE"
+    r"|RUNNER_TOOL_CACHE|GITHUB_ACTION_PATH)\}?/")
+
+
+def _resolve_path(cwd: str, path: str) -> str:
+    """`path` as seen from `cwd`, normalized. Absolute paths pass through."""
+    if path.startswith("/") or _RUNNER_ABSOLUTE_RE.match(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(cwd, path))
+
+
+def _under(dest: str, path: str) -> bool:
+    """Is `path` inside the fetched destination `dest`?
+
+    `dest == "."` is the whole working tree (what a `git fetch` +
+    `git checkout FETCH_HEAD` replaces), so every relative path is inside it;
+    an absolute path never is.
+    """
+    if dest == ".":
+        return not path.startswith("/")
+    return path == dest or path.startswith(dest + "/")
+
+
+def _clone_destination(url: str, dest: str | None) -> str | None:
+    """The directory a `git clone` writes into, or None when it is not visible.
+
+    With no explicit destination git derives one from the URL's last path
+    segment — knowable only when the URL is a literal. A URL held in a shell
+    variable (`"$TOOLS_REPO_URL"`) leaves the destination unknowable, and this
+    detector reports nothing it cannot show: no destination means no visible
+    connection to whatever executes later.
+    """
+    if dest:
+        return dest
+    if not url or "$" in url:
+        return None
+    base = url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    if base.endswith(".git"):
+        base = base[: -len(".git")]
+    return base or None
+
+
+@dataclass(frozen=True)
+class _RemoteFetch:
+    """A fetch of third-party code into a directory this job can execute."""
+    line: int
+    raw: str
+    dest: str
+    ref: str | None      # None = the remote's default branch (HEAD)
+    # Position in the job's command stream. Ordering is the finding's whole
+    # claim — the fetch put the code there BEFORE it ran — and a line number
+    # cannot carry it: `python3 tools/setup.py && git clone … tools` has both
+    # halves on one line, in the wrong order.
+    pos: int
+    # For the YAML arm: the repository `actions/checkout` was pointed at. None
+    # for a shell fetch, whose evidence line already shows the URL.
+    source: str | None = None
+
+
+def _ref_description(ref: str | None) -> str:
+    if ref is None:
+        return "the remote's default branch (HEAD)"
+    if _ABBREV_SHA_RE.match(ref):
+        # Reads mid-sentence ("fetches remote code at <this> into `tools`"), so
+        # it stays a NOUN PHRASE — a trailing clause here produced a sentence
+        # that ran on through the rest of the finding.
+        return f"`{ref}` (an ABBREVIATED commit id git re-resolves at fetch time)"
+    return f"`{ref}`"
+
+
+def _git_subcommand(tokens: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """(subcommand, `-C` directory, remaining args) for a `git …` invocation."""
+    i, gdir = 1, None
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-C" and i + 1 < len(tokens):
+            gdir = tokens[i + 1]
+            i += 2
+            continue
+        if tok in ("-c", "--namespace", "--git-dir", "--work-tree") and i + 1 < len(tokens):
+            i += 2
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok, gdir, tokens[i + 1:]
+    return None, gdir, []
+
+
+def _parse_clone(args: list[str]) -> tuple[str | None, str | None, str | None]:
+    """(url, destination-as-written, ref) from `git clone`'s arguments."""
+    ref: str | None = None
+    positionals: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok.startswith("--") and "=" in tok:
+            name, _, value = tok.partition("=")
+            if name in ("--branch", "--revision"):
+                ref = value
+            i += 1
+            continue
+        if tok in _CLONE_VALUE_OPTS:
+            if i + 1 < len(args):
+                if tok in ("-b", "--branch", "--revision"):
+                    ref = args[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        positionals.append(tok)
+        i += 1
+    url = positionals[0] if positionals else None
+    dest = positionals[1] if len(positionals) > 1 else None
+    return url, dest, ref
+
+
+# `github.com/<owner>/<repo>`, in any of the spellings a workflow writes it:
+# the https form, git's scp-like `user@host:owner/repo.git` form, and the
+# authenticated form that carries a token in the URL's userinfo (which the
+# `[/:]` and optional-userinfo handling below both cover).
+_GITHUB_SLUG_RE = re.compile(
+    r"github\.com[/:]([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?(?:[/?#]|$)")
+_SELF_REPO_EXPRESSION_RE = re.compile(r"\$\{\{\s*github\.repository\s*\}\}")
+# Survives expression collapsing in `_shell_tokens` so the clone arm can still
+# see that the URL named the scanned repository.
+_SELF_REPO_TOKEN = "$SELF_REPO"
+# The self-repository expression (or its collapsed token) as the ENTIRE
+# `owner/repo` path segment of a URL — `github.com/${{ github.repository }}` and
+# nothing appended to it.
+_SELF_REPO_SLUG_RE = re.compile(
+    r"[/@]"
+    r"(?:\$\{\{\s*github\.repository\s*\}\}|\$SELF_REPO"
+    # The environment-variable spelling is exactly as self-identifying as the
+    # expression, and the guard already honours the expression.
+    r"|\$GITHUB_REPOSITORY\b|\$\{GITHUB_REPOSITORY\})"
+    r"(?:\.git)?(?:[/?#]|$)")
+
+
+@lru_cache(maxsize=64)
+def _origin_slug(root: str) -> str | None:
+    """`owner/repo` for the checkout at `root`, from `.git/config`, or None.
+
+    Read straight out of the config file rather than by running `git`: this is
+    a per-workflow-file question on a scan that already refuses to shell out
+    for anything, and a scan of an exported tree with no `.git` simply gets
+    None and reports as before.
+    """
+    try:
+        text = (Path(root) / ".git" / "config").read_text(
+            encoding="utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError):
+        return None
+    section = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+            continue
+        if section != '[remote "origin"]' or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() != "url":
+            continue
+        match = _GITHUB_SLUG_RE.search(value.strip())
+        return f"{match.group(1)}/{match.group(2)}" if match else None
+    return None
+
+
+def _is_self_clone(url: str, file_path: Path) -> bool:
+    """Does this URL name the repository being scanned?
+
+    Cloning your own repository at a branch is not this vector: no third party
+    is involved, and the fix — pin to a full commit id — is unactionable for a
+    release workflow that must run at the branch head. On a 2,920-file corpus
+    this shape was 3 of the detector's 15 fires, all one repository's release
+    workflows. The `git fetch` arm already refuses the repo's own history via
+    its named-remote rule; the `clone` arm had no equivalent.
+    """
+    if not url:
+        return False
+    # `${{ github.repository }}` IS the scanned repository — but only when it
+    # is the WHOLE `owner/repo` part of the URL. Searching for it anywhere let
+    # `…/evil/${{ github.repository }}-mirror` — a stranger's URL that merely
+    # embeds yours — read as your own and go silent, and this guard exists to
+    # suppress findings, so a loose match suppresses real ones.
+    if _SELF_REPO_SLUG_RE.search(url):
+        return True
+    match = _GITHUB_SLUG_RE.search(url)
+    if not match:
+        return False
+    # `.github/workflows/<file>` — the scanned checkout is two levels up.
+    parents = file_path.resolve().parents
+    if len(parents) < 3:
+        return False
+    slug = _origin_slug(str(parents[2]))
+    cloned = f"{match.group(1)}/{match.group(2)}"
+    return slug is not None and slug.lower() == cloned.lower()
+
+
+def _is_remote_url(token: str) -> bool:
+    """A `git fetch` remote that names a THIRD PARTY rather than this repo.
+
+    `git fetch origin main` pulls the repository's own history — the code is
+    already the repo's, so it is not this vector. A URL (or a variable holding
+    one) is the shape that reaches somebody else's server.
+    """
+    return "://" in token or "@" in token or "$" in token
+
+
+def _executed_path(tokens: list[str]) -> str | None:
+    """The path this command EXECUTES, as written, or None.
+
+    Deliberately narrow — an interpreter running a named file, a sourced
+    script, a `pip install` of a directory, or a path invoked directly. A
+    command that merely reads the tree (`ls`, `cat`, `grep`) is not execution
+    and must not be treated as it.
+    """
+    if not tokens:
+        return None
+    cmd = tokens[0]
+    rest = tokens[1:]
+    if cmd in _SOURCE_CMDS:
+        return rest[0] if rest and not rest[0].startswith("-") else None
+    if cmd in ("pip", "pip3") or (
+        cmd in _INTERPRETERS and rest[:2] == ["-m", "pip"]
+    ):
+        args = rest[2:] if rest[:2] == ["-m", "pip"] else rest
+        if "install" not in args:
+            return None
+        skip_next = False
+        for i, tok in enumerate(args):
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "-e" and i + 1 < len(args):
+                return args[i + 1]          # editable install: it runs setup.py
+            if tok in _PIP_VALUE_OPTS:
+                # A flag's VALUE is not a positional. `--target tools/deps`
+                # names a destination pip writes into and `-r reqs.txt` names a
+                # file pip READS; reporting either as "executes" asserts
+                # something pip does not do.
+                skip_next = True
+                continue
+            if tok.startswith("-") or tok == "install":
+                continue
+            if tok.startswith("./") or tok.startswith("../") or "/" in tok:
+                return tok
+        return None
+    if cmd in _INTERPRETERS:
+        return _interpreter_executed_path(cmd, rest)
+    if "/" in cmd and not cmd.startswith("-"):
+        return cmd
+    return None
+
+
+# Which flags mean "the program is on the command line" depends on the
+# INTERPRETER, and only the flags BEFORE the first operand are the
+# interpreter's at all.
+#
+# A flat whitelist scanned over every argument leaked in both directions.
+# `-e`/`-E`/`-p`/`-n` are ordinary shell and Python options, so
+# `bash -e tools/install.sh` and `bash tools/install.sh -n` — where the flag
+# belongs to the FETCHED SCRIPT — became silent false cleans on exactly the
+# chain this vector catches. Meanwhile spellings the list did not carry
+# (`bash -lc`, `perl -lane`, `php -r`, `pwsh -Command`) still rendered the
+# program text as "the executed path".
+_INLINE_LETTER_FLAGS = {
+    # A single-dash cluster containing one of these letters carries the program.
+    "perl": set("ce"), "ruby": set("ce"), "node": set("ep"), "nodejs": set("ep"),
+    "php": set("r"), "python": set("c"), "python2": set("c"), "python3": set("c"),
+    "bash": set("c"), "sh": set("c"), "zsh": set("c"), "ksh": set("c"),
+}
+# Long forms, and the PowerShells, which do not use single-letter clusters.
+_INLINE_LONG_FLAGS = {
+    "--eval", "--exec", "--command", "-command", "-encodedcommand", "-c",
+}
+# Options that consume a separate VALUE which is not the program — python's
+# warning filter. Case matters: python's `-W` takes a value, perl's `-w` is a
+# boolean, and conflating them ate the script path after it.
+_INTERPRETER_VALUE_OPTS = {"-W"}
+# `-m` names a MODULE, which is not a path at all.
+_MODULE_FLAGS = {"-m"}
+
+
+def _interpreter_executed_path(cmd: str, rest: list[str]) -> str | None:
+    """The FILE this interpreter runs, or None when it runs inline text.
+
+    Only leading flags are inspected: the scan stops at the first operand,
+    because everything after it belongs to the program being run, not to the
+    interpreter.
+    """
+    letters = _INLINE_LETTER_FLAGS.get(cmd, set())
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "-":
+            return None                      # the program comes from stdin
+        if tok.startswith("<<"):
+            return None                      # …from a here-doc
+        if not tok.startswith("-"):
+            return tok                       # the first operand IS the file
+        low = tok.lower()
+        if low in _INLINE_LONG_FLAGS or low.startswith("--eval="):
+            return None
+        if tok in _MODULE_FLAGS:
+            return None                      # a module name is not a path
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            if letters & set(tok[1:]):
+                return None                  # `-c`, `-lc`, `-lane`, `-pe`, …
+        if tok in _INTERPRETER_VALUE_OPTS:
+            i += 2                           # the value is not the program
+            continue
+        i += 1
+    return None
+
+
+def _job_shell_commands(
+    text: str, job_range: tuple[int, int] | None,
+    gap: Callable[[str], None] | None = None,
+) -> list[tuple[int, str, str, bool]]:
+    """(line, verbatim line, joined command, starts-a-new-step) for the job.
+
+    Restricted to `run:` scalar content, like every other shell reader here, so
+    a step `name:` or a YAML comment is never read as a command. The fourth
+    element marks the first command of a STEP, which is where the working
+    directory must be forgotten: `cd` does not survive from one step to the
+    next, and carrying it across would connect a fetch to an execution that
+    never ran in that directory. Step identity comes from where each `run:`
+    scalar begins (`_run_scalar_starts`), never from line adjacency — adjacency
+    gets it wrong in both directions, joining two inline steps and splitting
+    one block scalar at a blank line.
+
+    A HEREDOC body is dropped: `cat <<'EOF' > install.sh` writes text to a
+    file, and the text a step writes is not a command the step runs. Reading it
+    as shell would let a documented example be reported as a live chain.
+    """
+    lines = text.splitlines()
+    shell_lines = _run_scalar_line_numbers(text)
+    step_starts = _run_scalar_starts(text)
+    start, end = job_range if job_range else (1, len(lines))
+    out: list[tuple[int, str, str, bool]] = []
+    heredoc: str | None = None
+    for line_no, raw, cmd in _shell_commands(lines):
+        if line_no < start or line_no > min(end, len(lines)):
+            continue
+        if line_no not in shell_lines:
+            continue
+        if line_no in step_starts:
+            if heredoc is not None and gap is not None:
+                # The body really was open at the end of the step, so its
+                # commands were correctly not read — but a step that stopped
+                # being scanned must not read as a step with nothing in it.
+                gap(f"a here-doc opened with `{heredoc}` was never closed "
+                    f"before the step ended, so the rest of that step was NOT "
+                    f"scanned for a mutable fetch executed out of")
+            heredoc = None            # a body cannot outlive its own step
+        if heredoc is not None:
+            if raw.strip() == heredoc:
+                heredoc = None
+            continue
+        # An INLINE scalar's shell starts after the `run:` key, and the raw
+        # line carries that key: without stripping it the first token of
+        # `- run: git clone …` is the list dash, and every one-line step in
+        # the file reads as an unparsable command.
+        key = _RUN_KEY_LINE_RE.match(cmd)
+        if key and key.group(2) and not _BLOCK_SCALAR_RE.match(key.group(2).strip()):
+            cmd = key.group(2)
+        out.append((line_no, raw, cmd, line_no in step_starts))
+        opened = _heredoc_delimiter(cmd)
+        if opened:
+            heredoc = opened
+    if heredoc is not None and gap is not None:
+        gap(f"a here-doc opened with `{heredoc}` was never closed before the "
+            f"job ended, so the rest of that step was NOT scanned for a "
+            f"mutable fetch executed out of")
+    return out
+
+
+# A step's own `working-directory:`, keyed by the line its `run:` shell begins
+# on — the same key `_run_scalar_starts` produces, so the two agree by
+# construction.
+_STEP_ITEM_RE = re.compile(r"^(\s*)-\s")
+_WORKING_DIR_RE = re.compile(r"^\s*working-directory\s*:\s*(.+?)\s*$")
+
+
+@dataclass(frozen=True)
+class _StepMark:
+    """One step, located by the YAML parser rather than by a line regex."""
+    job: str
+    run_line: int | None        # 1-based line the `run:` VALUE starts on
+    uses_line: int | None       # 1-based line the `uses:` VALUE starts on
+    working_directory: str | None
+    uses: str | None            # the action the step runs, verbatim
+    start_line: int             # 1-based first line of the step itself
+    end_line: int               # 1-based last line of the step
+
+
+def _step_marks(text: str) -> list[_StepMark] | None:
+    """Every step in the document with source lines, or None if it won't compose.
+
+    Read from the composed node tree — what the parser itself saw. The defects
+    this replaces all came from scraping raw lines with regexes while the
+    parsed document was already in hand:
+
+      * `working-directory: .   # repo root` took the YAML comment into the
+        value, rendering a destination of `` `.   # repo root/tools` ``;
+      * a `working-directory:` written INSIDE a heredoc body — text the step
+        GENERATES, not configuration of the step — was read as the step's own,
+        so the finding stated a destination lifted from generated content;
+      * checkout steps were matched to lines by ORDINAL, so the words
+        `uses: actions/checkout@v4` inside a heredoc shifted every later step.
+
+    A value the parser hands us cannot disagree with the document. A regex over
+    the same bytes can, and did.
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(root, yaml.MappingNode):
+        return None
+
+    def _child(node: Any, key: str) -> Any:
+        if not isinstance(node, yaml.MappingNode):
+            return None
+        for k, v in node.value:
+            if getattr(k, "value", None) == key:
+                return v
+        return None
+
+    jobs = _child(root, "jobs")
+    if not isinstance(jobs, yaml.MappingNode):
+        return None
+    out: list[_StepMark] = []
+    for job_key, job_node in jobs.value:
+        steps = _child(job_node, "steps")
+        if not isinstance(steps, yaml.SequenceNode):
+            continue
+        for step in steps.value:
+            if not isinstance(step, yaml.MappingNode):
+                continue
+            run = _child(step, "run")
+            uses = _child(step, "uses")
+            wd = _child(step, "working-directory")
+            out.append(_StepMark(
+                job=str(getattr(job_key, "value", "")),
+                run_line=(run.start_mark.line + 1) if run is not None else None,
+                uses_line=(uses.start_mark.line + 1) if uses is not None else None,
+                working_directory=(str(wd.value)
+                                   if wd is not None and hasattr(wd, "value")
+                                   else None),
+                uses=(str(uses.value)
+                      if uses is not None and hasattr(uses, "value") else None),
+                start_line=step.start_mark.line + 1,
+                end_line=step.end_mark.line + 1,
+            ))
+    return out
+
+
+def _step_working_directories(text: str) -> dict[int, str]:
+    """{run-scalar start line: the step's `working-directory:`}.
+
+    Keys are the lines `_run_scalar_starts` reports, because that is what
+    `_job_shell_commands` uses to mark a step boundary. VALUES come from the
+    composed document (`_step_marks`), so a YAML comment, a quoted value, or a
+    `working-directory:` written inside a heredoc body cannot reach them. Each
+    parsed step's `run:` line is matched to the first shell start at or after
+    it — the same step, by construction.
+    """
+    marks = _step_marks(text)
+    if marks is None:
+        return {}
+    starts = sorted(_run_scalar_starts(text))
+    out: dict[int, str] = {}
+    for mark in marks:
+        if mark.run_line is None or mark.working_directory is None:
+            continue
+        # Bounded to the step's OWN source span. Matching the first shell start
+        # at or after the `run:` line searched the whole file, so a flow-style
+        # `- {run: …, working-directory: vendor/x}` — which the line regex
+        # cannot see as a shell start at all — donated its directory to the
+        # next block-scalar step, in a different JOB, fabricating a destination
+        # there and moving a real chain out of the fetched tree here.
+        start_line = next(
+            (s for s in starts
+             if mark.run_line <= s <= mark.end_line), None)
+        if start_line is not None:
+            out[start_line] = mark.working_directory.strip()
+    return out
+
+
+def _default_working_directory(doc: dict, job: Any) -> str:
+    """`defaults.run.working-directory` for this job, else the workflow's.
+
+    GitHub resolves the JOB's over the workflow's, and a step's own
+    `working-directory:` over both. Precedence is decided HERE, before any
+    knowability test: treating an unreadable job default as absent fell
+    through to the workflow's value and placed the step in a directory it
+    demonstrably did not run in.
+
+    A default holding an expression gets the same opaque treatment a step's
+    does — `defaults: {run: {working-directory: apps/${{ matrix.app }}}}` is a
+    mainstream monorepo shape, and guessing the workspace root for it is the
+    defect class this scanner may not commit.
+    """
+    def _of(node: Any) -> str | None:
+        if not isinstance(node, dict):
+            return None
+        run = (node.get("defaults") or {}).get("run") \
+            if isinstance(node.get("defaults"), dict) else None
+        value = run.get("working-directory") if isinstance(run, dict) else None
+        return str(value) if isinstance(value, (str, int, float)) else None
+
+    written = _of(job)
+    if written is None:
+        written = _of(doc)
+    if not written:
+        return "."
+    if _EXPRESSION_TOKEN_RE.search(written):
+        return _opaque_dir(written)
+    return _resolve_path(".", written)
+
+
+def _opaque_dir(written: str) -> str:
+    """A directory whose real path the YAML does not contain.
+
+    Keyed by the WRITTEN TEXT, not by the line it appeared on. Keying by line
+    made two steps under the same `apps/${{ matrix.app }}` two different
+    unknown places, so a fetch in one and an execution in the other — the more
+    idiomatic spelling — produced no finding and no gap, while the single-step
+    form fired. The same expression is the same directory.
+    """
+    # Normalized INSIDE the braces too: GitHub ignores the spacing there, so
+    # `apps/${{ matrix.app }}` and `apps/${{matrix.app}}` are one directory.
+    # Keying on the raw text made them two unknown places and lost the chain
+    # between them with no finding and no gap.
+    canonical = _EXPRESSION_TOKEN_RE.sub(
+        lambda m: "${{ " + " ".join(m.group(0)[3:-2].split()) + " }}", written)
+    return _OPAQUE_DIR + " ".join(canonical.split())
+
+
+_CHECKOUT_USES_RE = re.compile(r"^\s*-?\s*uses\s*:\s*['\"]?actions/checkout[@'\"]")
+
+
+def _checkout_fetches(
+    job: Any, text: str, job_range: tuple[int, int] | None, file_path: Path,
+    gap: Callable[[str], None] | None = None,
+) -> list[_RemoteFetch]:
+    """`actions/checkout` steps that fetch ANOTHER repository at a mutable ref.
+
+    The YAML spelling of the same trust model, and the common one: most
+    workflows pull a second repository with `actions/checkout`, not with
+    `git clone`. At a branch or tag the tree that lands is whatever the other
+    side serves when the job runs, exactly as for the shell arm — and the shell
+    arm could not see it, because it reads `run:` scalars only.
+
+    A checkout with no `repository:` is your own code. So is one naming your
+    own repository. Both are the overwhelmingly common case and neither is this
+    vector.
+    """
+    steps = job.get("steps") if isinstance(job, dict) else None
+    if not isinstance(steps, list):
+        return []
+    lines = text.splitlines()
+    start, end = job_range if job_range else (1, len(lines))
+    # Lines from the PARSER, not from a regex counting `uses:` occurrences in
+    # order: the words `uses: actions/checkout@v4` inside a heredoc body shifted
+    # every later step's line, so the evidence quoted a shell-script line, and a
+    # flow-style step matched nothing and fell back to the job header.
+    # Only CHECKOUT steps, and their own `uses:` lines. Collecting every step
+    # with a `uses:` key while the index below counted only checkouts shifted
+    # the mapping by one for every `actions/setup-*` step ahead of the
+    # third-party checkout — nearly every real workflow — so the evidence
+    # quoted the wrong step and, when the shift moved the checkout EARLIER than
+    # a run step, invented a chain whose execution precedes its fetch.
+    marks = _step_marks(text) or []
+    at_lines = [m.uses_line for m in marks
+                if m.uses_line is not None and start <= m.uses_line <= end
+                and (m.uses or "").startswith("actions/checkout")]
+    out: list[_RemoteFetch] = []
+    index = -1
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        uses = step.get("uses")
+        if not (isinstance(uses, str) and uses.startswith("actions/checkout")):
+            continue
+        index += 1
+        # The line this checkout sits on, resolved once so every gap sentence
+        # can name it: notes dedupe on their reason text, and two steps with
+        # the same unresolvable expression collapsed into one entry.
+        mark_line = at_lines[index] if index < len(at_lines) else start
+        with_block = step.get("with")
+        if not isinstance(with_block, dict):
+            continue
+        repository = with_block.get("repository")
+        if not isinstance(repository, str) or not repository.strip():
+            continue                                   # your own code
+        # The self-repository test comes FIRST. Running the expression gap
+        # ahead of it recorded a checkout of your own repo — the very spelling
+        # the clone arm was taught to recognise — as "whether it fetches a
+        # third party was NOT established", into the channel that raises the
+        # "not a clean result" banner. Two real repositories opened their
+        # reports with that warning over nothing but self-checkouts.
+        if _is_self_clone(repository, file_path) or \
+                _is_self_clone(f"github.com/{repository.strip()}", file_path):
+            continue
+        if _EXPRESSION_TOKEN_RE.search(repository):
+            # Anything else computed at run time — the fork-PR spelling above
+            # all — really is unknowable, and the finding would name a third
+            # party the scan never established.
+            if gap is not None:
+                gap(f"an `actions/checkout` on line {mark_line} takes its "
+                    f"`repository:` from `{repository.strip()}`, computed at "
+                    f"run time, so whether it fetches a third party was NOT "
+                    f"established")
+            continue
+        ref = with_block.get("ref")
+        ref = str(ref).strip() if isinstance(ref, (str, int)) else None
+        if ref and _FULL_SHA_RE.match(ref):
+            if gap is not None:
+                gap(f"an `actions/checkout` of `{repository}` on line "
+                    f"{mark_line} is pinned to a full commit id, so it is "
+                    f"deliberately not reported",
+                    kind=_KIND_SUPPRESSED)
+            continue                                   # immutable, as pinned
+        path = with_block.get("path")
+        path = str(path).strip() if isinstance(path, (str, int)) else None
+        if path and _EXPRESSION_TOKEN_RE.search(path):
+            if gap is not None:
+                gap(f"an `actions/checkout` of `{repository}` on line "
+                    f"{mark_line} uses a `path:` computed at run time, so what "
+                    f"executes out of it was NOT checked")
+            continue
+        if ref and _EXPRESSION_TOKEN_RE.search(ref):
+            # A ref chosen at run time is not knowably mutable OR pinned.
+            if gap is not None:
+                gap(f"an `actions/checkout` of `{repository}` on line "
+                    f"{mark_line} uses a `ref:` computed at run time, so "
+                    f"whether it is pinned was NOT established")
+            continue
+        line = mark_line
+        out.append(_RemoteFetch(
+            line=line,
+            raw=lines[line - 1] if line - 1 < len(lines) else "",
+            dest=_resolve_path(".", path) if path else ".",
+            ref=ref,
+            pos=-1,                       # a YAML step: ordered by line, below
+            source=repository.strip(),
+        ))
+    return out
+
+
+def _mutable_fetch_executions(
+    text: str, job_range: tuple[int, int] | None,
+    gap: Callable[[str], None] | None = None,
+    file_path: Path | None = None,
+    base_cwd: str = ".",
+    extra_fetches: list[_RemoteFetch] | None = None,
+) -> list[tuple[_RemoteFetch, int, str]]:
+    """Every (fetch, execution line, executed path) pair visible in one job.
+
+    Both halves have to be visible in the SAME job — jobs get their own runner
+    and their own working tree, so a clone in one is not the tree another runs
+    from. Within the job the pairing is positional: the execution must come
+    after the fetch that put the code there.
+
+    A pin suppresses a destination only when it lands BETWEEN the fetch and the
+    execution. Earlier than the fetch it pinned the tree as it stood rather
+    than the code the fetch brought in; later than the execution the code had
+    already run unpinned. Both used to suppress.
+    """
+    fetches: dict[str, _RemoteFetch] = {
+        f.dest: f for f in reversed(extra_fetches or [])}
+    pending_fetch_head: dict[str, _RemoteFetch] = {}
+    # destination -> the EARLIEST position a full-40-hex pin was applied to it.
+    # Position matters: pinning is a claim about the code that ran, and a pin
+    # applied after an execution pinned nothing that had already executed.
+    pinned: dict[str, list[int]] = {}
+    # `git remote add <name> <url>` — a third-party fetch spelled in two steps.
+    # Without this, two characters of indirection made the whole arm blind.
+    named_remotes: dict[str, str] = {}
+    # (position, line, resolved path, path as written)
+    executions: list[tuple[int, int, str, str]] = []
+    # (position, line) for EVERY command in the job. A checkout-step fetch has
+    # no position of its own, so its suppression window has to open at the
+    # first command after it — any command. Deriving that from `executions`
+    # instead opened the window at the first EXECUTION, which is the reported
+    # hit itself, leaving an interval nothing could fall inside.
+    command_lines: list[tuple[int, int]] = []
+    cwd = base_cwd
+    skip_step = False
+    pos = 0
+    step_dirs = _step_working_directories(text)
+    for line_no, _raw, command, new_step in _job_shell_commands(
+            text, job_range, gap):
+        if new_step:
+            # `working-directory:` on the step wins over the job's and the
+            # workflow's `defaults.run.working-directory`; with none of them
+            # set, a step starts at the workspace root. Getting this wrong is
+            # not a missed finding but a FALSE one: a clone into `vendor/tools`
+            # and a `tools/build.py` that is the repository's own file were
+            # reported as a chain between them.
+            step_dir = step_dirs.get(line_no)
+            skip_step = False
+            if step_dir is not None and _EXPRESSION_TOKEN_RE.search(step_dir):
+                # `working-directory: apps/${{ matrix.app }}` is extremely
+                # common and its value is not knowable here. Skipping the step
+                # would lose every chain inside it; pretending to know it would
+                # invent chains across it. So it becomes an OPAQUE root, keyed
+                # by the expression TEXT: two steps under the same expression
+                # are the same place, and two different expressions never are.
+                cwd = _opaque_dir(step_dir)
+            elif step_dir:
+                # A step's `working-directory:` is resolved against the
+                # WORKSPACE and REPLACES the job default rather than nesting
+                # inside it. Composing them put a step under `app` into
+                # `app/app` and lost real chains through the job's own default.
+                cwd = _resolve_path(".", step_dir)
+            else:
+                cwd = base_cwd
+        if skip_step:
+            continue
+        # A substitution is collapsed BEFORE the command is split, because the
+        # split breaks on `|` and would otherwise cut `$(ls a | head)` in half
+        # and read each piece as a command of its own.
+        #
+        # But `$( … )` RUNS its body, so the body is then read as commands in
+        # its own right, ahead of the command that captures its output.
+        # Collapsing alone lost them: `OUT=$(tools/setup.sh)` after a mutable
+        # clone produced no finding, no gap and no suppression, while the
+        # backtick spelling of the same construct still recorded one.
+        bodies = [
+            piece
+            for match in _COMMAND_SUBSTITUTION_RE.finditer(command)
+            for piece in _install_command_segments(match.group(0)[2:-1])
+        ]
+        for segment in bodies + _install_command_segments(
+                _COMMAND_SUBSTITUTION_RE.sub("$SUBST", command)):
+            pos += 1
+            if not segment.strip():
+                continue
+            command_lines.append((pos, line_no))
+            tokens = _strip_command_prefix(_shell_tokens(segment))
+            if not tokens:
+                # `shlex` refused it — an unbalanced quote, most often, and
+                # ordinary in real workflows (`awk '{print $1}'` inside a
+                # quoted string, and so on). It contributes nothing, which is
+                # correct: it is only a COVERAGE GAP when the text it could not
+                # read could have held one of the two halves this detector
+                # pairs. Reporting every unreadable command instead produced
+                # roughly eight notes per repository about `jq` filters.
+                if _CHAIN_RELEVANT_RE.search(segment):
+                    if gap is not None:
+                        gap(f"a command on line {line_no} could not be parsed "
+                            f"as shell and mentions a fetch or an execution, "
+                            f"so it was NOT checked — review it by hand")
+                    if _UNPARSED_CD_RE.search(segment):
+                        # A `cd` nobody could read leaves the working directory
+                        # stale, so every path resolved after it in this step
+                        # would be wrong. That half-read step is abandoned.
+                        skip_step = True
+                        break
+                continue
+            if tokens[0] == "cd" and len(tokens) > 1 and not tokens[1].startswith("-"):
+                cwd = _resolve_path(cwd, tokens[1])
+                continue
+            if tokens[0] == "git":
+                sub, gdir, args = _git_subcommand(tokens)
+                base = _resolve_path(cwd, gdir) if gdir else cwd
+                if sub == "remote" and args[:1] == ["add"]:
+                    positionals = [a for a in args[1:] if not a.startswith("-")]
+                    if (len(positionals) >= 2
+                            and _is_remote_url(positionals[1])
+                            and not (file_path is not None
+                                     and _is_self_clone(positionals[1],
+                                                        file_path))):
+                        # The two-step spelling of a fetch has to make the same
+                        # judgment the one-step spelling makes. Without the
+                        # self-clone test the identical URL was silent through
+                        # `git clone` and a finding through `git remote add`.
+                        named_remotes[positionals[0]] = positionals[1]
+                    continue
+                if sub == "clone":
+                    url, dest_written, ref = _parse_clone(args)
+                    if file_path is not None and _is_self_clone(url or "",
+                                                                file_path):
+                        continue
+                    dest_written = _clone_destination(url or "", dest_written)
+                    if not dest_written:
+                        # Nothing is claimed without a visible destination, but
+                        # the job then reads as a job with no fetch in it.
+                        if gap is not None:
+                            gap(f"a `git clone` on line {line_no} has no "
+                                f"visible destination directory, so whether "
+                                f"anything executes out of it was NOT checked")
+                        continue
+                    dest = _resolve_path(base, dest_written)
+                    if ref and _FULL_SHA_RE.match(ref):
+                        pinned.setdefault(dest, []).append(pos)
+                        if gap is not None:
+                            gap(f"a clone into `{_as_written(dest)}` on line {line_no} is "
+                                f"pinned to a full commit id, so it is "
+                                f"deliberately not reported",
+                                kind=_KIND_SUPPRESSED)
+                        continue
+                    fetches.setdefault(
+                        dest, _RemoteFetch(line_no, _raw, dest, ref, pos))
+                    continue
+                if sub == "fetch":
+                    positionals = [a for a in args if not a.startswith("-")]
+                    if not positionals:
+                        continue
+                    if not (_is_remote_url(positionals[0])
+                            or positionals[0] in named_remotes):
+                        continue
+                    ref = positionals[1] if len(positionals) > 1 else None
+                    if ref and _FULL_SHA_RE.match(ref):
+                        pinned.setdefault(base, []).append(pos)
+                        continue
+                    # A fetch alone changes no file in the tree — it becomes
+                    # executable code only once something checks FETCH_HEAD
+                    # out, so it is held until that happens.
+                    pending_fetch_head.setdefault(
+                        base, _RemoteFetch(line_no, _raw, base, ref, pos))
+                    continue
+                if sub in ("checkout", "reset", "switch", "merge", "rebase"):
+                    if any(_FULL_SHA_RE.match(a) for a in args):
+                        pinned.setdefault(base, []).append(pos)
+                    if any("FETCH_HEAD" in a for a in args):
+                        held = pending_fetch_head.get(base)
+                        if held is not None:
+                            fetches.setdefault(base, held)
+                    continue
+                continue
+            path = _executed_path(tokens)
+            if path:
+                executions.append((pos, line_no, _resolve_path(cwd, path), path))
+
+    pairs: list[tuple[_RemoteFetch, int, str]] = []
+    for dest, fetch in fetches.items():
+        hit = next(
+            (
+                (at, line, written)
+                for at, line, resolved, written in executions
+                # A shell fetch is ordered by position in the command stream
+                # (both halves can share a line); a checkout step has no
+                # position there, so it is ordered by line.
+                if (line > fetch.line if fetch.pos < 0 else at > fetch.pos)
+                and _under(dest, resolved)
+            ),
+            None,
+        )
+        if hit is None:
+            continue
+        # ANY pin between the fetch and the execution suppresses — not just the
+        # first one seen. Keeping only the earliest hid the pin a repository
+        # actually applied when an older one landed on a tree it then
+        # discarded, and told it that it executes unpinned remote code.
+        #
+        # A checkout-step fetch has no position in the command stream, so its
+        # window opens just before the first shell command AFTER its step —
+        # ANY command. Two ways to get this wrong, and this code has had both:
+        # opening at -1 let every pin in the job count, including one applied
+        # to a tree the checkout then replaced; opening at the first
+        # EXECUTION-shaped command left the window empty whenever that
+        # execution was the reported hit, so the fix recipe's own shape
+        # (checkout, pin, run) could never suppress and an unrelated command
+        # sitting in between decided the verdict.
+        window_start = fetch.pos
+        if window_start < 0:
+            window_start = next(
+                (at for at, line in command_lines if line > fetch.line),
+                hit[0] + 1) - 1
+        pin_at = next((p for p in pinned.get(dest, ())
+                       if window_start < p < hit[0]), None)
+        if pin_at is not None:
+            # Pinned before it ran: the fix this entry recommends, applied.
+            if gap is not None:
+                gap(f"a fetch into `{_as_written(dest)}` on line {fetch.line} was pinned to "
+                    f"a full commit id before anything ran from it, so it is "
+                    f"deliberately not reported",
+                    kind=_KIND_SUPPRESSED)
+            continue
+        pairs.append((fetch, hit[1], hit[2]))
+    return sorted(pairs, key=lambda p: p[0].line)
+
+
+def _correlation_unverified_remote_code_execution(
+    file_path: Path,
+) -> Iterator[RawHit]:
+    """P14.24 — the job executes remote code nobody pinned.
+
+    Two arms, one vector (see the comment block above): the piped installer,
+    delegated unchanged to the shared `run:`-scalar walker, and a git fetch at
+    a MUTABLE ref whose tree the same job then executes from.
+    """
+    yield from detect_yaml_run_injection(file_path, _REMOTE_PIPE_TO_SHELL)
+
+    text = _read_text_safe(file_path)
+    if not text:
+        return
+    doc = _parse_yaml_text(text, file_path)
+    if not isinstance(doc, dict):
+        return
+    ranges = {name: (s, e) for name, s, e in (job_line_ranges(file_path) or [])}
+    for job_name, _job in _walk_jobs(doc):
+        job_range = ranges.get(job_name)
+        if job_range is None:
+            # No source range for this job means its commands cannot be
+            # scoped to it, and a cross-job pairing would be a false claim.
+            # Recorded as a coverage gap rather than dropped in silence.
+            _DROPPED_MATCHES.append({
+                "kind": _KIND_UNANCHORED,
+                "file": str(file_path),
+                "reason": (
+                    f"P14.24: jobs.{job_name} could not be located in the raw "
+                    f"file, so its shell was NOT scanned for a mutable fetch "
+                    f"executed out of — review the job manually"
+                ),
+            })
+            continue
+        def _gap(reason: str, _job: str = job_name,
+                 kind: str = _KIND_NOT_SCANNED) -> None:
+            _DROPPED_MATCHES.append({
+                "file": str(file_path),
+                "reason": f"P14.24: jobs.{_job}: {reason}",
+                "kind": kind,
+            })
+
+        for fetch, exec_line, exec_path in _mutable_fetch_executions(
+            text, job_range, _gap, file_path,
+            _default_working_directory(doc, _job),
+            _checkout_fetches(_job, text, job_range, file_path, _gap),
+        ):
+            yield RawHit(
+                line=fetch.line,
+                evidence=f"{fetch.line:>4}: {fetch.raw}  <-- here",
+                # Identifies the FETCH, not the line. Deduplication keys on
+                # this, so using the whole line made two clones written on one
+                # line byte-identical and the second chain vanished with no
+                # record anywhere.
+                match_text=(f"fetch into {_as_written(fetch.dest)} at "
+                            f"{fetch.ref or 'HEAD'}"),
+                derived_note=(
+                    (f"jobs.{job_name} checks out `{fetch.source}` at "
+                     if fetch.source else
+                     f"jobs.{job_name} fetches remote code at ")
+                    + f"{_ref_description(fetch.ref)} into "
+                      f"`{_as_written(fetch.dest)}` — a "
+                    f"MUTABLE reference, so what lands in the tree is whatever "
+                    f"the other side serves at the moment the job runs — and "
+                    f"then executes `{_as_written(exec_path)}` from it at "
+                    f"line {exec_line}. "
+                    f"A full 40-character commit id is the only reference that "
+                    f"cannot change under you."
+                ),
+            )
 
 
 def _correlation_untrusted_trigger_writes_cache(
@@ -2937,6 +4178,7 @@ _Correlation = Callable[[Path], Iterator[RawHit]]
 _JOB_CORRELATIONS: dict[str, _Correlation] = {
     "credential-file-in-cache-or-artifact": _correlation_credential_file_in_cache_or_artifact,
     "install-scripts-in-privileged-job": _correlation_install_scripts_in_privileged_job,
+    "unverified-remote-code-execution": _correlation_unverified_remote_code_execution,
 }
 _WORKFLOW_CORRELATIONS: dict[str, _Correlation] = {
     "untrusted-trigger-writes-cache": _correlation_untrusted_trigger_writes_cache,
@@ -3418,6 +4660,14 @@ def _dedupe_occurrences(findings: list[Finding]) -> list[Finding]:
             bucket = texts[id(seen[key])]
             if match_text and match_text not in bucket:
                 bucket.append(match_text)
+            # Fold the folded finding's own CLAIM in too, not just its label.
+            # Naming the second fetch on the marker stopped it vanishing, but
+            # the kept finding's prose still described only the first chain, so
+            # what runs out of the second tree was stated nowhere at all.
+            note = str(f.get("derived_note") or "")
+            kept_note = str(seen[key].get("derived_note") or "")
+            if note and note not in kept_note:
+                seen[key]["derived_note"] = f"{kept_note} ALSO: {note}"
             continue
         seen[key] = f
         texts[id(f)] = [match_text] if match_text else []
@@ -3443,6 +4693,7 @@ def scan(
     gh_skip_reason: str = _DEFAULT_GH_SKIP_REASON,
 ) -> dict[str, Any]:
     _DROPPED_MATCHES.clear()
+    _reset_expression_tokens()
     _PARSE_FAILURES_LOGGED.clear()
     workflow_files = all_workflow_files(root)
     missed = _undiscovered_workflows(root, workflow_files)
@@ -3742,13 +4993,31 @@ def scan(
     # too — but a DIFFERENT one, kept in its own list. See `_DROPPED_MATCHES`:
     # the file here read and parsed fine, so its config facts are perfectly
     # measurable; only one `run:` step went unscanned.
+    #
+    # Split by KIND. Only an unanchorable `run:` step belongs under the
+    # report's "…were NOT scanned…" headline — a computed `working-directory:`
+    # is a real gap the headline does not describe, and a pin suppression is
+    # not a gap at all.
     dropped_matches: list[dict[str, str]] = []
+    coverage_notes: list[dict[str, str]] = []
+    suppressed_findings: list[dict[str, str]] = []
+    _by_kind = {
+        _KIND_UNANCHORED: dropped_matches,
+        _KIND_NOT_SCANNED: coverage_notes,
+        _KIND_SUPPRESSED: suppressed_findings,
+    }
     for dropped in _DROPPED_MATCHES:
         rel = _repo_relative(dropped["file"], root)
-        logger.warning("unscanned run: step: %s — %s", rel, dropped["reason"])
+        kind = dropped.get("kind", _KIND_UNANCHORED)
+        if kind != _KIND_SUPPRESSED:
+            logger.warning("coverage gap (%s): %s — %s", kind, rel,
+                           dropped["reason"])
+        else:
+            logger.debug("suppressed finding: %s — %s", rel, dropped["reason"])
         entry = {"workflow_file": rel, "reason": dropped["reason"]}
-        if entry not in dropped_matches:
-            dropped_matches.append(entry)
+        bucket = _by_kind.get(kind, dropped_matches)
+        if entry not in bucket:
+            bucket.append(entry)
 
     logger.debug(
         "scan complete: %d findings, %d coverage gap(s), %d dropped match(es)",
@@ -3803,6 +5072,16 @@ def scan(
         # facts stay measurable, while coverage still degrades to PARTIAL and
         # the report names the step count and the file count honestly.
         "dropped_matches": dropped_matches,
+        # A real coverage gap that is NOT an unanchorable run step — a
+        # computed `working-directory:`, a `ref:` chosen at run time, shell
+        # that would not parse. Its own key so the report can name it in its
+        # own words instead of under a headline that misdescribes it.
+        "coverage_notes": coverage_notes,
+        # Findings the scanner REACHED and deliberately did not report, above
+        # all a fetch pinned to a full commit id. Informational: this must
+        # never degrade coverage, or a repository that did exactly what the fix
+        # recipe says is told its report is not a clean result.
+        "suppressed_findings": suppressed_findings,
         # The config facts + the security component of the CI Score
         # (ci-secure owns this number; the ten vectors above stay
         # findings-only and never enter it). Unscannable workflows force
@@ -3822,7 +5101,7 @@ def scan(
         # prose. `report.py`
         # renders the FACTS as a `## 🧰 Config hygiene checks — pass/fail`
         # table and no number at all. A hygiene aggregate labelled "Security
-        # score" overclaims what six config observations can say and collides
+        # score" overclaims what a handful of config observations can say and collides
         # with the vector scan printed beside it — an early run read "5 of 6
         # facts pass" above ten green rows as a contradiction.
         #
@@ -3834,13 +5113,14 @@ def scan(
         # `tests/verify_report.py::check_no_rendered_security_score` makes the
         # invisibility an invariant. Do not "fix" it again.
         "security_score": _compute_security_score(root, workflow_files,
-                                                  scan_incomplete),
+                                                  scan_incomplete, repo),
     }
 
 
 def _compute_security_score(
     root: Path, workflow_files: list[Path],
     scan_incomplete: list[dict[str, str]],
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Isolated so a facts-layer crash degrades to an honest 'unmeasured'
     block instead of taking down the whole scan (the vectors are the product's
@@ -3848,7 +5128,7 @@ def _compute_security_score(
     try:
         import config_facts
         return config_facts.compute_config_facts(root, workflow_files,
-                                                 scan_incomplete)
+                                                 scan_incomplete, repo=repo)
     except Exception as exc:                                  # noqa: BLE001
         logger.warning("security_score unavailable: %r", exc)
         # Same key set as facts_to_score, so a consumer never has to branch on

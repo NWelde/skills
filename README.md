@@ -63,12 +63,15 @@ CI/CD attack vectors** — template injection in `run:` blocks, fork code execut
 with privileges (pwn requests), `pull_request_target` jobs that poison the shared
 cache, impostor action SHAs, whole-context secret dumps, `$GITHUB_ENV` /
 `$GITHUB_PATH` hijack, `pull-requests: write` granted to untrusted triggers,
-credential files swept into caches and artifacts, unverified `curl | bash`, and
-dependency install scripts running in a job that holds secrets. Every finding
-comes with the exact file and line, the evidence taken from your own workflow,
-and a plain-English **"what an attacker could do"** scenario — then the skill
-offers to fix the ones you pick, dispatching a subagent per finding group that
-applies the [catalog](skills/ci-secure/references/security-patterns.md) recipe
+credential files swept into caches and artifacts, unverified remote code
+execution (an installer piped straight into a shell, or a git tree fetched at
+a branch or tag and then run), and dependency install scripts running in a job
+that holds secrets.
+Every finding comes with the exact file and line, evidence taken from your
+own workflow, and a plain-English **"what an attacker could do"** scenario —
+then the skill offers to fix the ones you pick, dispatching a subagent per
+finding group that applies the
+[catalog](skills/ci-secure/references/security-patterns.md) recipe
 and leaves the diff in your working tree to review. It never commits, pushes, or
 opens a PR on its own. Alongside the findings it reports a short set of pass/fail **config hygiene
 checks** (declared `permissions:`, CODEOWNERS coverage of `.github/workflows/`,
@@ -117,9 +120,9 @@ $ci-speedup      # or $ci-score, $ci-secure
   only.** Its run-history data pass reads the audited repo's Actions
   run/job/log data through read-only `gh` API calls; a token with read access to
   the repo's Actions is enough. `ci-score` never uses the network at all, and
-  `ci-secure` treats `gh` as optional: with it, the impostor-SHA check and the
-  dormancy notes run; without it, the scan still runs and the report says which
-  check was skipped.
+  `ci-secure` treats `gh` as optional: with it, the impostor-SHA check, the
+  dormancy notes, and the two config facts read over the API run; without it,
+  the scan still runs and the report says which checks went unmeasured.
 - **`python3` (3.9 or newer)** and **PyYAML**: the bundled scripts are
   stdlib-only apart from one third-party dependency, **PyYAML**, which the
   scanner uses to parse your workflow YAML. Install it with `pip install pyyaml`

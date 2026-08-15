@@ -180,7 +180,7 @@ def test_finding_order_is_the_action_plan_no_duplicate_summary_sections() -> Non
     assert "Quick wins" not in md and "Bigger projects" not in md
     assert "| **Risk** |" not in md and "| Risk |" not in md
     # the curated action verb survives, inside the finding's Fix block
-    assert "**Do this:** Download + checksum-verify remote scripts" in md
+    assert "**Do this:** Pin remote code to a full commit SHA" in md
     # HIGH finding renders before the MEDIUM one — severity order, not input
     # order — and that order is the plan.
     assert md.index("## 🟥 Finding 1:") < md.index("## 🟧 Finding 2:")
@@ -2218,3 +2218,35 @@ def test_skill_md_coverage_recipe_reads_the_provenance_row() -> None:
     assert lines.index(row) < banner, "Coverage is above the banner, not under it"
     assert "PARTIAL" in row and "b.yml" not in row
     assert any("Incomplete coverage" in ln and "b.yml" in md for ln in lines)
+
+
+def test_the_coverage_note_headline_does_not_claim_the_step_was_unscanned():
+    """The whole point of splitting the channels: a step that WAS read but
+    carries an unknowable value must not be described with the sentence
+    written for steps that were never scanned. A mutant restoring that wording
+    left the suite green, and the report layer had no test at all."""
+    banner = report._coverage_gap_banner(
+        scan_incomplete=[],
+        dropped_matches=[],
+        coverage_notes=[{"workflow_file": "ci.yml",
+                         "reason": "a `ref:` computed at run time"}],
+    )
+    assert "Incomplete coverage" in banner
+    assert "NOT scanned" not in banner, banner
+    assert "were read" in banner, banner
+
+
+def test_coverage_notes_break_the_completeness_flag():
+    """A note is a real gap, so the header cannot say the scan was complete
+    while the banner warns underneath it. A mutant dropping notes from the
+    completeness test left header and banner contradicting each other, green."""
+    assert report._coverage_is_complete([], [], []) is True
+    assert report._coverage_is_complete(
+        [], [], [{"workflow_file": "ci.yml", "reason": "x"}]) is False
+
+
+def test_a_pin_suppression_alone_leaves_the_report_complete():
+    """And the property the split exists for: a repository that pinned exactly
+    as the fix recipe says gets no banner and no incomplete-coverage flag."""
+    assert report._coverage_is_complete([], [], []) is True
+    assert report._coverage_gap_banner([], [], []) == ""
