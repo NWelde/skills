@@ -11,7 +11,42 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **2026-08-15** — **The blocking rule is now part of the skill, as three
+  independent names in `config.py`.** `BLOCKING_OUTCOMES` (which fact outcomes
+  fail a build), `KNOWN_OUTCOMES` (which are recognised at all) and
+  `OUTCOME_MARKS` (how each is displayed), plus `coverage_is_complete()`, which
+  says whether the three agree. None is derived from another — in particular
+  the first two are never computed from the display table, because that
+  coupling lets a cosmetic edit widen the set of accepted outcomes and ship a
+  new failure state as a pass. Anything running ci-secure as a CI gate imports
+  these instead of hardcoding a copy that can drift from the engine's.
+
+- **2026-08-15** — **`config.py` now owns the one definition of how a scanned
+  string is neutralized.** `flatten_scanned()` collapses whitespace, replaces
+  the backtick and escapes the pipe — the rule the report renderer already
+  applied, moved somewhere a stdlib-only CI gate can import it too. The
+  renderer delegates to it rather than keeping a copy: two copies of an
+  escaping rule eventually differ, and the surface with the weaker copy is the
+  one an attacker aims at.
+
+### Fixed
+
+- **2026-08-15** — **The skill imports again on Python 3.9**, the floor
+  `pyproject.toml` declares. `config.py` was the only module under `scripts/`
+  without `from __future__ import annotations`, so the PEP 604 (`X | Y`)
+  annotations added alongside the outcome tables were evaluated at definition
+  time and raised `TypeError` on import — taking `scan.py`, `report.py` and any
+  CI gate down with it for every 3.9 user. Every workflow in this repository
+  pins 3.12, so CI could not see the break. A test now asserts the rule for
+  every module under `scripts/` rather than leaving it to habit.
+
 ### Changed
+
+- **2026-08-15** — **`__version__` / `VERSION` bumped to 0.2.0** for the
+  changes in this entry. The constant is stamped into the report's Scanner row,
+  so an installed skill carries it as its provenance marker.
 
 - **2026-08-14** — **P14.24's rendered finding title is now "Unverified remote
   code execution", not "Unverified remote script execution".** The entry covers
@@ -19,8 +54,6 @@ entries are dated (UTC). Format loosely follows
   findings. Reports generated before and after this change print different
   titles for the identical defect; the pattern id, the severity and the fix
   anchor are unchanged, so anything keyed on those still matches.
-
-### Fixed
 
 - **2026-08-14** — **A single-star branch filter (`branches: ['*']`) no longer
   certifies a required check.** GitHub's filter glob `*` matches a run of
