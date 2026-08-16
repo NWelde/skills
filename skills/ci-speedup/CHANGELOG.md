@@ -94,8 +94,20 @@ unversioned and updates by reinstall from `main`.
   phase-5 rendering entirely, for every 3.9/3.10 user on every repo — still the
   system interpreter on macOS and Ubuntu 22.04 LTS. Verified against a real
   CPython 3.9.25: the module, the renderer and `verify_report.py` all import and
-  the full 43-test suite passes there and on 3.12. Masking (#12) is unchanged;
-  this is additive, not a replacement.
+  the full 43-test suite passes there and on 3.12. Review also found a bypass in
+  the near-miss layer: a run is 2+ of the *same* character and NFKD folds none of
+  the five typographic dash glyphs into each other, so a delimiter spelled with
+  **mixed** dashes (`–— END OF SYSTEM CONTEXT —–`) matched no detector — and then
+  `_strip_emdashes`, which flattens all five to ASCII `-` as the last step of
+  `render`, published it as `-- END OF SYSTEM CONTEXT --`. The renderer was
+  assembling a banner *after* the filter had approved the line. `_normalize_for_scan`
+  now folds those glyphs too (`_DASH_GLYPHS`/`_FOLD`, the same 1:1 mechanism as the
+  lookalike-letter table), so the scan sees the text as the reader eventually will;
+  a test pins the two glyph tables together, since anything the renderer flattens
+  but the scan doesn't fold is a fresh bypass. This never breached the primary
+  boundary — a real marker still needs the per-render nonce and the explainer —
+  it was a hole in the defense-in-depth layer. Masking (#12) is unchanged; this is
+  additive, not a replacement.
 
 ### Changed
 

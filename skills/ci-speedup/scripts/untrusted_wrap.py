@@ -66,16 +66,40 @@ _CONFUSABLES = {
     "\u13A0": "D", "\u1D05": "D", "\u216E": "D",                  # Cherokee/smallcap/numeral D
 }
 
+# The typographic dashes the RENDERER flattens to ASCII "-", at the very end of
+# rendering - i.e. AFTER this module has already scanned and approved the line
+# (`blocking_path._strip_emdashes`, applied to the whole report in `render`).
+#
+# NFKD folds none of these into each other (each is its own NFKD normal form,
+# categories Pd/Sm), so "\u2013\u2014" is two DIFFERENT characters: not a run, no detector
+# fires, nothing is neutralized. The renderer then publishes it as "--" and a
+# convincing near-miss banner ("\u2013\u2014 END OF SYSTEM CONTEXT \u2014\u2013" becoming
+# "-- END OF SYSTEM CONTEXT --") lands in the report having passed straight
+# through the filter that exists to defuse exactly that.
+#
+# So fold them here too: the scan must see the text as the READER will eventually
+# see it, not as it arrives. Same 1:1 mechanism as `_CONFUSABLES` above, so the
+# index map stays aligned and defusal still lands in the original text.
+#
+# MUST stay in sync with `blocking_path._DASH_GLYPHS` - if the renderer ever
+# flattens another glyph, that glyph becomes a new bypass here on the same day.
+_DASH_GLYPHS = ("\u2014", "\u2013", "\u2012", "\u2015", "\u2212")  # em/en/figure/bar/minus
+
+# One lookup for the scan: lookalike letters + renderer-flattened dashes.
+_FOLD = dict(_CONFUSABLES, **{d: "-" for d in _DASH_GLYPHS})
+
 
 def _normalize_for_scan(text: str) -> tuple[str, list[int]]:
     """Return (normalized_text, index_map) where index_map[i] is the position in
     the ORIGINAL text that normalized character i came from.
 
-    Normalizing does three things, each closing off a whole family of disguises:
+    Normalizing closes off a whole family of disguises, one per rule:
       - drops invisible characters, so "E<zero-width>ND" reads as "END"
       - applies NFKC, so fullwidth "ＢＥＧＩＮ" reads as "BEGIN"
       - uppercases, so "end"/"End" read as "END"
       - folds lookalike letters, so Cyrillic "ЕND" reads as "END"
+      - folds the renderer's typographic dashes to "-", so a MIXED run like "–—"
+        reads as the "--" the reader will actually be shown (see `_DASH_GLYPHS`)
 
     We keep the index map so matches found in the normalized copy can be defused
     in the original text - the report still shows exactly what the log said.
@@ -92,7 +116,7 @@ def _normalize_for_scan(text: str) -> tuple[str, list[int]]:
                 continue
             if category == "Cc" and out not in _KEEP_CONTROLS:
                 continue
-            chars.append(_CONFUSABLES.get(out, out))
+            chars.append(_FOLD.get(out, out))
             index_map.append(i)
     return "".join(chars), index_map
 
