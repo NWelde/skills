@@ -23,6 +23,35 @@ entries are dated (UTC). Format loosely follows
   new failure state as a pass. Anything running ci-secure as a CI gate imports
   these instead of hardcoding a copy that can drift from the engine's.
 
+- **2026-08-15** — **You can now set ci-secure up as a CI check in your own
+  repository.** Say *"install ci-secure as a CI check"* and it (1) COPIES the
+  engine, gate and licence into your repo plus one workflow, as a pull request
+  you review and merge; (2) REPORTS WITHOUT BLOCKING on the first run, so the
+  setup does not brick your merge path on day one; (3) becomes blocking when
+  YOU delete the `--advisory` flag and add `ci-secure` to your required checks;
+  (4) is undone by removing that required check, never by deleting the
+  workflow. Nothing happens on its own, and it blocks only after you make it
+  required.
+
+  Nothing is fetched and executed at CI time — a pin can be moved or deleted in
+  a repository you do not control, and we ship a detector for that shape
+  (P14.24). `scripts/vendor.py` does the copying and writes a `VENDORED.json`
+  of per-file hashes that your own CI re-checks every run, so a local edit to
+  the copied gate is loud instead of invisible. `--advisory` downgrades failed
+  FACTS only: a crashed engine, zero workflows scanned, an unrecognised outcome
+  or an incomplete scan stay red, because a ramp for findings must never become
+  a mute button for a broken scan. Updating re-copies the code and never
+  rewrites your workflow file — the runner, the triggers and the flag you
+  deleted are yours. The copied gate is held byte-identical to the one this
+  repo runs on itself, so a weaker copy cannot ship.
+
+  Setup refuses anything that is not plainly your repository rather than
+  writing and hoping: a destination that resolves outside it, a subdirectory
+  rather than the root, or a `ci-secure/` directory already holding files of
+  yours. `--verify` treats compiled bytecode and symlinks under the copied tree
+  as drift even when the manifest lists them, since the manifest is repository
+  content and cannot exempt them.
+
 - **2026-08-15** — **`config.py` now owns the one definition of how a scanned
   string is neutralized.** `flatten_scanned()` collapses whitespace, replaces
   the backtick and escapes the pipe — the rule the report renderer already
@@ -32,6 +61,59 @@ entries are dated (UTC). Format loosely follows
   one an attacker aims at.
 
 ### Fixed
+
+- **2026-08-15** — **The gate setup instructions cover the paths a real
+  session actually takes.** Setup and refresh are the same command, and which
+  one runs is decided by whether `VENDORED.json` is already there — so an
+  agent following the setup steps on a repo that had the vendored copy but no
+  workflow announced a workflow that was never written. The instructions now
+  name that discriminator, stop rather than guessing when the destination is
+  not a git work tree, warn when a repository has no workflows at all (the gate
+  reds permanently on "nothing scanned", which `--advisory` does not clear),
+  say that the copied files are left uncommitted and nothing runs until they
+  are committed, complete the list of refusals, and require checking for local
+  edits before a refresh overwrites them. "Make ci-secure block my PRs" now has
+  a procedure of its own instead of resolving to a setup run that changes
+  nothing. Backing the gate out has an order: the workflow first, then the
+  vendored directory.
+
+- **2026-08-15** — **`--verify` no longer passes a vendored copy that was made
+  smaller than the one that was reviewed.** Deleting a vendored file *and* its
+  `VENDORED.json` entry left every remaining hash correct, so the drift check
+  reported a match — the manifest was allowed to define its own domain. This is
+  not the documented "anyone who can edit the gate can edit the manifest"
+  caveat: nothing is edited-with-a-matching-hash, the copy is simply shrunk. It
+  matters most for `config.py`, the rule that says which outcomes block: with
+  the vendored copy gone the gate falls back to a path *inside the repository
+  being audited*, so one pull request could delete the rule here, add its own
+  there, and be judged by a rule it wrote — under a green drift check. The
+  manifest is now checked for completeness before any hash is compared.
+
+- **2026-08-15** — **The setup no longer asks the wrong repository whether a
+  destination is a repository root.** `GIT_DIR` overrides `git -C`, so an
+  exported one — from a hook, a `rebase -x`, a worktree-driven session — made
+  the subdirectory guard read an unrelated repository's toplevel, refuse a
+  perfectly good install, and tell you to vendor the gate and a live workflow
+  into *that other repository* instead. The same variable made the recorded
+  source commit a stranger's HEAD. All git calls now run with the ambient
+  `GIT_*` variables stripped. Relatedly, the working-tree-dirty check now has
+  the timeout and return-code check its sibling call always had: any failure of
+  `git status` previously read as "clean" and stamped the manifest with a bare
+  sha, which asserts this copy is byte-for-byte the published commit.
+
+- **2026-08-15** — **`--verify` escapes what it reads out of your repository
+  before printing it.** `VENDORED.json` arrives with a branch, a pull request
+  checkout or a fork clone, and its strings went to a step log unescaped — a
+  newline in the recorded version forged a `::notice::all clear` on the check
+  run, and one in a `files` key emitted `::stop-commands::`, swallowing every
+  drift reason printed after it so the step red with no stated cause. The gate
+  has escaped engine output for this reason all along; the drift check runs in
+  the step above it and reads from the same trust class.
+
+- **2026-08-15** — **`PYTHONDONTWRITEBYTECODE` now covers the whole scan job.**
+  Scoped to the gate step alone, it stopped one step short of the drift check
+  itself — the step whose entire purpose is rejecting bytecode was the one
+  Python was free to write it from.
 
 - **2026-08-15** — **The skill imports again on Python 3.9**, the floor
   `pyproject.toml` declares. `config.py` was the only module under `scripts/`

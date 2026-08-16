@@ -547,6 +547,186 @@ If the user asks for verification next steps: run the report self-check
 `--clone <audited-repo>` to confirm every fix in `## Fixes applied`
 actually changed its file.
 
+## Add ci-secure as a CI gate
+
+**Reached by NAMING it** — "install ci-secure as a CI check", "make
+ci-secure block my PRs", "add the ci-secure gate", "update/refresh the
+ci-secure gate". A scan request is not an install request: audit as
+usual, and do not add a gate option to the Phase 6 close, whose option
+list is fixed. If the user asks what would stop the findings coming
+back, this section is the answer.
+
+A scan says what is wrong today. A gate stops it coming back — the same
+engine, on every pull request, red when a security fact fails. It is
+**vendored, never fetched**: the engine, the gate and the licence are
+COPIED into the user's repository, so the code judging their PRs is code
+they can read and it cannot change underneath them. Fetching a pinned
+SHA and executing it at CI time is a shape this skill FLAGS (P14.24); do
+not ship it.
+
+**Install.** This WRITES INTO their working tree, so the "never write
+into the user's tree unasked" rule binds: say exactly what will be
+written, get a yes, and only then run it. Do it on a branch, as one
+setup PR; never push without asking.
+
+Check three things BEFORE saying what will be written, because two of
+them change the answer and the third makes the install pointless:
+
+- `git rev-parse --show-toplevel` gives `<repo-root>`. It is never the
+  current directory — vendoring into a subdirectory produces a workflow
+  GitHub never runs and an install that looks like it worked. If that
+  command FAILS, this is not a git work tree: stop and ask, rather than
+  falling back to the current directory, which is that same outcome
+  reached by guessing.
+- **Does `<repo-root>/ci-secure/VENDORED.json` already exist?** Install
+  and Refresh below are the same command, and this file is what decides
+  which one runs. If it exists this is a REFRESH — go to Refresh, and do
+  not promise a workflow, because a refresh writes none even when none
+  is there.
+- **Does `<repo-root>/.github/workflows/` hold any workflow?** With
+  nothing to scan, the gate reports "no workflow files were scanned",
+  which is a DEGRADED outcome and stays red even in `--advisory` — a
+  permanently red check that neither documented remedy clears. Say so
+  and let the user decide before installing.
+
+```bash
+<ci-secure>/scripts/vendor.py --into <repo-root>
+```
+
+That writes, all under `<repo-root>`:
+
+- `ci-secure/scripts/` — the engine (`scan.py`, `config.py`,
+  `config_facts.py`, `gh_utils.py`), `gate.py`, and `vendor.py` itself,
+  which is what their CI runs to check the copy has not drifted;
+- `ci-secure/references/security-patterns.md` — the pattern catalog the
+  engine reads at runtime. It is a large document that quotes attack
+  shapes, so a repo running its own secret or malware scanners may want
+  to allow-list the path;
+- `ci-secure/LICENSE` and `ci-secure/VENDORED.json`;
+- `.github/workflows/ci-secure.yml`, only if it does not already exist
+  (see Refresh).
+
+Everything that can refuse refuses before the first byte is written, and
+the workflow is written last, after the manifest. So a non-zero exit
+means at worst a partly-copied `ci-secure/`, never a live workflow with
+no gate behind it. It refuses on: a vendored copy trying to install, a
+missing licence, an incomplete skill, a `<repo-root>` that is a
+subdirectory of a repository rather than its root, a destination
+redirected by a symlink, a `ci-secure` that exists and is not a
+directory, and a `ci-secure/` directory that already holds someone
+else's files — that last one because the workflow re-checks that
+directory against the manifest on every run and would red on anything
+else it finds there. That collision refusal applies to a FIRST install
+only; a refresh expects to find our files there. Report the error and
+stop; do not retry blind.
+
+If it reports that `.github/workflows/ci-secure.yml` already existed, the
+install did NOT wire anything up — resolve that with the user before
+telling them they have a gate. The exit code is 0 either way, so read
+the output; do not infer success from it.
+
+The install leaves everything UNCOMMITTED, and nothing runs until those
+files are on a branch GitHub can see. Say that plainly when handing over
+— committing is theirs to do unless they ask, and the NEVER rules below
+bind. If their tree already had uncommitted work in it, say that too:
+the vendored files are now mixed in with it.
+
+Then walk the user through the following in the message that hands the
+work over. They need it whether or not a PR gets opened. Items 1, 3 and
+4 also belong in the PR body; items 2, 5 and 6 name weaknesses the repo
+still has, so on a public repository keep those out of the PR body and
+say them to the user directly — the disclosure corollary below applies
+to an install PR as much as to a fix PR:
+
+1. **Requirements**: Python 3.12 and PyYAML, both pinned in the
+   workflow. The engine is not stdlib-only; the gate is. `vendor.py`
+   itself needs Python 3.9 or newer to run. **Check their default
+   branch**: the workflow ships `push: branches: [main]`, so if theirs
+   is not `main`, change it in the file before handing it over — left as
+   shipped that trigger silently covers nothing, and it is the one that
+   re-judges what already merged. Pull requests are judged either way.
+2. **It ships in `--advisory` mode.** A repo that has never been scanned
+   usually reds two or three facts on its first run (workflows with no
+   `permissions:`, no CODEOWNERS entry for `.github/`). Advisory reports
+   them without blocking, so the installing PR does not brick their
+   merge path. **`--advisory` downgrades FAILED FACTS ONLY** — a crashed
+   engine, zero workflows scanned, an unrecognised outcome or an
+   incomplete scan stay red, because a ramp for findings must never
+   become a mute button for a broken scan.
+3. **Going blocking**, once those are burned down: drop `--advisory`
+   from the "Run ci-secure" step in
+   `.github/workflows/ci-secure.yml`, then require **`ci-secure`** — the
+   always-running verdict job, never the scan job. A conditional job that
+   gets skipped reports Success to a required-check rule, so requiring
+   one is a rule that can be satisfied by never running it. The second
+   half is a repository setting only they can change.
+
+   "Make ci-secure block my PRs" on a repo that already has the gate is
+   asking for this, not for an install — the install command would run a
+   refresh, touch no workflow, and leave `--advisory` exactly where it
+   was. Editing that one line is a write into their tree like any other:
+   say which line, get a yes, then make the edit.
+4. **Getting out**, if it ever reds their default branch: un-require
+   `ci-secure` (one settings change, reversible, and it needs admin).
+   That unblocks MERGES; the branch itself stays red until the cause is
+   fixed, because the `push:` trigger keeps running. **Not** deleting
+   the workflow — that leaves them believing they have a check they do
+   not. Putting `--advisory` back is the narrower remedy and only clears
+   a red caused by a failed fact; it will not clear a crashed engine, an
+   incomplete scan, or a rate-limited weekly run — the workflow also
+   runs weekly, which is where that last one comes from. If they want
+   the gate gone entirely, the order matters: delete the workflow FIRST,
+   then `ci-secure/`. The other way round reds every run in between, on
+   the drift check, before the gate is even reached.
+5. **Two facts stay UNMEASURED** on any CI token: whether required
+   checks are skippable, and the fork-PR approval policy. Both are
+   admin-scoped API reads. They are disclosed and dropped from the
+   score, never counted as passes.
+6. **A pull request can edit the workflow that judges it — and the gate
+   it runs.** On `pull_request` GitHub checks out the PR's tree, so both
+   `.github/workflows/ci-secure.yml` and the vendored `ci-secure/` are
+   the PR's versions. Tell them to require review on **both** paths
+   before making `ci-secure` a required check. A CODEOWNERS entry for
+   `.github/` is one of the facts this gate checks; `/ci-secure/` is not
+   — nothing checks it for them, and `.github/` alone leaves the gate,
+   the engine, `config.py` (which defines which outcomes block) and the
+   manifest editable by an ordinary approval. Hashing does not help
+   here: whoever edits the vendored gate edits `VENDORED.json` in the
+   same commit.
+
+**Refresh** ("update the ci-secure gate"): re-run `vendor.py --into`
+from the current skill version. This writes into their tree exactly as
+the install does, so the same rule binds — say what will be rewritten,
+get a yes, and only then run it. Show them the resulting diff; open a PR
+only if they ask for one.
+
+- Run `vendor.py --verify ci-secure` and `git status` FIRST. A refresh
+  overwrites every vendored file, and an UNCOMMITTED local edit is gone
+  for good — `git diff` afterwards cannot show what it replaced, because
+  there is no committed version to compare against. If either command
+  shows local changes, surface them and get a decision before running
+  anything.
+- The vendored CODE is replaced, and files a newer version no longer
+  ships are removed. Committed hand edits show up in the resulting
+  `git diff` for the user to resolve. Their CI re-checks the copy every run
+  (`vendor.py --verify ci-secure`), which catches the local edit made
+  while debugging and never removed — not a determined attacker, who can
+  edit the manifest in the same commit.
+- **A refresh writes no workflow at all**, whether or not one is sitting
+  at `.github/workflows/ci-secure.yml`. That file is theirs: the runner,
+  the triggers, the path they moved it to, and the `--advisory` flag they
+  deleted when they went blocking. Rewriting it — or re-adding the
+  template beside a copy they renamed — quietly returns a blocking gate
+  to advisory, and since it is deliberately not checksummed nothing
+  downstream would catch that. If the template has changed in a way they
+  want, show them the diff against `<ci-secure>/scaffold/ci-secure.yml`
+  and let them choose.
+- There is no dry run, and `--verify` compares their copy against its own
+  manifest, not against this skill — so "is it already current?" can only
+  be answered after the refresh, from `git diff`. If that diff is empty,
+  say so and open nothing: a PR whose only change is a rewritten manifest
+  is noise.
+
 ## NEVER rules
 
 - **Never modify a file outside the one named in a finding's
@@ -555,7 +735,9 @@ actually changed its file.
   between dispatches.
 - **Never push, commit, or open a PR from inside the skill unless the user
   explicitly asks.** By default the user reviews the working tree
-  themselves. (Corollary: if the user does
+  themselves, and that includes the gate install, a refresh, and the
+  one-line `--advisory` edit that goes blocking: each of those WRITES
+  with consent, and none of them commits. (Corollary: if the user does
   ask you to open a PR for the fixes, the PR body must not name the
   vulnerability class being closed or narrate the attack — a public PR
   describing an unfixed-until-now hole is a disclosure. Describe the
@@ -564,7 +746,9 @@ actually changed its file.
   unasked.** Render to tmp; only the explicit save pick (or `open`)
   writes `./ci-secure-report.md` — one stable name, as both siblings use,
   so a re-run overwrites the last report instead of accreting dated copies
-  the user has to reconcile.
+  the user has to reconcile. The gate install and refresh are the other
+  writers, and they are asked for by name: the same rule binds them, which
+  is why each states what it will write and waits for a yes.
 - **Never widen a fix beyond what the catalog recipe specifies.** Each
   vector's patch is exactly its recipe; adjacent hardening is a separate
   finding and a separate dispatch.
