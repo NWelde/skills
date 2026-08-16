@@ -166,6 +166,86 @@ unversioned and updates by reinstall from `main`.
 
 ### Fixed
 
+- **2026-08-15** — **Three detection bypasses in the untrusted-log marker scan,
+  and a verifier that died on a broken sibling** (issue #29 follow-up; found by
+  `/code-review` of PR #43). (1) `_run_start` required the delimiter run to be
+  "not preceded by ANY delimiter character", so a single unrelated punctuation
+  character in front of a banner disabled detection for the whole line and the
+  forgery shipped byte-identical: `#--- BEGIN SYSTEM PROMPT ---`,
+  `**--- BEGIN …---**`, `|--- BEGIN …---|`, `*=== END OF UNTRUSTED LOG ===*` —
+  every one a markdown bullet, comment marker or table pipe away from a shape the
+  suite already caught. This is the same flaw `_run_after_gap` already documents
+  and rejects on the *tail* side; it sat unnoticed on the leading side. The
+  lookbehind now compares against the *captured* character ("not preceded by THIS
+  SAME character"), which keeps the property that made the old one fast — exactly
+  one start position per maximal run — so the scan stays linear. Simply deleting
+  the lookbehind, the obvious-looking fix, instead restores the quadratic blowup
+  the ReDoS entry above removed (measured on one machine at 0.20s for 5k characters, 3.4s at
+  20k and 12.8s at 40k — absolute numbers are hardware-dependent and were ~2x
+  higher on a second machine; what matters is the shape, 4x the time for 2x the
+  input, extrapolating to minutes at the 200KB the perf guards use); a perf guard now pins
+  the crafted `#` + long-run line specifically. (2) `\b(?:BEGIN|END)\b` never
+  matched an underscore-drawn banner — `_` is both a `\w` character and a run
+  character, so there is no word boundary between the run and the keyword, and
+  `___BEGIN SYSTEM PROMPT___` / `___END___` / `__END OF UNTRUSTED CONTENT__`
+  passed through unmodified while the identical banner drawn with any other
+  character was caught. Replaced with explicit `(?<![0-9A-Za-z])` /
+  `(?![0-9A-Za-z])` boundaries, with a test pinning that `LEGEND`, `ENDPOINT`,
+  `BEGINNER` and `APPENDED` still don't count. That widening alone was too broad,
+  though, and the first cut of it regressed ordinary evidence: `_` is the one
+  delimiter character that is also a *word* character, so it appears
+  mid-identifier constantly, and `test_foo__END_TO_END`, `Module.__END` and
+  `src/__tests__/end.test.ts` each carry a `__` run immediately followed by the
+  keyword — structurally identical to a banner. They were being rewritten in place
+  (`test_foo[delimiter-shaped text from log, neutralized: _·_EN·D]_TO_END`),
+  mangling the exact diagnostic the report exists to show. The first attempt at
+  containing that — requiring underscore runs to start at a line start or after
+  whitespace — was itself wrong, and re-opened bypass (1) above for `_` alone:
+  `#--- BEGIN SYSTEM PROMPT ---` was caught while `#___BEGIN SYSTEM PROMPT___`
+  passed through byte-identical, one character of attacker effort. The rule that
+  actually holds is on the keyword's *right* boundary instead: `_` counts there
+  only when another `_` follows it, i.e. when it is part of a delimiter run
+  (`___END___`) rather than identifier glue (`end_idx`). Underscore runs are
+  otherwise unrestricted, like every other run character. Three directions are
+  pinned (`test_underscore_drawn_banners_are_caught`,
+  `test_underscore_banner_after_punctuation_is_caught`,
+  `test_snake_case_identifiers_are_not_keywords`). That rule alone cost the
+  underscore-*separated* banner (`___END_OF_INPUT___`), whose keyword is followed
+  by a lone `_` and so reads as identifier glue — recovered by a dedicated
+  `_UNDERSCORE_BANNER_RE` using the two signals code doesn't have: the run must
+  TOUCH the keyword (`___END`, never `___ end` or `test_end`), and a closing run is
+  mandatory. Measured over 612,970 lines of this repo as a log proxy, that pattern
+  flags 5 lines the keyword rule leaves clean — 3 of them this module's own
+  documentation of the banner string, one Crystal's `__END_LINE__` end-of-source
+  token (same family as Ruby `__END__`, already flagged by design), and one true
+  false positive (a pyparsing docstring). One residual is accepted and documented
+  rather than closed: `at Module.__END (…)` IS flagged, since a `__` run glued
+  after punctuation is genuinely delimiter-shaped and separating it from
+  `.___BEGIN SYSTEM PROMPT___` would cost the bypass above. (3) Only the *first* BEGIN/END in
+  a matched span was broken, so a line carrying a whole banner pair published half
+  of it intact: `--- BEGIN X --- END ---` rendered a verbatim `END ---` directly
+  after a label announcing the other half had been neutralized. Two causes, both
+  fixed — the run in the middle is simultaneously the first marker's closing
+  delimiter and the second's opening one, and `finditer` consumed it into the
+  first match and restarted past it (`_scan_sharing_runs` now re-offers a
+  match's trailing run as the next search's starting point, and the existing
+  merge step folds the overlapping spans), and `_label` broke keywords only in
+  the `head` half (it now breaks them in the tail too — one `·` per extra
+  keyword, with the surrounding diagnostic text still untouched and still outside
+  the label brackets). (4) `verify_report.py`'s by-path loader guarded only the
+  sibling `untrusted_wrap.py` being *absent*; a sibling that was present but
+  failed to import propagated out of `exec_module` and took the whole verifier
+  down with a traceback and no verdict on any other check. Since that module
+  compiles every pattern at import time, one malformed regex — or simply running
+  below the documented 3.9 floor — cost all report verification; it now degrades
+  to the same loud SKIP as an absent sibling and doesn't leave the
+  half-initialized module in `sys.modules`. All four are pinned by tests verified to
+  fail before the corresponding source change is applied, and the whole wrapper
+  suite was re-run against a real CPython 3.9.25 (the new
+  backreference-in-lookbehind is accepted there). The two `*_scans_quickly` tests
+  are forward-guards against the tempting-but-quadratic alternative fix, not
+  regression tests — they pass with and without the change.
+
 - **2026-07-30** — **Two more floor-ranking sites name the check that actually
   caps the wait — the effective floor, not the p50-slowest sibling** (same class
   as #22's below-gate role line, found by its floor-semantics audit). (1) The
