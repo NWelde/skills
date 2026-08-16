@@ -38,6 +38,7 @@ when the bug genuinely cannot be expressed as a re-derivation property.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import re
@@ -60,8 +61,37 @@ from pathlib import Path
 # (issue #29's own grounding-check regression: a genuinely-quoted, correctly
 # neutralized evidence line was failing grounding because this file only knew
 # about `_fence_safe`'s transforms, not this one).
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import untrusted_wrap as uw  # noqa: E402
+
+
+def _load_untrusted_wrap():
+    """Load the sibling `scripts/untrusted_wrap.py` BY PATH, under a unique module
+    name, without touching `sys.path`.
+
+    A `sys.path.insert(0, .../scripts)` would front-load that whole directory for
+    the rest of the process, and it holds `run.py`, `summary.py`, `scan.py`,
+    `claims.py` — names generic enough to shadow an embedding harness's own
+    modules. That is a second-order version of the collision this file's
+    standalone rule exists to avoid, so pay only for the one module we need. Same
+    by-path idiom `test_verify_report_self.py` already uses to load THIS file.
+
+    Returns None when the sibling isn't there (this file copied next to a report
+    on its own). That is not fatal: every other check still runs, and only
+    `check_gap_fill_evidence_grounded` — which cannot mirror the renderer without
+    it — degrades, to a loud SKIP rather than a wrong verdict."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "untrusted_wrap.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "ci_speedup_untrusted_wrap_for_verify", path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+uw = _load_untrusted_wrap()
 
 
 @dataclass(frozen=True)
@@ -1989,7 +2019,7 @@ def _ground_transform(text: str) -> str:
     collapse let fabricated text SPLICED across two adjacent log lines pass as "verbatim" (#110
     bot review) — the gap-fill contract quotes verbatim log LINES, so each evidence line must be
     a substring of a single transformed log line."""
-    corpus = uw.neutralize_forged_markers(_fence_safe(text))
+    corpus = uw.neutralize_forged_markers(_fence_safe(text))  # `uw` presence gated by the caller
     for dash in _TYPOGRAPHIC_DASHES:
         corpus = corpus.replace(dash, "-")
     return corpus
@@ -2012,6 +2042,14 @@ def check_gap_fill_evidence_grounded(report: str, findings_path: Path | None) ->
               if _LLM_ANALYSIS_MARKER in body and _LLM_EVIDENCE_FENCE_RE.search(body)]
     if not blocks:
         return Check(name, True, "no 🤖 gap-fill block renders evidence - nothing to ground")
+    if uw is None:
+        # `_ground_transform` cannot mirror the renderer's marker neutralization without
+        # the sibling module, and an unmirrored compare FAILS every legitimately
+        # neutralized line. A wrong verdict is worse than no verdict: SKIP loudly.
+        return Check(name, True, f"{len(blocks)} gap-fill block(s) render evidence but the "
+                     "sibling scripts/untrusted_wrap.py is not present next to this file, so "
+                     "the renderer's marker neutralization cannot be mirrored - grounding "
+                     "not verified (run this from a full skill checkout)", skipped=True)
     if not findings_path:
         return Check(name, True, f"{len(blocks)} gap-fill block(s) render evidence but no "
                      "--findings to locate the captured logs - cannot verify grounding",

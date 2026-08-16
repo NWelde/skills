@@ -1651,6 +1651,46 @@ def test_gap_fill_evidence_grounded_passes_on_a_neutralized_forged_marker(tmp_pa
     assert _tag_for(rep, _GROUND, tmp_path, findings=_gapfill_findings(str(tmp_path))) == "PASS"
 
 
+def test_verify_report_does_not_mutate_sys_path_on_import():
+    # Claude's review of PR #43, finding #3. Loading the sibling untrusted_wrap via
+    # `sys.path.insert(0, .../scripts)` would front-load that directory for the whole
+    # process, and it holds `run.py`, `summary.py`, `scan.py`, `claims.py` - names
+    # generic enough to shadow an embedding harness's own modules. That is the same
+    # collision class this file's standalone rule exists to avoid, so the module must
+    # be loaded by path instead.
+    # NOTE: asserting `find_spec("run") is None` here would be vacuous-in-reverse -
+    # pyproject's `pythonpath` puts scripts/ on sys.path for the whole pytest session
+    # anyway, so it fails whatever verify_report does. The load-bearing property is
+    # that IMPORTING verify_report adds nothing itself; verified outside pytest, where
+    # `run` is correctly unimportable after the by-path load.
+    before = list(sys.path)
+    vr = _load_verify_report()
+    assert [p for p in sys.path if p not in before] == [], (
+        "importing verify_report mutated sys.path - a by-path load leaves it alone")
+    assert vr.uw is not None, "the sibling untrusted_wrap should still load in a checkout"
+
+
+def test_gap_fill_grounding_skips_loudly_without_the_sibling_module(tmp_path: Path):
+    # The degraded case for the by-path load: verify_report copied next to a report
+    # with no sibling scripts/. `_ground_transform` then cannot mirror the renderer's
+    # marker neutralization, and an unmirrored compare FAILS every legitimately
+    # neutralized line - so it must SKIP loudly rather than emit a wrong verdict.
+    vr = _load_verify_report()
+    vr.uw = None                       # simulate the absent sibling
+    try:
+        rep = _with_gapfill_block("  added 1200 packages in 3m 02s")
+        blocks_report = rep
+        fp = tmp_path / "findings.json"
+        fp.write_text(json.dumps(_gapfill_findings(str(tmp_path))), encoding="utf-8")
+        (tmp_path / "build.log").write_text(_GAPFILL_LOG, encoding="utf-8")
+        res = vr.check_gap_fill_evidence_grounded(blocks_report, fp)
+    finally:
+        vr.uw = _load_verify_report().uw   # restore, so later tests are unaffected
+    assert res.skipped, f"expected a loud SKIP, got ok={res.ok} skipped={res.skipped}"
+    assert res.ok, "a missing sibling must not be reported as a grounding FAILURE"
+    assert "untrusted_wrap" in res.detail, res.detail
+
+
 def test_gap_fill_evidence_grounded_skips_loud_when_logs_absent(tmp_path: Path):
     # The block renders evidence but the captured log can't be located (logs_dir absent, or the file
     # is gone from a moved scratch dir) → loud SKIP, never a silent pass.
