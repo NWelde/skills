@@ -782,6 +782,72 @@ def test_dash_glyph_table_matches_the_renderer():
         "any glyph the renderer flattens but the scan doesn't fold is a bypass")
 
 
+# --------------------------------------------------------------------------- #
+# The ASCII fast path in _normalize_for_scan
+# --------------------------------------------------------------------------- #
+
+def test_ascii_fast_path_matches_the_general_path():
+    # The fast path is only sound if it is INDISTINGUISHABLE from the full rule set
+    # on the inputs it claims. Exhaustive over the whole ASCII range - every single
+    # character and every ordered pair - so a wrong control-char bound or a missed
+    # uppercase rule shows up here rather than as a silently different scan.
+    import itertools
+    for cp in range(128):
+        s = chr(cp)
+        assert uw._normalize_ascii(s) == uw._normalize_general(s), repr(s)
+    for a, b in itertools.product(range(128), repeat=2):
+        s = chr(a) + chr(b)
+        assert uw._normalize_ascii(s) == uw._normalize_general(s), repr(s)
+
+
+def test_ascii_input_does_no_unicodedata_work(monkeypatch):
+    # Pins the optimization itself, deterministically rather than by timing: if an
+    # ASCII line ever reaches `unicodedata` again, this raises. A pure throughput
+    # assertion would have to be loose enough not to flake on a slow runner, which
+    # makes it too loose to notice the fast path being quietly removed.
+    # Patch the MODULE'S OWN reference, not the global `unicodedata` - pytest uses
+    # that module itself while reporting, so a global patch takes the runner down
+    # with an INTERNALERROR instead of failing this test.
+    class _Boom:
+        def __getattr__(self, name):
+            raise AssertionError(
+                f"ASCII line reached unicodedata.{name} - fast path bypassed")
+
+    # Clean ASCII lines only - which is the case that matters, since it is
+    # essentially every line of a real job log and the one the whole-log scan pays
+    # for. A line that DOES match is expected to reach the general path: defusal
+    # inserts "·" (U+00B7), so `_label`'s re-scan of its own output is no longer
+    # ASCII by construction.
+    monkeypatch.setattr(uw, "unicodedata", _Boom())
+    for line in ("npm ERR! added 1200 packages in 3m 02s",
+                 "  Finished release [optimized] target(s) in 4.21s",
+                 "diff --git a/x.py b/x.py",
+                 "-------------------------------------"):
+        assert uw.neutralize_forged_markers(line) == line
+
+
+def test_whole_log_scan_throughput():
+    # `verify_report._ground_transform` runs this over EVERY line of the captured
+    # job log, which routinely runs to multiple MB - a cost the single-crafted-line
+    # perf guards above cannot see. Generous bound: catches a catastrophic
+    # regression (a per-character regex, an accidental O(n^2)) without flaking on a
+    # slow runner. Measured ~0.45s locally for this corpus.
+    import random
+    import time
+    random.seed(7)
+    words = ["npm", "ERR!", "webpack", "build", "cache", "miss", "added", "1200",
+             "packages", "in", "3m", "02s", "Step", "12/20", "RUN", "pip", "install"]
+    lines = [" ".join(random.choice(words) for _ in range(random.randint(4, 12)))
+             for _ in range(50_000)]
+    start = time.perf_counter()
+    for line in lines:
+        uw.neutralize_forged_markers(line)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 5.0, (
+        f"scanning a {sum(map(len, lines)):,}-char log took {elapsed:.1f}s - the "
+        "per-line scan has regressed badly enough to slow the grounding check")
+
+
 def test_forged_begin_with_explainer_copied_is_still_neutralized():
     # An attacker convincing enough to copy our new explainer wording too (not
     # just the dashes/nonce shape) must still get caught - the bigger surface

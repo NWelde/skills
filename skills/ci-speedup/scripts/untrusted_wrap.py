@@ -103,7 +103,45 @@ def _normalize_for_scan(text: str) -> tuple[str, list[int]]:
 
     We keep the index map so matches found in the normalized copy can be defused
     in the original text - the report still shows exactly what the log said.
+
+    Two implementations, same contract: `_normalize_ascii` for an all-ASCII line
+    and `_normalize_general` for everything else. They are pinned equivalent over
+    the whole ASCII range by `test_ascii_fast_path_matches_the_general_path`.
     """
+    # Hot path. `verify_report._ground_transform` calls this (via
+    # `neutralize_forged_markers`) once per line of the ENTIRE captured job log,
+    # and those run to multiple MB - so the per-character `unicodedata` work below
+    # is paid millions of times on a check that used to be a few `str.replace`s.
+    # Virtually every real log line is ASCII, and on ASCII the general path is
+    # provably a no-op beyond uppercasing and dropping control characters:
+    # NFKD is identity on ASCII, no ASCII character is in `_STRIP_CATEGORIES`
+    # (all are Cc / Zs / printable), and every `_FOLD` key is non-ASCII.
+    if text.isascii():
+        return _normalize_ascii(text)
+    return _normalize_general(text)
+
+
+def _normalize_ascii(text: str) -> tuple[str, list[int]]:
+    """`_normalize_for_scan` for an all-ASCII line - no `unicodedata` calls at all.
+
+    Only `str.upper()` and the control-character filter survive from the general
+    path; see its call site for why the other three rules cannot apply to ASCII.
+    ASCII uppercasing stays ASCII and is 1:1, so the index map stays trivial."""
+    chars: list[str] = []
+    index_map: list[int] = []
+    for i, ch in enumerate(text):
+        out = ch.upper()
+        # Category Cc over ASCII is exactly 0x00-0x1F plus 0x7F - an ordinal
+        # compare instead of `unicodedata.category`, which is the expensive part.
+        if (out < "\x20" or out == "\x7f") and out not in _KEEP_CONTROLS:
+            continue
+        chars.append(out)
+        index_map.append(i)
+    return "".join(chars), index_map
+
+
+def _normalize_general(text: str) -> tuple[str, list[int]]:
+    """`_normalize_for_scan` for a line containing non-ASCII - the full rule set."""
     chars: list[str] = []
     index_map: list[int] = []
     for i, ch in enumerate(text):

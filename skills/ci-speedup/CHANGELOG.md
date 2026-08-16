@@ -106,8 +106,21 @@ unversioned and updates by reinstall from `main`.
   a test pins the two glyph tables together, since anything the renderer flattens
   but the scan doesn't fold is a fresh bypass. This never breached the primary
   boundary — a real marker still needs the per-render nonce and the explainer —
-  it was a hole in the defense-in-depth layer. Masking (#12) is unchanged; this is
-  additive, not a replacement.
+  it was a hole in the defense-in-depth layer. Two follow-ups from the same review:
+  `verify_report.py` now loads its sibling `untrusted_wrap` **by path** instead of
+  `sys.path.insert`-ing the whole `scripts/` directory — that directory holds
+  `run.py`, `summary.py`, `scan.py`, `claims.py`, names generic enough to shadow an
+  embedding harness's modules process-wide, which is the same collision class the
+  file's standalone rule exists to avoid; when the sibling is genuinely absent the
+  grounding check now degrades to a loud SKIP rather than a wrong verdict. And
+  `_normalize_for_scan` grew an ASCII fast path: it runs once per line of the whole
+  captured log inside the grounding check, and its per-character `unicodedata` work
+  dominated that on the multi-MB logs the skill drills. On ASCII, NFKD is identity,
+  no character is in `_STRIP_CATEGORIES` and no fold key applies, so only
+  uppercasing and control-stripping remain — 2× faster end-to-end on a 4 MB log,
+  pinned equivalent to the general path across all 128 ASCII characters and all
+  16,384 ordered pairs. Masking (#12) is unchanged; this is additive, not a
+  replacement.
 
 ### Changed
 
