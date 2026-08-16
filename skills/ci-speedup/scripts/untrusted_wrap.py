@@ -108,17 +108,48 @@ def _normalize_for_scan(text: str) -> tuple[str, list[int]]:
 _RUN_CHAR = r"[^\s0-9A-Za-z]"
 
 
+def _repeats_atomically(name: str) -> str:
+    """`(?P={name})++` - one-or-more repeats of the character group `name` already
+    captured, matched ATOMICALLY (the engine may never give any of them back).
+
+    ############################################################################
+    # DO NOT "SIMPLIFY" THIS TO `(?P={name})+` OR `(?P={name})++`.             #
+    # Both are wrong, in different ways, and both fail silently:               #
+    #   `+`  reintroduces the quadratic scan this idiom exists to prevent -    #
+    #        caught by the perf guards in `test_untrusted_wrap.py`.            #
+    #   `++` is Python 3.11+ ONLY and raises `re.error: multiple repeat` at    #
+    #        IMPORT time on 3.9/3.10, which README.md and SKILL.md still       #
+    #        document as supported (verified against a real CPython 3.9.25).   #
+    #        Nothing in this suite catches that - every test run here is on a  #
+    #        newer interpreter, which is exactly how it shipped in PR #43.     #
+    ############################################################################
+
+    Why the shape works. `(?=...)` is a lookahead: it matches without moving the
+    cursor, so the inner `(?P<{name}g>(?P={name})+)` only MEASURES the run and
+    stores that exact text in a second group. `(?P={name}g)` then consumes that
+    stored text - and a backreference matches one fixed string or fails outright,
+    with no shorter alternative to retry. So the length consumed is fixed the
+    moment the lookahead measured it, which is precisely what possessive `++`
+    buys, using only syntax that has existed since Python 2.
+
+    Costs one extra group name per run (`r1` -> `r1` + `r1g`); a pattern using two
+    runs ends up with four groups, which must all stay distinct or `re` rejects the
+    pattern at compile time.
+    """
+    return rf"(?=(?P<{name}g>(?P={name})+))(?P={name}g)"
+
+
 def _run_start(name: str) -> str:
     """A run of 2+ of the SAME delimiter character, at the start of a run.
 
     The backreference is what makes "same character" work, so "───" counts but
-    "-=~" doesn't. The lookbehind ("not already inside a run") and the possessive
-    `++` ("never backtrack inside the run") are both there for speed: without
-    them a long row of dashes gets retried at every single position and the scan
-    becomes quadratic - a line of dashes, which CI tools print constantly, used
-    to take a full minute.
+    "-=~" doesn't. The lookbehind ("not already inside a run") and the atomic
+    repeat (`_repeats_atomically`, "never backtrack inside the run") are both
+    there for speed: without them a long row of dashes gets retried at every
+    single position and the scan becomes quadratic - a line of dashes, which CI
+    tools print constantly, used to take a full minute.
     """
-    return rf"(?<!{_RUN_CHAR})(?P<{name}>{_RUN_CHAR})(?P={name})++"
+    return rf"(?<!{_RUN_CHAR})(?P<{name}>{_RUN_CHAR}){_repeats_atomically(name)}"
 
 
 def _run_end(name: str) -> str:
@@ -128,7 +159,7 @@ def _run_end(name: str) -> str:
     unbounded lazy middle use `_run_after_gap` instead - the trailing lookahead
     here is what makes that combination quadratic.
     """
-    return rf"(?P<{name}>{_RUN_CHAR})(?P={name})++(?!{_RUN_CHAR})"
+    return rf"(?P<{name}>{_RUN_CHAR}){_repeats_atomically(name)}(?!{_RUN_CHAR})"
 
 
 def _run_after_gap(name: str) -> str:
@@ -146,16 +177,16 @@ def _run_after_gap(name: str) -> str:
     position that starts a repeat matches outright, so each position costs O(1) and
     the scan is linear.
 
-    Dropping it does NOT weaken detection - it widens it. `++` is possessive, so the
-    matched run is still every consecutive copy of that character; the lookahead only
-    ever REJECTED a run that happened to butt up against a different punctuation
+    Dropping it does NOT weaken detection - it widens it. The repeat is atomic, so
+    the matched run is still every consecutive copy of that character; the lookahead
+    only ever REJECTED a run that happened to butt up against a different punctuation
     character (`-===`), which is a forgery shape we want caught, not skipped. The
     other obvious fix - requiring the run to be left-maximal with a `_run_start`-style
     lookbehind - is also linear but silently drops exactly those mixed-punctuation
     tails, so it was rejected (pinned by
     `test_mixed_punctuation_tail_banners_are_still_caught`).
     """
-    return rf"(?P<{name}>{_RUN_CHAR})(?P={name})++"
+    return rf"(?P<{name}>{_RUN_CHAR}){_repeats_atomically(name)}"
 
 
 _H_SPACE = r"[^\S\n]*"   # spaces/tabs but NOT newlines, so nothing matches

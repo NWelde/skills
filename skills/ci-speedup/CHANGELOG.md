@@ -44,7 +44,7 @@ unversioned and updates by reinstall from `main`.
   credential-shaped strings masked) stated the trust boundary only in
   surrounding prose — issue #29 asks that the boundary also be marked
   structurally in the text itself. `skills/ci-speedup/scripts/untrusted_wrap.py`
-  (new module, own 41-test suite) adds `wrap_untrusted_block`: every evidence
+  (new module, own 43-test suite) adds `wrap_untrusted_block`: every evidence
   block is wrapped in a per-render, nonce-bearing `--- BEGIN/END UNTRUSTED LOG
   CONTENT [xxxxxxxx] ---` pair, with any marker-shaped text the log itself
   contains (exact wording, near-miss wording, homoglyphs, invisible
@@ -85,8 +85,17 @@ unversioned and updates by reinstall from `main`.
   punctuation, e.g. `-===`, which is a forgery shape worth catching). Both the
   perf bound and the mixed-punctuation detection are pinned by tests, the latter
   specifically to reject the tempting left-maximal-lookbehind fix that is linear
-  but silently drops those tails. Masking (#12) is unchanged; this is additive,
-  not a replacement.
+  but silently drops those tails. The runs are held atomic by
+  `_repeats_atomically` — the `(?=(?P<g>…))(?P=g)` lookahead-plus-backreference
+  idiom rather than a possessive `++`, which CPython's `re` only accepts from
+  **3.11** while `README.md` and `SKILL.md` both promise `python3` 3.9+. That
+  mismatch was not a degradation but a hard `re.error` at *import* time, taking
+  down `blocking_path.py` (which imports the module at top level) and therefore
+  phase-5 rendering entirely, for every 3.9/3.10 user on every repo — still the
+  system interpreter on macOS and Ubuntu 22.04 LTS. Verified against a real
+  CPython 3.9.25: the module, the renderer and `verify_report.py` all import and
+  the full 43-test suite passes there and on 3.12. Masking (#12) is unchanged;
+  this is additive, not a replacement.
 
 ### Changed
 
