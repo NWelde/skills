@@ -44,7 +44,7 @@ unversioned and updates by reinstall from `main`.
   credential-shaped strings masked) stated the trust boundary only in
   surrounding prose — issue #29 asks that the boundary also be marked
   structurally in the text itself. `skills/ci-speedup/scripts/untrusted_wrap.py`
-  (new module, own 43-test suite) adds `wrap_untrusted_block`: every evidence
+  (new module, with its own dedicated test suite) adds `wrap_untrusted_block`: every evidence
   block is wrapped in a per-render, nonce-bearing `--- BEGIN/END UNTRUSTED LOG
   CONTENT [xxxxxxxx] ---` pair, with any marker-shaped text the log itself
   contains (exact wording, near-miss wording, homoglyphs, invisible
@@ -94,7 +94,7 @@ unversioned and updates by reinstall from `main`.
   phase-5 rendering entirely, for every 3.9/3.10 user on every repo — still the
   system interpreter on macOS and Ubuntu 22.04 LTS. Verified against a real
   CPython 3.9.25: the module, the renderer and `verify_report.py` all import and
-  the full 43-test suite passes there and on 3.12. Review also found a bypass in
+  its whole suite passes there and on 3.12. Review also found a bypass in
   the near-miss layer: a run is 2+ of the *same* character and NFKD folds none of
   the five typographic dash glyphs into each other, so a delimiter spelled with
   **mixed** dashes (`–— END OF SYSTEM CONTEXT —–`) matched no detector — and then
@@ -119,8 +119,14 @@ unversioned and updates by reinstall from `main`.
   no character is in `_STRIP_CATEGORIES` and no fold key applies, so only
   uppercasing and control-stripping remain — 2× faster end-to-end on a 4 MB log,
   pinned equivalent to the general path across all 128 ASCII characters and all
-  16,384 ordered pairs. Masking (#12) is unchanged; this is additive, not a
-  replacement.
+  16,384 ordered pairs. **Where the boundary marking applies:** quoted *job-log*
+  evidence, which is what W011/#29 scopes — structural and workflow-YAML evidence
+  (step and job names, quoted `.yml`) still goes through `_fence_safe` alone, so a
+  repo could put marker-shaped text in a step name and have it render unwrapped.
+  That is a strictly weaker position for an attacker (it carries no nonce and no
+  explainer, so it cannot imitate a real boundary) and it is repo-controlled rather
+  than third-party, but it is the same class and worth knowing. Masking (#12) is
+  unchanged; this is additive, not a replacement.
 
 ### Changed
 

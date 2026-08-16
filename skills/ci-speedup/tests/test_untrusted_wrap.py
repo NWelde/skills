@@ -201,9 +201,14 @@ def test_single_line_evidence_wraps_correctly():
 
 
 # =========================================================================== #
-# Regression tests for the six bugs found in security review.
-# See maintainers/ci-speedup/untrusted-wrap-bugfixes.md for the full write-up
-# of each.
+# Regression tests for the six bugs found in the first security review round:
+#   1 the "already wrapped" check was forgeable from the log itself
+#   2 forgeries with no [bracketed code] were not caught at all
+#   3 lookalike Unicode delimiter characters evaded every pattern
+#   4 a long row of dashes could hang the scan
+#   5 ordinary log lines were falsely flagged
+#   6 an embedded newline glued two unrelated lines into one "forgery"
+# Each bug's own reasoning is in the test that pins it, below.
 # =========================================================================== #
 
 # --------------------------------------------------------------------------- #
@@ -359,8 +364,10 @@ def test_trailing_newline_does_not_satisfy_the_wrapper_check():
 
 
 # =========================================================================== #
-# Regression tests for the SECOND review round.
-# See maintainers/ci-speedup/untrusted-wrap-bugfixes.md, "Round 2".
+# Regression tests for the SECOND review round: a quadratic scan introduced by
+# the round-1 fixes, case-sensitive detection, a real nonce being enough to
+# claim "already wrapped", the label swallowing real diagnostic evidence, and
+# invisible / fullwidth keyword spellings.
 # =========================================================================== #
 
 # --------------------------------------------------------------------------- #

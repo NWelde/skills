@@ -373,10 +373,12 @@ def _evidence_fence(ev: list[str]) -> list[str]:
     territory. The one chokepoint every self-contained evidence fence in the report
     renders through (`_llm_analysis_block`, `_offcategory_note_block`, the main `render()`
     evidence block) — matches `_fence_safe`'s own one-chokepoint discipline, so a future
-    evidence-rendering site can't quietly skip the wrap. NOT used by `_build_agent_prompt`
-    / `_build_generic_agent_prompt`: their evidence lines sit inside ONE larger fence
+    evidence-rendering site can't quietly skip the wrap. NOT used by `_build_agent_prompt`,
+    the one remaining site that quotes log evidence: its lines sit inside ONE larger fence
     spanning the whole agent hand-off prompt, where a second nested ```text fence isn't
-    possible — those wrap the wrap_untrusted_block() output as plain inline lines instead."""
+    possible, so it splices `wrap_untrusted_block()`'s output in as plain inline lines
+    instead. (`_build_generic_agent_prompt` needs no wrap at all — it is the no-catalog-
+    match hand-off and quotes no log evidence.)"""
     safe = [_fence_safe(e) for e in ev]
     return ["```text", *uw.wrap_untrusted_block(safe), "```"]
 

@@ -31,9 +31,16 @@ Two design notes worth reading before changing anything here:
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import secrets
 import unicodedata
+
+# Quiet by default; opt in with STARSLING_LOG_LEVEL=DEBUG (see CLAUDE.md). Only
+# ever records shapes and lengths, never log CONTENT - this module exists to
+# handle attacker-controlled text, so echoing it into a debug log would hand that
+# text a second path out.
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Normalizing a line before we scan it
@@ -321,11 +328,10 @@ _LEAD_RUN_RE = re.compile(rf"^(?P<c>{_RUN_CHAR})(?P=c)+")
 _TAIL_RUN_RE = re.compile(rf"(?P<c>{_RUN_CHAR})(?P=c)+$")
 _KEYWORD_RE = re.compile(r"BEGIN|END")
 
-# How much of a flagged span goes inside the label. Anything beyond this stays
-# outside it: a long log line can be delimiter-shaped at the front and carry the
-# actual diagnostic detail afterwards, and burying that detail inside a
-# "suspected forgery" label hides the very thing the report exists to show.
-_LABEL_MAX = 60
+# (There is deliberately no length cap here. An earlier revision carried a
+# `_LABEL_MAX = 60` describing a truncation policy `_label` never implemented -
+# it bounds the label at the KEYWORD instead, which is a sharper cut than any
+# character count. Removed rather than wired up; see `_label`.)
 
 
 def _break_one_run(match: "re.Match[str]") -> str:
@@ -453,6 +459,14 @@ def neutralize_forged_markers(line: str) -> str:
         if rewritten == line:
             return line
         line = rewritten
+    # Cap reached without reaching a fixpoint. The line is still returned - it has
+    # had `_MAX_PASSES` rounds of defusal and every keyword found in those rounds is
+    # broken - but it was NOT verified quiet, so say so instead of returning
+    # possibly-still-shaped text silently. Debug rather than warn: this is expected
+    # to be unreachable, and the skill's logging is opt-in via STARSLING_LOG_LEVEL.
+    logger.debug("neutralize_forged_markers hit the %d-pass cap without converging; "
+                 "line may still contain marker-shaped text (len=%d)",
+                 _MAX_PASSES, len(line))
     return line
 
 
@@ -462,7 +476,21 @@ def neutralize_forged_markers(line: str) -> str:
 
 # Fingerprints of the exact blocks this process has produced. See
 # `_is_our_own_wrapper` for why we store the whole block and not just the codes.
-_ISSUED_BLOCKS: set[str] = set()
+#
+# A dict-as-ordered-set (insertion order is guaranteed from 3.7) rather than a set,
+# so the oldest entry can be evicted once the cap is reached. One render issues on
+# the order of tens of blocks, so the cap is unreachable for the one-shot CLI this
+# normally runs as; it exists so an embedding process that renders indefinitely
+# doesn't grow this without bound. Evicting only costs a re-wrap of a block last
+# seen 4096 blocks ago, which is correct behaviour anyway - never a wrong result.
+_ISSUED_BLOCKS_MAX = 4096
+_ISSUED_BLOCKS: "dict[str, None]" = {}
+
+
+def _remember_issued(digest: str) -> None:
+    _ISSUED_BLOCKS[digest] = None
+    while len(_ISSUED_BLOCKS) > _ISSUED_BLOCKS_MAX:
+        _ISSUED_BLOCKS.pop(next(iter(_ISSUED_BLOCKS)))
 
 
 def _block_digest(lines: list[str]) -> str:
@@ -513,5 +541,5 @@ def wrap_untrusted_block(evidence_lines: list[str]) -> list[str]:
     begin = f"--- BEGIN UNTRUSTED LOG CONTENT [{nonce}] --- {_BOUNDARY_EXPLAINER}"
     end = f"--- END UNTRUSTED LOG CONTENT [{nonce}] ---"
     wrapped = [begin, *safe_lines, end]
-    _ISSUED_BLOCKS.add(_block_digest(wrapped))
+    _remember_issued(_block_digest(wrapped))
     return wrapped
