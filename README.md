@@ -63,12 +63,15 @@ CI/CD attack vectors** — template injection in `run:` blocks, fork code execut
 with privileges (pwn requests), `pull_request_target` jobs that poison the shared
 cache, impostor action SHAs, whole-context secret dumps, `$GITHUB_ENV` /
 `$GITHUB_PATH` hijack, `pull-requests: write` granted to untrusted triggers,
-credential files swept into caches and artifacts, unverified `curl | bash`, and
-dependency install scripts running in a job that holds secrets. Every finding
-comes with the exact file and line, the evidence taken from your own workflow,
-and a plain-English **"what an attacker could do"** scenario — then the skill
-offers to fix the ones you pick, dispatching a subagent per finding group that
-applies the [catalog](skills/ci-secure/references/security-patterns.md) recipe
+credential files swept into caches and artifacts, unverified remote code
+execution (an installer piped straight into a shell, or a git tree fetched at
+a branch or tag and then run), and dependency install scripts running in a job
+that holds secrets.
+Every finding comes with the exact file and line, evidence taken from your
+own workflow, and a plain-English **"what an attacker could do"** scenario —
+then the skill offers to fix the ones you pick, dispatching a subagent per
+finding group that applies the
+[catalog](skills/ci-secure/references/security-patterns.md) recipe
 and leaves the diff in your working tree to review. It never commits, pushes, or
 opens a PR on its own. Alongside the findings it reports a short set of pass/fail **config hygiene
 checks** (declared `permissions:`, CODEOWNERS coverage of `.github/workflows/`,
@@ -88,6 +91,34 @@ check that could not run is always reported as *did not run*, never as a pass.
 The scan runs locally in seconds from your checkout; `gh` is optional and used
 only for the impostor-SHA check and for noting which findings sit in dormant
 workflows.
+
+### Keeping it fixed: ci-secure as a CI check
+
+A scan tells you what is wrong today. It does nothing about next week, which is
+when the workflow gets edited. Ask for the check and ci-secure sets itself up to
+run on every pull request:
+
+> install ci-secure as a CI check
+
+1. It **copies** the scanner into your repository — under `ci-secure/`, plus one
+   workflow — and hands you a pull request to review and merge. Nothing is
+   downloaded at build time, so the code judging your pull requests is code you
+   can read, and it changes only when you ask for an update.
+2. The **first run reports without blocking**. A repository that has never been
+   scanned usually has two or three findings, and the setup pull request should
+   not brick your merge path on day one.
+3. When you have fixed those, **you** make it blocking: delete the `--advisory`
+   flag from the workflow and add `ci-secure` to your required checks. From then
+   on a failed security check stops the merge.
+4. If you ever need out, remove `ci-secure` from your required checks — one
+   settings change, reversible. Not deleting the workflow, which would leave you
+   believing you have a check you do not.
+
+Your CI re-checks the copied files against a manifest of hashes on every run, so
+a local edit somebody made while debugging and never removed shows up instead of
+quietly weakening the check. Asking for an update re-copies the code and leaves
+your workflow file alone — the runner, the triggers and the flag you deleted are
+yours.
 
 ## Install
 
@@ -117,9 +148,9 @@ $ci-speedup      # or $ci-score, $ci-secure
   only.** Its run-history data pass reads the audited repo's Actions
   run/job/log data through read-only `gh` API calls; a token with read access to
   the repo's Actions is enough. `ci-score` never uses the network at all, and
-  `ci-secure` treats `gh` as optional: with it, the impostor-SHA check and the
-  dormancy notes run; without it, the scan still runs and the report says which
-  check was skipped.
+  `ci-secure` treats `gh` as optional: with it, the impostor-SHA check, the
+  dormancy notes, and the two config facts read over the API run; without it,
+  the scan still runs and the report says which checks went unmeasured.
 - **`python3` (3.9 or newer)** and **PyYAML**: the bundled scripts are
   stdlib-only apart from one third-party dependency, **PyYAML**, which the
   scanner uses to parse your workflow YAML. Install it with `pip install pyyaml`
