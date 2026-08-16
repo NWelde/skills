@@ -63,6 +63,15 @@ from pathlib import Path
 # about `_fence_safe`'s transforms, not this one).
 
 
+# Why `uw` is None, when it is - appended by `_load_untrusted_wrap`. The two cases
+# need DIFFERENT advice: an absent sibling means "run this from a full checkout",
+# while a present-but-broken one means "your untrusted_wrap.py doesn't import".
+# Telling a maintainer who just broke a regex that the file is missing sends them
+# hunting for a problem that isn't there - and this file's own Lesson L8 contract
+# is that a SKIP must state the REAL reason it skipped.
+_UW_UNAVAILABLE: list[str] = []
+
+
 def _load_untrusted_wrap():
     """Load the sibling `scripts/untrusted_wrap.py` BY PATH, under a unique module
     name, without touching `sys.path`.
@@ -75,11 +84,25 @@ def _load_untrusted_wrap():
     by-path idiom `test_verify_report_self.py` already uses to load THIS file.
 
     Returns None when the sibling isn't there (this file copied next to a report
-    on its own). That is not fatal: every other check still runs, and only
-    `check_gap_fill_evidence_grounded` — which cannot mirror the renderer without
-    it — degrades, to a loud SKIP rather than a wrong verdict."""
+    on its own), and equally when it IS there but won't import. That is not fatal:
+    every other check still runs, and only `check_gap_fill_evidence_grounded` —
+    which cannot mirror the renderer without it — degrades, to a loud SKIP rather
+    than a wrong verdict.
+
+    The `exec_module` guard is the point of the `except`, not decoration. A missing
+    file was already handled, but a PRESENT-and-broken one was not, and that is the
+    likelier failure: `untrusted_wrap.py` is a regex-heavy module that does real
+    work at import time (it compiles every pattern at module level), so a bad edit
+    raises `re.error` — or `SyntaxError`, or `ValueError` on an interpreter below
+    the documented 3.9 floor — from this exact line. Unguarded, that aborted the
+    whole verifier with a traceback and NO verdict on any of the other checks,
+    turning one cosmetic regex typo into a total loss of report verification. Catch
+    `Exception` rather than a named list because the failure modes are exactly the
+    open-ended ones. `BaseException` is deliberately NOT caught, so a
+    KeyboardInterrupt still stops the run."""
     path = Path(__file__).resolve().parents[1] / "scripts" / "untrusted_wrap.py"
     if not path.is_file():
+        _UW_UNAVAILABLE.append("not present next to this file")
         return None
     spec = importlib.util.spec_from_file_location(
         "ci_speedup_untrusted_wrap_for_verify", path)
@@ -87,7 +110,13 @@ def _load_untrusted_wrap():
         return None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:
+        # Don't leave the half-initialized module behind for a later importer.
+        sys.modules.pop(spec.name, None)
+        _UW_UNAVAILABLE.append(f"failed to import: {type(exc).__name__}: {exc}")
+        return None
     return mod
 
 
@@ -2046,8 +2075,9 @@ def check_gap_fill_evidence_grounded(report: str, findings_path: Path | None) ->
         # `_ground_transform` cannot mirror the renderer's marker neutralization without
         # the sibling module, and an unmirrored compare FAILS every legitimately
         # neutralized line. A wrong verdict is worse than no verdict: SKIP loudly.
+        why = _UW_UNAVAILABLE[0] if _UW_UNAVAILABLE else "unavailable"
         return Check(name, True, f"{len(blocks)} gap-fill block(s) render evidence but the "
-                     "sibling scripts/untrusted_wrap.py is not present next to this file, so "
+                     f"sibling scripts/untrusted_wrap.py is unusable ({why}), so "
                      "the renderer's marker neutralization cannot be mirrored - grounding "
                      "not verified (run this from a full skill checkout)", skipped=True)
     if not findings_path:
