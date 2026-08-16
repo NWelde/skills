@@ -1691,6 +1691,48 @@ def test_gap_fill_grounding_skips_loudly_without_the_sibling_module(tmp_path: Pa
     assert "untrusted_wrap" in res.detail, res.detail
 
 
+def test_untrusted_wrap_loader_survives_a_broken_sibling(tmp_path: Path):
+    # `/code-review` of PR #43, finding #4. The by-path loader guarded only the
+    # sibling being ABSENT (`path.is_file()`); a sibling that was PRESENT but failed
+    # to import took the whole verifier down with a traceback and no verdict on any
+    # other check. That is the likelier failure of the two: untrusted_wrap.py
+    # compiles every one of its patterns at module level, so a bad regex edit - or
+    # simply running under an interpreter below the documented 3.9 floor - raises
+    # from `exec_module`. One cosmetic typo should not cost all report verification.
+    fake = tmp_path / "skill"
+    (fake / "scripts").mkdir(parents=True)
+    (fake / "tests").mkdir()
+    # A module that imports cleanly as far as the compiler is concerned but blows up
+    # at import time, exactly like a malformed pattern reaching `re.compile`.
+    (fake / "scripts" / "untrusted_wrap.py").write_text(
+        "import re\nre.compile('(?P<a>x')\n", encoding="utf-8")
+    (fake / "tests" / "verify_report.py").write_text(
+        _VERIFY.read_text(encoding="utf-8"), encoding="utf-8")
+
+    name = "ci_speedup_verify_report_broken_sibling"
+    spec = importlib.util.spec_from_file_location(
+        name, fake / "tests" / "verify_report.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    try:
+        spec.loader.exec_module(mod)          # must NOT raise
+    finally:
+        sys.modules.pop(name, None)
+    assert mod.uw is None, (
+        "a sibling that fails to import must degrade to None, like an absent one")
+    # And it must not leave the half-initialized module behind for a later importer.
+    # (Asserted flatly: an earlier version of this line was `not in sys.modules or
+    # sys.modules[...] is not None`, which a module object can never fail, so it
+    # passed with the cleanup deleted.)
+    assert "ci_speedup_untrusted_wrap_for_verify" not in sys.modules
+    # The SKIP must say the module failed to IMPORT, not that it is missing - a
+    # maintainer who just broke a regex should not be sent looking for a file that
+    # is sitting right there.
+    why = " ".join(mod._UW_UNAVAILABLE)
+    assert "failed to import" in why, why
+    assert "not present" not in why, why
+
+
 def test_gap_fill_evidence_grounded_skips_loud_when_logs_absent(tmp_path: Path):
     # The block renders evidence but the captured log can't be located (logs_dir absent, or the file
     # is gone from a moved scratch dir) → loud SKIP, never a silent pass.
