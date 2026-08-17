@@ -207,9 +207,16 @@ def _runner(tokens: list[str]) -> str | None:
     return None
 
 
-def _pytest_commands(arm_lines: list[str]) -> list[list[str]]:
+def _pytest_commands(arm_lines: list[str]) -> list[tuple[int, list[str]]]:
     """Every individual shell STATEMENT in an arm that invokes pytest, one
-    statement at a time (see ``_statements`` for why a line isn't a statement).
+    statement at a time (see ``_statements`` for why a line isn't a statement),
+    paired with the index of the LINE it came from within the arm.
+
+    The line index matters: a caller reasoning about ordering — "did the yaml
+    preflight run BEFORE this pytest invocation, or after" — needs a position
+    to compare against, not just the tokens. A preflight that textually exists
+    somewhere in the arm but AFTER the `python3 -m pytest -v` line already ran
+    pytest unprotected; it is exactly as broken as no preflight at all.
 
     Matches ``pytest`` as a whole token (or a path ending in ``/pytest``) so that
     an ``echo`` whose *message text* happens to contain "pytest" — the hook's own
@@ -217,10 +224,10 @@ def _pytest_commands(arm_lines: list[str]) -> list[list[str]]:
     a quoted shell fragment is caught separately, as an unmodellable construct.
     """
     found = []
-    for line in arm_lines:
+    for i, line in enumerate(arm_lines):
         for tokens in _statements(line):
             if any(t == "pytest" or t.endswith("/pytest") for t in tokens):
-                found.append(tokens)
+                found.append((i, tokens))
     return found
 
 
@@ -344,7 +351,7 @@ def _violations(hook_text: str) -> list[str]:
     # `if` that merely mentions pytest must not shadow a broken real dispatch.
     for arms in blocks:
         for arm in arms:
-            for raw_tokens in _pytest_commands(arm):
+            for line_idx, raw_tokens in _pytest_commands(arm):
                 tokens = _flat(raw_tokens)
                 runner = _runner(tokens)
                 if runner in _ISOLATED_RUNNERS:
@@ -359,17 +366,22 @@ def _violations(hook_text: str) -> list[str]:
                             "to `pipx install`); it aborts with 'unrecognized arguments' "
                             "and breaks every commit. Use --with.")
                 elif runner and runner.startswith("python"):
-                    # Can't provision; must pre-check instead, in this same arm.
-                    if not _real_yaml_preflight(arm):
+                    # Can't provision; must pre-check instead, and that preflight
+                    # must appear BEFORE this pytest line in the arm — one that
+                    # exists only AFTER already let pytest run unprotected first.
+                    preceding = arm[:line_idx]
+                    if not _real_yaml_preflight(preceding):
                         problems.append(
-                            "the bare python3 arm cannot install pyyaml, so it must "
-                            "preflight `python3 -c \"import yaml\"` and fail readably; "
-                            "no such command found in that arm")
-                    elif not _aborts(arm):
+                            "the bare python3 arm must preflight "
+                            "`python3 -c \"import yaml\"` BEFORE running pytest, so it "
+                            "can fail readably instead of hitting INTERNALERROR; no "
+                            "such command found ahead of the pytest invocation in "
+                            "that arm")
+                    elif not _aborts(preceding):
                         problems.append(
                             "the bare python3 arm preflights yaml but never `exit`s on "
-                            "failure, so pytest still runs without yaml and still hits "
-                            "INTERNALERROR")
+                            "failure before running pytest, so pytest still runs "
+                            "without yaml and still hits INTERNALERROR")
                 else:
                     problems.append(
                         f"unknown test runner {runner!r} — if this is a new isolated "
@@ -402,10 +414,13 @@ def test_uvx_arm_is_tried_before_pipx():
     """uvx is the arm verified end-to-end (full suite, CI-identical pass/skip counts).
 
     pipx is correct as written but the minimum version carrying `run --with` is
-    unconfirmed, so it must not shadow uvx by being checked first.
+    unconfirmed, so it must not shadow uvx by being checked first. (The hook
+    also runtime-probes `pipx run --help` for `--with` and falls through to the
+    python3 arm when it's absent, but that's a second line of defense, not a
+    reason to relax the ordering.)
     """
     arms = _dispatch_arms(_HOOK.read_text())
-    runners = [_runner(_flat(cmds[0])) for arm in arms if (cmds := _pytest_commands(arm))]
+    runners = [_runner(_flat(cmds[0][1])) for arm in arms if (cmds := _pytest_commands(arm))]
     assert runners.index("uvx") < runners.index("pipx"), (
         f"uvx must be tried before pipx; got order {runners}")
 
@@ -465,11 +480,13 @@ fi
 """
 
 # A compliant hook, used as the base for the hostile rewrites below so each one
-# differs from a PASSING text by exactly the defect it is named for.
+# differs from a PASSING text by exactly the defect it is named for. Mirrors
+# the real hook's pipx capability probe (`&& pipx run --help | grep --with`)
+# so the negative controls below exercise the actual shape being shipped.
 _GOOD = """#!/bin/bash
 if command -v uvx &> /dev/null; then
     uvx --with pyyaml pytest -v
-elif command -v pipx &> /dev/null; then
+elif command -v pipx &> /dev/null && pipx run --help 2>/dev/null | grep -q -- '--with'; then
     pipx run --with pyyaml pytest -v
 else
     if ! python3 -c "import yaml" &> /dev/null; then
@@ -539,6 +556,23 @@ _FOURTH_ARM = _GOOD.replace(
     "elif command -v pipx",
     "elif command -v hatch &> /dev/null; then\n    hatch run pytest -v\nelif command -v pipx")
 
+# The preflight exists and aborts, but AFTER pytest already ran — pytest is
+# unprotected by the time the check happens, so it hits INTERNALERROR before
+# the preflight ever gets a chance to say anything useful.
+_PREFLIGHT_AFTER_PYTEST = """#!/bin/bash
+if command -v uvx &> /dev/null; then
+    uvx --with pyyaml pytest -v
+elif command -v pipx &> /dev/null; then
+    pipx run --with pyyaml pytest -v
+else
+    python3 -m pytest -v
+    if ! python3 -c "import yaml" &> /dev/null; then
+        echo "install pyyaml"
+        exit 1
+    fi
+fi
+"""
+
 
 @pytest.mark.parametrize("label,text", [
     ("the original issue-31 hook", _BROKEN_ORIGINAL),
@@ -554,6 +588,7 @@ _FOURTH_ARM = _GOOD.replace(
     ("a line continuation", _CONTINUATION),
     ("a case-statement dispatch", _CASE_DISPATCH),
     ("an unrecognized fourth runner", _FOURTH_ARM),
+    ("preflight runs AFTER pytest, not before", _PREFLIGHT_AFTER_PYTEST),
 ])
 def test_checker_rejects_known_bad_hooks(label, text):
     """Without these, a parser that silently matched everything would ship green."""

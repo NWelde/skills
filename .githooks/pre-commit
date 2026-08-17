@@ -20,11 +20,15 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 #
 # uvx is tried FIRST because it is the arm verified end-to-end (full suite, same
 # pass/skip counts as CI). The pipx arm is correct as written — `run` takes
-# `--with`, NOT the `--preinstall` that belongs to `pipx install` — but the minimum
-# pipx version carrying `run --with` is unconfirmed, so it sits second.
+# `--with`, NOT the `--preinstall` that belongs to `pipx install` — but the
+# minimum pipx version carrying `run --with` is unconfirmed. Rather than trust
+# that unconditionally, probe for the flag at runtime: a contributor on an old
+# pipx (and no uvx) would otherwise get an opaque argument-parsing error and a
+# fully blocked commit with zero tests run. If the probe fails, fall through to
+# the python3 arm below, which has its own preflight and can still succeed.
 if command -v uvx &> /dev/null; then
     uvx --with pyyaml pytest -v
-elif command -v pipx &> /dev/null; then
+elif command -v pipx &> /dev/null && pipx run --help 2>/dev/null | grep -q -- '--with'; then
     pipx run --with pyyaml pytest -v
 else
     # This arm uses whatever python3 is on PATH, so it can't provision anything.
