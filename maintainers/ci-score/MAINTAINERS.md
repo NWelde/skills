@@ -50,4 +50,6 @@ test suite pins the spec's version, structure, and scorer contract.
 
 From the repo root, `python3 -m pytest -q` runs every suite (the root
 `pyproject.toml` wires the paths, including `skills/ci-score/tests`). CI runs
-the same command.
+the same command. Install the dev dependencies first — `pip install -e ".[dev]"`
+— since ci-score's own scripts import PyYAML at module scope and pytest aborts at
+collection with `INTERNALERROR` without it.

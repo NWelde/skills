@@ -56,7 +56,9 @@ These rules apply to EVERY shipped skill — `ci-speedup`, `ci-score`,
   didn't touch its changelog, the PR is incomplete. Pure-docs / test-only
   refactors that don't change behavior can be noted briefly or skipped.
 - **Tests.** From the repo root, `python3 -m pytest -v` runs every suite (the
-  root `pyproject.toml` wires the paths). CI runs the same command; the
+  root `pyproject.toml` wires the paths). The suite needs pytest **and PyYAML** —
+  `pip install -e ".[dev]"` installs both; without yaml, pytest aborts at
+  collection with `INTERNALERROR` and no test runs. CI runs the same command; the
   `.githooks/pre-commit` hook runs it locally (`git config core.hooksPath
   .githooks`).
 

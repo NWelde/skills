@@ -8,7 +8,28 @@ dependencies = []
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    # The suite HARD-requires PyYAML: several ci-score tests exec
+    # `skills/ci-score/scripts/collect_config.py` by file path at module scope, and
+    # that script `sys.exit(1)`s when yaml is missing — a SystemExit during pytest's
+    # collection phase, which aborts the whole run with INTERNALERROR rather than a
+    # readable failure. Declared here so every environment (CI, .githooks/pre-commit,
+    # a contributor laptop) learns it from ONE place instead of hardcoding the package
+    # name in its own install step. See issue #31.
+    "pyyaml>=5.1",
 ]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# This repo is NOT a Python distribution — `skills/` and `maintainers/` are trees the
+# `skills` CLI copies verbatim, not importable packages (pytest reaches their scripts
+# via `pythonpath` below, not via an install). Declaring zero modules is what makes
+# `pip install -e ".[dev]"` succeed as a pure dependency install; without it,
+# setuptools' flat-layout autodiscovery aborts with "Multiple top-level packages
+# discovered: ['skills', 'maintainers']" and the dev extra above is unusable.
+py-modules = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "skills/ci-speedup/tests", "maintainers/ci-speedup/tests", "skills/ci-score/tests", "skills/ci-secure/tests"]

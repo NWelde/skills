@@ -7,11 +7,16 @@ Thanks for your interest in improving `ci-speedup`. Pull requests are welcome.
 - **Open a PR — never push to `main`.** `main` is protected; branch protection
   requires the `test` check (the full `pytest -v` suite) to pass before a PR can
   merge.
-- **The full test suite must pass.** From the repo root:
+- **The full test suite must pass.** The suite needs pytest and PyYAML — install
+  both from the declared dev extra, then run it from the repo root:
 
   ```bash
+  pip install -e ".[dev]"
   python3 -m pytest -v
   ```
+
+  PyYAML is not optional: without it, pytest aborts during collection with
+  `INTERNALERROR` instead of a readable failure, and no tests run at all.
 
   CI runs the same command on every push and PR (`.github/workflows/ci.yml`).
   Tests live under `skills/ci-speedup/tests/`, `maintainers/ci-speedup/tests/`,
@@ -47,7 +52,9 @@ External contributions are welcome and follow the standard fork flow:
   self-hosted runners; the hosted workflow gives you the identical suite.
 - **Local gate: green on your machine means green in CI.** The same
   `python3 -m pytest -v` runs in both places, so you can reproduce CI locally
-  before you push.
+  before you push — provided your environment has the dev dependencies
+  (`pip install -e ".[dev]"`). CI installs them explicitly; a local environment
+  missing PyYAML fails at collection rather than reproducing anything.
 
 ## Registry security scanning
 
