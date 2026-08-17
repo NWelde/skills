@@ -22,7 +22,7 @@ fix recipe consumed by per-finding fix subagents.
 - [P14.15 — Attacker-Controlled Write to `$GITHUB_ENV` or `$GITHUB_PATH`](#p1415--attacker-controlled-write-to-github_env-or-github_path)
 - [P14.18 — `pull-requests: write` Granted to Workflow With Untrusted Trigger](#p1418--pull-requests-write-granted-to-workflow-with-untrusted-trigger)
 - [P14.19 — Cache or Artifact `path:` Includes Known Credential Files](#p1419--cache-or-artifact-path-includes-known-credential-files)
-- [P14.24 — Unverified Remote Script Execution (`curl | bash`)](#p1424--unverified-remote-script-execution-curl--bash)
+- [P14.24 — Unverified Remote Code Execution (`curl | bash` and mutable fetch-and-run)](#p1424--unverified-remote-code-execution-curl--bash-and-mutable-fetch-and-run)
 - [P14.25 — Dependency Install Scripts Executed in a Privileged Job](#p1425--dependency-install-scripts-executed-in-a-privileged-job)
 - [Severity scale](#severity-scale)
 - [METADATA schema](#metadata-schema)
@@ -37,8 +37,8 @@ Catalog `severity` records the unfixed attack's potency (HIGH / MEDIUM).
 critical finding by definition — the catalog IS the critical set. Two entries
 carry catalog-severity MEDIUM, both for the same documented reason — their
 potency depends on a live condition outside the repo rather than on an in-repo
-defect: P14.24 (whether the remote host serving the piped script is or becomes
-malicious) and P14.25 (whether a dependency in the tree is or becomes
+defect: P14.24 (whether the remote code — the host serving the piped script, or
+the repository behind the mutable ref — is or becomes malicious) and P14.25 (whether a dependency in the tree is or becomes
 malicious). Both render as findings all the same. P14.9 was raised to HIGH
 when its detector was rebuilt as a real chain detector.
 
@@ -569,24 +569,26 @@ For caches: the file becomes restorable by any future workflow that restores the
 
 ---
 
-### P14.24 — Unverified Remote Script Execution (`curl | bash`)
+### P14.24 — Unverified Remote Code Execution (`curl | bash` and mutable fetch-and-run)
 
 <!-- METADATA
 pattern: P14.24
 severity: MEDIUM
-detector: yaml-run-injection
-match: "(?:(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:bash|sh)\b|\b(?:bash|sh)\s+<\(\s*(?:curl|wget)\b|\bdeno\s+run\b[^\n]*https?://)"
+detector: yaml-job-correlated
+correlation: unverified-remote-code-execution
 affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
 fix_strategy: pin-and-verify-remote-script
 fix-surface: yaml
-title_template: "Unverified remote script execution in {basename}"
+title_template: "Unverified remote code execution in {basename}"
 -->
 
-**TL;DR.** A `run:` step pipes a remotely-fetched script straight into a shell — `curl … | bash`, `wget … | sh`, `bash <(curl …)`, or `deno run <url>`. The runner executes whatever the remote server returns *at that moment*, with no integrity check. If the URL's host is compromised (or the response is MITM'd, or the maintainer pushes malicious content), the workflow runs attacker code at full job privilege.
+**TL;DR.** A job executes remotely-fetched code that nothing pins — a script piped straight into a shell, or another repository fetched at a mutable ref (by `git clone`, `git fetch`, or `actions/checkout`) and then run out of. **The piped installer**: a `run:` step pipes a remotely-fetched script straight into a shell — `curl … | bash`, `wget … | sh`, `bash <(curl …)`, or `deno run <url>`. **The mutable fetch**: a job clones or fetches a git tree at a BRANCH, TAG, `HEAD`, or an abbreviated commit id — anything but a full 40-hex commit — and then executes a file out of that tree. Both run whatever the other side serves *at that moment*, with no integrity check, at full job privilege. A fetch pinned to a full 40-character commit id is immutable and is NOT a finding: that is the same trust model this catalog recommends for action pins.
 
-**What an attacker can do.** Whoever controls the fetched URL — the upstream host, a hijacked CDN, a compromised installer endpoint — runs arbitrary code on the runner with access to the job's secrets and `GITHUB_TOKEN`. Unlike a pinned action (immutable by SHA), a piped remote script is re-fetched live on every run, so a one-time host compromise hits every subsequent CI run until someone notices.
+**What an attacker can do.** Whoever controls the fetched code — the upstream host, a hijacked CDN, a maintainer account on the cloned repository — runs arbitrary code on your runner with the job's secrets and `GITHUB_TOKEN`. The mutable-fetch shape needs no host compromise at all: a branch or tag is *designed* to move, so anyone who can push to (or re-point a tag on) that repository changes what your next CI run executes, and nothing in your repo has to change for it to happen. Unlike a SHA-pinned action, both shapes re-resolve live on every run, so a one-time compromise hits every subsequent run until someone notices.
 
-**Anti-pattern**: a `run:` scalar that fetches and executes in one step without verifying integrity. The detector only inspects `run:` scalars (not comments or `env:`), and matches:
+**Anti-pattern**: executing code the repo never pinned, in either of two shapes.
+
+*Shape 1 — the piped installer*: a `run:` scalar that fetches and executes in one step without verifying integrity. The detector only inspects `run:` scalars (not comments or `env:`), and matches:
 
 - `curl … | bash` / `curl … | sh` (with or without `sudo`)
 - `wget … | bash` / `wget … | sh`
@@ -604,25 +606,62 @@ what makes those unsafe is the pipe into a shell, not the address being
 fetched; the `deno run` form is the exception — it has no pipe, so that arm
 does key on a literal URL.)
 
-PowerShell `iex (New-Object Net.WebClient).DownloadString(...)` is the same class on Windows runners but is not matched here (casing / Windows-runner rarity); flag it in manual review if you run Windows jobs.
-
-**Severity**: MEDIUM. Real RCE vector, but it depends on the remote host being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/…`) materially reduces the risk; the detector still flags it, so treat a pinned-URL hit as low-priority.
-
-**Fix recipe**: Download, verify, then execute as separate steps — pin the expected content by checksum:
+*Shape 2 — the mutable fetch*: within ONE job, a `git clone` / `git fetch` / `actions/checkout` of another repository at a mutable reference, followed by a command that executes out of the directory it landed in.
 
 ```yaml
-# RIGHT — fetch, verify a known-good digest, then run
+# WRONG — `main` is whatever that branch points at when the job runs
+- run: git clone --branch main "<tools-repo-url>" tools
+- run: python3 tools/setup.py
+```
+
+Execution shapes matched: an interpreter running a fetched file (`python3`/`node`/`bash`/`sh`/`ruby`/`perl`/`pwsh` …), `source`ing a fetched script, `pip install <fetched-dir>` (including `-e`, but never a flag's value — `--target` names a destination and `-r` names a file pip reads), and a fetched path invoked directly (`./tools/install`). `cd` into the fetched directory is followed within the step that ran it, so `cd tools && ./install` connects — and, because `cd` dies with its step, a later step is read from the workspace root again.
+
+**Detection**, and where it deliberately stops short. The pairing must be VISIBLE: the fetch's destination directory and the executed path have to connect inside the same job, which the scanner reads off the shell text. Its consequences, stated rather than implied:
+
+- **A full 40-hex pin silences it — a short sha does not, and neither does a late one.** `git clone … && git -C dir checkout <40-hex>` is immutable and never reported, and the pin has to land BETWEEN the fetch and the execution: pinning is a claim about the code that ran, so a pin before the fetch pinned the tree as it stood and a pin after the execution pinned nothing that had already run. Every suppression is recorded — in the scan's `suppressed_findings`, which is informational and never counts against coverage. An abbreviated id (`a1b2c3d`) is re-resolved by git at fetch time and is treated as mutable.
+- **A destination the scanner cannot see is not reported.** `git clone "$TOOLS_URL"` with no explicit target directory leaves the destination unknowable, so no connection is claimed and no finding is raised — a deliberate false negative in favour of never inventing a chain. It is recorded as a coverage note, so "no finding" is distinguishable from "nothing here". Shell the scanner cannot parse (an unbalanced quote) contributes nothing; it is recorded as a coverage note when the text it could not read mentions a fetch or an execution, and only an unreadable `cd` abandons the rest of the step, since that is the case that leaves the working directory stale.
+- **`git fetch` fires only for a third-party remote** — a URL, a variable holding one, or a name this job just added with `git remote add <name> <url>` — that something then brings into the tree (`git checkout FETCH_HEAD`, or `reset` / `switch` / `merge` / `rebase` on it). `git fetch origin main` pulls the repository's own history and is not this vector. Unlike the clone arm, a `git fetch` lands in the job's working directory, so the destination is that directory and the finding renders it as `.`.
+- **The shell arm reads `git clone`, `git fetch` and `git remote add`, and nothing else.** Everything below is the same trust model and is NOT reported — a clean P14.24 is not a statement that the repo has no mutable fetch-and-run, only that no `git`-spelled one is visible:
+  - other fetchers: `gh repo clone`, `svn checkout`, `git submodule update --remote`, and package managers pointed at a git ref (`pip install "git+…@main"`, `go install …@latest`, an npm/cargo git dependency);
+  - a tarball fetched with `curl`/`wget`, unpacked, and then run;
+  - a fetch and its execution separated by a rename (`mv tools built && python3 built/setup.py`);
+  - the mirror of that rename — a third-party tree whose bytes are OVERWRITTEN by the repo's own content before the named file runs (`rm -rf dir/*; cp -r "$GITHUB_WORKSPACE/mine" dir/`), so the fetch into `dir` is real but the executed file is self-owned; the finding names the fetch it can see, and whether a copy-in later replaced those bytes is not tracked;
+  - a remote whose URL is set with `git config remote.<name>.url` rather than `git remote add`;
+  - execution through an interpreter's INLINE program — `bash -c "…"`, `perl -e`, `php -r`, `pwsh -Command`, `powershell -EncodedCommand` — whose text is not read as commands;
+  - an execution whose path BEGINS with a variable this scan cannot resolve (`"$TOOLS/setup.sh"`) — it could hold an absolute path that escapes the fetched tree, so it is recorded as a coverage note rather than resolved and reported; the runner's own absolute variables (`$GITHUB_WORKSPACE/…`) are the exception, treated as absolute, and a variable DEEPER in a path rooted at the fetched directory (`tools/$V/run.sh`) is inside the tree whatever it holds and still fires;
+  - execution through a build driver rather than an interpreter (`make -C tools`), or through a versioned interpreter (`python3.11`);
+  - a fetch whose execution happens in a different job (different runner, different tree).
+
+  Review those by hand. Widening the shell arm to guess at them would cost the property the whole entry rests on: every reported chain is one a reader can see in their own YAML.
+- **A clone of your OWN repository is not reported.** `${{ github.repository }}` is the scanned repo by definition, and a literal `github.com/<owner>/<repo>` is compared against the checkout's `origin` remote — including the authenticated spelling that carries a token in the URL's userinfo. No third party is involved in re-cloning yourself, and the fix this entry recommends (pin to a full commit id) is unactionable for a release workflow that must run at the branch head. In an exported tree with no `.git`, `origin` is unknown and the literal form is reported like any other clone.
+- **`working-directory:` is followed** — on the step, and through `defaults.run.working-directory` on the job and on the workflow. A `working-directory:` computed at run time (`apps/${{ matrix.app }}`) is not knowable, so it becomes an opaque directory: a fetch and an execution both inside it still connect to each other, and nothing inside it can match a directory anywhere else.
+- **`actions/checkout` of another `repository:` is covered too**, since it is how most workflows fetch a second repository. The same rules apply: a full 40-hex `ref:` is silent, your own repository is silent, and something in a LATER step of the same job has to execute out of the `path:` it landed in. With NO `path:` the checkout replaces the workspace, so anything the job runs afterwards counts. A `repository:`, `ref:` or `path:` computed at run time is recorded as a coverage gap rather than guessed at.
+
+PowerShell `iex (New-Object Net.WebClient).DownloadString(...)` is the same class on Windows runners but is not matched here (casing / Windows-runner rarity); flag it in manual review if you run Windows jobs.
+
+**Severity**: MEDIUM. Real RCE vector, but it depends on the remote code being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/…`) materially reduces the risk of the piped-installer arm; the detector still flags it, so treat a pinned-URL hit as low-priority.
+
+**Fix recipe**: pin what you execute, or vendor it. A mutable fetch is pinned to a full 40-character commit id — the same immutability an action SHA-pin buys, re-pinned deliberately when you want the update. A piped installer becomes three steps: download, verify a known digest, then run the local copy. One block, both shapes — apply the half that matches the occurrence:
+
+```yaml
+# RIGHT (mutable fetch) — the tree is one immutable commit, verified by git
+- run: |
+    git clone "<tools-repo-url>" tools
+    git -C tools checkout <full-40-hex-commit>
+- run: python3 tools/setup.py
+
+# RIGHT (piped installer) — fetch, verify a known-good digest, then run
 - run: |
     curl -fsSL -o install.sh "<installer-url>"
     echo "<known-sha256>  install.sh" | sha256sum -c -
     bash install.sh
 ```
 
-Prefer a package manager or a SHA-pinned action over an ad-hoc installer where one exists. For tools distributed only via `curl | bash`, vendor the script into the repo (so it's reviewed and pinned by git) and run the local copy.
+Prefer a package manager or a SHA-pinned action over an ad-hoc installer where one exists. For tools distributed only as a piped installer, or a repository you must build from source, vendor the code into the repo (so it is reviewed and pinned by git) and run the local copy.
 
 **Sources**: poutine `unverified_script_exec` rule (boostsecurityio/poutine); OpenSSF "Mitigating attack vectors in GitHub workflows".
 
-**Risk of the change.** A pinned installer can drift from the toolchain the build expects: freezing the script at one checksum makes upgrades a deliberate step, and CI will fail — correctly, but loudly — the day upstream rotates the script.
+**Risk of the change.** Pinning freezes the version you execute: a pinned installer or commit can drift from the toolchain the build expects, so upgrades become a deliberate step and CI will fail — correctly, but loudly — the day you actually need the newer code.
 
 ---
 
