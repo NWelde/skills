@@ -1598,3 +1598,537 @@ def test_react_author_association_is_a_closed_enum_not_attacker_text() -> None:
     for ctx in ("issue", "comment", "pull_request"):
         assert scan._is_shape_safe_expression(
             "${{ github.event." + ctx + ".author_association }}"), ctx
+
+
+def test_inert_gate_is_named_as_inert(tmp_path: Path) -> None:
+    """The Snowflake bug (Wiz, Jun 2026) reduced to its single live term.
+
+    `snowflakedb/snowflake-connector-net`'s `jira_issue.yml` gated on
+    `github.event.pull_request.user.login != '...'` under `issues` /
+    `issue_comment`, neither of which populates a `pull_request`, so the
+    comparison was `null != '...'` — always true, and the gate admitted every
+    GitHub user.
+
+    The gate in the real file is that term OR'd with another, so the scanner
+    declines a whole-gate verdict there and only names the dead field; that
+    disjunction is covered by
+    `test_compound_gate_with_one_dead_term_keeps_the_verify_wording`. This
+    fixture is the bare comparison, which is the shape a verdict IS offered
+    for: the generic "verify it" wording is wrong here, because there is no
+    remainder to verify.
+    """
+    _write_workflow(tmp_path, "jira_issue.yml", (
+        "on:\n"
+        "  issues:\n"
+        "    types: [opened]\n"
+        "  issue_comment:\n"
+        "    types: [created]\n"
+        "jobs:\n"
+        "  create-issue:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n"
+    ))
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    evidence = hits[0]["evidence"] + str(hits[0].get("derived_note") or "")
+    assert "github.event.pull_request" in evidence, (
+        f"the gate is missing from the evidence entirely: {evidence!r}"
+    )
+    assert "inert" in evidence.lower(), (
+        f"the gate is inert but the evidence does not say so: {evidence!r}"
+    )
+
+
+def test_live_gate_is_not_called_inert(tmp_path: Path) -> None:
+    """The same gate under a trigger that DOES populate the object is a real
+    control — it keeps the "verify it" wording and must never read as inert."""
+    _write_workflow(tmp_path, "pr.yml", (
+        "on:\n"
+        "  pull_request_target:\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.pull_request.title }}'\n"
+    ))
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    assert "inert" not in (
+        hits[0]["evidence"] + str(hits[0].get("derived_note") or "")
+    ).lower(), (
+        f"a live gate was reported as inert: {hits[0]['evidence']!r}"
+    )
+
+
+def test_gate_live_under_any_one_declared_trigger_is_not_inert(
+    tmp_path: Path,
+) -> None:
+    """A workflow on several triggers references an object only ONE of them
+    populates. That gate is live whenever that trigger fires, so the rule is
+    "no declared trigger populates it" — not "this trigger doesn't"."""
+    _write_workflow(tmp_path, "mixed.yml", (
+        "on:\n"
+        "  issues:\n"
+        "  pull_request_target:\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n"
+    ))
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    assert "inert" not in (
+        hits[0]["evidence"] + str(hits[0].get("derived_note") or "")
+    ).lower(), (
+        f"a gate live under one declared trigger was called inert: "
+        f"{hits[0]['evidence']!r}"
+    )
+
+
+def test_unknown_trigger_never_yields_an_inert_verdict(tmp_path: Path) -> None:
+    """`workflow_call` carries the CALLER's event payload, which this file
+    cannot see. Unknown payload → no verdict, never a guess."""
+    _write_workflow(tmp_path, "reusable.yml", (
+        "on:\n"
+        "  workflow_call:\n"
+        "  issues:\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n"
+    ))
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    assert "inert" not in (
+        hits[0]["evidence"] + str(hits[0].get("derived_note") or "")
+    ).lower(), (
+        f"an unknowable payload produced an inert verdict: "
+        f"{hits[0]['evidence']!r}"
+    )
+
+
+def _p14_10_evidence(tmp_path: Path, name: str, body: str) -> str:
+    _write_workflow(tmp_path, name, body)
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    # The verbatim excerpt and the scanner's gate verdict are separate fields
+    # (see RawHit.derived_note); a caller asking "what does this finding tell
+    # the reader" wants both.
+    return hits[0]["evidence"] + "\n" + str(hits[0].get("derived_note") or "")
+
+
+def test_equality_gate_against_an_empty_value_never_reads_as_wide_open(
+    tmp_path: Path,
+) -> None:
+    """`==` flips the verdict. `null != 'bot'` is always TRUE and admits
+    everyone; `null == 'bot'` is always FALSE and admits nobody. Both are
+    broken gates, but reporting the second as "does not restrict who reaches
+    this job" tells the reader the exact opposite of what the gate does."""
+    evidence = _p14_10_evidence(tmp_path, "eq.yml", (
+        "on:\n"
+        "  issues:\n"
+        "    types: [opened]\n"
+        "jobs:\n"
+        "  create-issue:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login == 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n"
+    ))
+    assert "does not restrict who reaches this job" not in evidence, (
+        f"an always-false gate was described as admitting everyone: "
+        f"{evidence!r}"
+    )
+    assert "never runs" in evidence, (
+        f"an always-false gate should say the job never runs: {evidence!r}"
+    )
+
+
+def test_compound_gate_with_one_dead_term_keeps_the_verify_wording(
+    tmp_path: Path,
+) -> None:
+    """The dead term is only one conjunct. The gate as a whole still restricts
+    who reaches the job — via the live term — so no INERT verdict is available,
+    only the lookup fact plus the ordinary "verify it"."""
+    evidence = _p14_10_evidence(tmp_path, "compound.yml", (
+        "on:\n"
+        "  issues:\n"
+        "    types: [opened]\n"
+        "jobs:\n"
+        "  create-issue:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: >-\n"
+        "      github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "      && github.event.issue.user.login == 'trusted-owner'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n"
+    ))
+    assert "does not restrict who reaches this job" not in evidence, (
+        f"a compound gate with a live term was called wide open: {evidence!r}"
+    )
+    assert "verify it" in evidence, (
+        f"an undecidable gate must keep the verify wording: {evidence!r}"
+    )
+    assert "no trigger this workflow declares" in evidence, (
+        f"the dead term is still worth naming: {evidence!r}"
+    )
+
+
+def test_a_dead_term_in_a_compound_gate_is_not_called_harmless(
+    tmp_path: Path,
+) -> None:
+    """Declining a whole-gate verdict must not become a claim that the dead
+    term does nothing.
+
+    A dead term is a CONSTANT, and a constant is the opposite of harmless in a
+    compound: `A && (null == 'bot')` is always false, so that comparison closes
+    the entire gate on its own, and `A || (null != 'bot')` is always true, so it
+    opens the gate no matter what `A` says. Telling the reader the comparison
+    "cannot restrict anything" is exactly backwards in the first case and
+    understates the second.
+    """
+    for name, operator, joiner in (
+        ("and_eq.yml", "==", "&&"),
+        ("or_ne.yml", "!=", "||"),
+    ):
+        evidence = _p14_10_evidence(tmp_path, name, (
+            "on:\n"
+            "  issues:\n"
+            "    types: [opened]\n"
+            "jobs:\n"
+            "  create-issue:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    if: >-\n"
+            "      github.event.issue.user.login == 'trusted-owner'\n"
+            f"      {joiner} github.event.pull_request.user.login "
+            f"{operator} 'dependabot[bot]'\n"
+            "    steps:\n"
+            "      - run: echo '${{ github.event.issue.title }}'\n"
+        ))
+        assert "cannot restrict anything" not in evidence, (
+            f"{name}: a constant term that can decide the whole gate was "
+            f"described as unable to restrict anything: {evidence!r}"
+        )
+        assert "no trigger this workflow declares" in evidence, (
+            f"{name}: the dead term is still worth naming: {evidence!r}"
+        )
+        assert "verify it" in evidence, (
+            f"{name}: an undecidable gate must keep the verify wording: "
+            f"{evidence!r}"
+        )
+
+
+def _p14_10_hit(tmp_path: Path, name: str, body: str) -> dict:
+    _write_workflow(tmp_path, name, body)
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.10"]
+    assert hits, "expected the P14.10 injection finding"
+    return hits[0]
+
+
+_SNOWFLAKE_JOB = (
+    "jobs:\n"
+    "  create-issue:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+    "    steps:\n"
+    "      - run: echo '${{ github.event.issue.title }}'\n"
+)
+
+
+def test_the_gate_verdict_is_not_dressed_as_quoted_source(
+    tmp_path: Path,
+) -> None:
+    """P14.10's evidence is a verbatim excerpt, rendered by report.py inside a
+    ```yaml fence with a line-number gutter. A sentence the scanner assembled
+    does not belong in there — `RawHit.derived_note` is the channel built for
+    "this quoted line, because of a condition elsewhere in the job"."""
+    hit = _p14_10_hit(
+        tmp_path, "jira_issue.yml",
+        "on:\n  issues:\n    types: [opened]\n" + _SNOWFLAKE_JOB,
+    )
+    for line in hit["evidence"].splitlines():
+        assert re.match(r"\s*\d+:(?: |$)", line), (
+            f"non-source line inside verbatim evidence: {line!r}"
+        )
+    assert "inert" in (hit.get("derived_note") or "").lower(), (
+        f"the gate verdict is missing from derived_note: {hit!r}"
+    )
+
+
+def test_a_live_gate_puts_no_bypass_sentence_on_an_injection_finding(
+    tmp_path: Path,
+) -> None:
+    """"The finding stands only if that gate can be bypassed" is true of the
+    correlated chains, whose payoff leg IS the untrusted trigger. It is false
+    of an injection: the catalog says occurrences on trusted triggers "still
+    execute attacker-influenced text as shell and are mechanical to fix". On
+    P14.10 the note is carried only when the gate is provably dead."""
+    hit = _p14_10_hit(
+        tmp_path, "pr.yml",
+        "on:\n  pull_request_target:\njobs:\n  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.pull_request.title }}'\n",
+    )
+    assert not (hit.get("derived_note") or ""), (
+        f"a live gate produced a bypass sentence: {hit!r}"
+    )
+    assert "gate condition" not in hit["evidence"], (
+        f"the gate sentence leaked into the verbatim evidence: {hit!r}"
+    )
+
+
+def test_a_step_level_gate_withdraws_the_job_level_verdict(
+    tmp_path: Path,
+) -> None:
+    """The finding is a STEP; the gate we judge is the JOB's. When the step
+    carries its own `if:`, "the gate does not restrict who reaches this job"
+    is true of the job and misleading about the finding — the step's own
+    guard is the live control and this code never looked at it."""
+    hit = _p14_10_hit(
+        tmp_path, "stepgate.yml",
+        "on:\n  issues:\n    types: [opened]\n"
+        "jobs:\n  create-issue:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - if: github.event.issue.user.login == 'trusted-owner'\n"
+        "        run: echo '${{ github.event.issue.title }}'\n",
+    )
+    assert not (hit.get("derived_note") or ""), (
+        f"a step with its own gate still got the job-level verdict: {hit!r}"
+    )
+    assert "gate condition" not in hit["evidence"], (
+        f"a step with its own gate still got the job-level verdict: {hit!r}"
+    )
+
+
+def test_deployment_events_do_populate_workflow_run() -> None:
+    """`deployment` and `deployment_status` payloads carry top-level
+    `workflow_run` (and `workflow`) whenever the deployment came from a
+    workflow, which is the normal case. Calling such a gate dead is the
+    "your working gate is useless" failure this check exists to avoid."""
+    for trigger in ("deployment", "deployment_status"):
+        note = scan._gate_note(
+            {"if": "github.event.workflow_run.conclusion == 'success'"},
+            [trigger],
+        )
+        assert "inert" not in note.lower(), (trigger, note)
+        assert "never runs" not in note.lower(), (trigger, note)
+
+
+def test_a_literal_that_casts_to_zero_declines_the_verdict() -> None:
+    """GitHub casts mismatched types to a number, so an absent value (0)
+    compares EQUAL to '0' just as it does to ''. Every zero-valued literal
+    inverts the operator table, so no verdict is offered for one."""
+    note = scan._gate_note(
+        {"if": "github.event.pull_request.number == '0'"}, ["issues"],
+    )
+    assert "never runs" not in note.lower(), note
+    assert "always false" not in note.lower(), note
+    assert "no trigger this workflow declares" in note, note
+    # And it must not invent a remainder: `== '0'` IS the whole condition.
+    assert "the rest of the condition decides" not in note, note
+    assert "which is not evaluated here — verify it" in note, note
+
+
+def test_ubiquitous_event_fields_are_never_judged_inert(tmp_path: Path) -> None:
+    """`github.event.sender` rides on every webhook payload but appears in no
+    trigger's table entry, so only the `_GATE_CHECKED_OBJECTS` intersection
+    keeps it from reading as absent. Without it, an ordinary workflow is told
+    its gate does nothing."""
+    hit = _p14_10_hit(
+        tmp_path, "sender.yml",
+        "on:\n  pull_request_target:\n"
+        "jobs:\n  build:\n    runs-on: ubuntu-latest\n"
+        "    if: github.event.sender.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.pull_request.title }}'\n",
+    )
+    assert not (hit.get("derived_note") or ""), (
+        f"a field present in every payload was judged inert: {hit!r}"
+    )
+
+
+def test_a_workflow_with_no_parseable_triggers_yields_no_verdict(
+    tmp_path: Path,
+) -> None:
+    """Zero KNOWN triggers is not zero populated objects — it is no
+    information. `_on_trigger_names` returns [] for an absent, null or
+    unparseable `on:`, and this detector has no `on:` guard of its own."""
+    hit = _p14_10_hit(
+        tmp_path, "noon.yml",
+        "name: fragment\n"
+        "jobs:\n  build:\n    runs-on: ubuntu-latest\n"
+        "    if: github.event.pull_request.user.login != 'dependabot[bot]'\n"
+        "    steps:\n      - run: echo '${{ github.event.issue.title }}'\n",
+    )
+    assert not (hit.get("derived_note") or ""), (
+        f"an unknown trigger set produced a verdict: {hit!r}"
+    )
+
+
+def test_a_schedule_only_workflow_can_reach_an_inert_verdict() -> None:
+    """`schedule` is the one table entry mapping to the empty set, and the
+    trigger most likely to PRODUCE a verdict: a cron run populates no event
+    object at all, so every trust gate built on one is dead."""
+    note = scan._gate_note(
+        {"if": "github.event.pull_request.user.login != 'dependabot[bot]'"},
+        ["schedule"],
+    )
+    assert "INERT" in note, note
+    assert "does not restrict who reaches this job" in note, note
+
+
+def test_two_dead_objects_read_as_a_plural_sentence() -> None:
+    """The sentence is the reader-facing product of the whole check; naming
+    two objects and then saying "that comparison is" reads as a bug."""
+    note = scan._gate_note(
+        {"if": "github.event.pull_request.number > 0 || github.event.release.tag_name != ''"},
+        ["issues"],
+    )
+    assert "`github.event.pull_request`" in note, note
+    assert "`github.event.release`" in note, note
+    assert "those comparisons are against an empty value" in note, note
+    assert "that comparison is" not in note, note
+
+
+def test_the_gate_note_trigger_list_stays_a_required_argument() -> None:
+    """`triggers` is a required parameter precisely so a call site that
+    forgets it is a TypeError rather than a check that silently stops
+    reporting. Pin the signature so nobody restores the default."""
+    import inspect
+
+    params = inspect.signature(scan._gate_note).parameters
+    assert params["triggers"].default is inspect.Parameter.empty, (
+        "triggers must stay required — a defaulted trigger list turns a "
+        "missed call site into permanent silence on a security verdict"
+    )
+
+
+def test_the_untrusted_checkout_chain_also_names_an_inert_gate(
+    tmp_path: Path,
+) -> None:
+    """P14.9's correlation site takes the same gate note. Nothing pinned that
+    it could fire at all — reverting that call site to the one-argument form
+    left the whole suite green."""
+    _write_workflow(tmp_path, "pwn.yml", (
+        "on: pull_request_target\n"
+        "jobs:\n"
+        "  bench:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    if: github.event.issue.user.login != 'dependabot[bot]'\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "        with:\n"
+        "          ref: ${{ github.event.pull_request.head.sha }}\n"
+        "      - run: make bench\n"
+    ))
+    data = _scan_dir(tmp_path)
+    hits = [f for f in data["findings"] if f["pattern"] == "P14.9"]
+    assert hits, "expected the P14.9 untrusted-checkout chain finding"
+    assert "INERT" in hits[0]["evidence"], hits[0]["evidence"]
+
+
+def test_a_dead_term_in_a_disjunction_claims_no_remainder() -> None:
+    """The neutral wording used to say "the rest of the condition decides who
+    reaches this job". That assumes AND. Under OR the dead term can decide the
+    whole gate by itself — snowflakedb's real gate is a disjunction, and there
+    "verify the remainder" points the reader away from the live problem. There
+    is no evaluator here, so the honest note claims nothing about the rest."""
+    real = (
+        "((github.event_name == 'issue_comment' && "
+        "github.event.comment.user.login == 'sfc-gh-mkeller') || "
+        "(github.event_name == 'issues' && "
+        "github.event.pull_request.user.login != 'wss[bot]'))"
+    )
+    note = scan._gate_note({"if": real}, ["issues", "issue_comment"])
+    assert "the rest of the condition decides" not in note, note
+    assert "stands only if that remainder can be bypassed" not in note, note
+    assert "no trigger this workflow declares" in note, note
+
+
+def test_a_lone_declined_comparison_claims_no_remainder() -> None:
+    """`!= 0` is unquoted and `!(...)` is a negation, so neither settles a
+    direction — but both ARE the whole condition. Saying "the rest of the
+    condition decides" invents a remainder that does not exist."""
+    for cond in (
+        "github.event.pull_request.number != 0",
+        "!(github.event.pull_request.user.login == 'bot')",
+        "github.event.pull_request.number == '0'",
+    ):
+        note = scan._gate_note({"if": cond}, ["issues"])
+        assert "the rest of the condition decides" not in note, (cond, note)
+
+
+def test_an_object_named_inside_a_string_literal_is_not_read_by_the_gate(
+) -> None:
+    """`_GATE_EVENT_REF_RE` scans the raw condition text, so a `github.event.`
+    mention inside a quoted string counted as an object the gate reads. That
+    turned a perfectly live gate into a dead-field report."""
+    note = scan._gate_note(
+        {"if": "github.event.pull_request.user.login != "
+               "'filed by github.event.discussion bot'"},
+        ["pull_request_target"],
+    )
+    # The note quotes the condition verbatim, so the literal's text appears;
+    # what must NOT appear is the claim that the gate READS that object.
+    assert "`github.event.discussion`" not in note, note
+    assert "no trigger this workflow declares" not in note, note
+    assert "verify it" in note, note
+
+
+def test_only_a_legal_json_number_worth_zero_declines_the_verdict() -> None:
+    """GitHub parses a string "from any legal JSON number format, otherwise
+    NaN". `'+0'` and `' 0 '` are not legal JSON numbers, so GitHub reads NaN,
+    the comparison is not equal to an absent value, and a verdict IS
+    available. Python's `float()` accepts all three, so using it as the parser
+    threw those verdicts away."""
+    for literal in ("+0", " 0 "):
+        note = scan._gate_note(
+            {"if": f"github.event.pull_request.number != '{literal}'"},
+            ["issues"],
+        )
+        assert "INERT" in note, (literal, note)
+    for literal in ("0", "0.0", "-0", "0e5", ""):
+        note = scan._gate_note(
+            {"if": f"github.event.pull_request.number != '{literal}'"},
+            ["issues"],
+        )
+        assert "INERT" not in note, (literal, note)
+
+
+def test_evidence_gutter_check_tolerates_a_blank_source_line(
+    tmp_path: Path,
+) -> None:
+    """A blank line inside the quoted excerpt renders as a bare `NN:`. Any
+    assertion about evidence shape has to allow it, or it only passes on
+    fixtures that happen to have no blank lines."""
+    hit = _p14_10_hit(
+        tmp_path, "blank.yml",
+        "on:\n  issues:\n    types: [opened]\n"
+        "jobs:\n  create-issue:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: file\n"
+        "        run: echo '${{ github.event.issue.title }}'\n"
+        "\n"
+        "      - run: true\n",
+    )
+    for line in hit["evidence"].splitlines():
+        assert re.match(r"\s*\d+:(?: |$)", line), (
+            f"non-source line inside verbatim evidence: {line!r}"
+        )
