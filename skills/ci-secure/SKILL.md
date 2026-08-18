@@ -606,10 +606,70 @@ That writes, all under `<repo-root>`:
 - `.github/workflows/ci-secure.yml`, only if it does not already exist
   (see Refresh).
 
+Then, before it reports the install complete, it **proves the gate can
+fail**. The freshly vendored gate is pointed at a throwaway workflow
+that fails a named security fact (`sec.permissions.workflow-declares`),
+and must exit non-zero AND name that fact; then at the same workflow
+with the hole closed — byte-for-byte the same but for the `permissions:`
+block — where it must exit 0, because a gate wedged red reds on
+everything and proves nothing. The two fixtures differ only by the fact
+under test, so a green has only one explanation. Both fixtures are temporary files
+that are deleted afterwards: **nothing is written into the user's tree
+for the proof, and no workflow of theirs is broken to demonstrate it.**
+It then runs the gate on their real tree and prints what it found,
+keeping the two kinds of red apart: failed FACTS, which the shipped
+`--advisory` reports without blocking, and everything else — a crashed
+engine, an unscannable workflow, a dropped match — which stays red even
+in advisory, so their very first run will be red until it is resolved.
+Relay that distinction; it is the difference between "green on day one"
+and "red on day one". Read the proof line too, and relay it:
+
+- `self-proof PASSED` — the gate has been observed failing and passing.
+  Only then is this a working install.
+- `self-proof FAILED` (exit 1) — the gate passed a vulnerable fixture, or
+  redded a clean one. **Do not report a working install**, and **stop
+  before the handover runbook below** — skip it entirely rather than
+  walking them through going blocking. Say the gate is not usable, and
+  say what is on disk: the vendored files AND
+  `.github/workflows/ci-secure.yml`, which runs on every pull request
+  from the next push. Offer to revert them, or to refresh the copy.
+  Committing them ships a check that cannot block — a green tick and no
+  protection, the thing this skill exists to argue against.
+- `self-proof COULD NOT RUN` (exit 2 from `--self-test`; the install
+  itself still exits 0) — the proof did not happen here. The gate's own
+  output is quoted above the line and says whether the engine could not
+  start on this machine (PyYAML missing, most often — CI installs it) or
+  the vendored copy is broken everywhere; relay which, and do not assert
+  a cause the output does not give. The gate is installed and
+  **unproven**: say so, and tell them to re-run
+  `<repo-root>/ci-secure/scripts/vendor.py --self-test <repo-root>/ci-secure`
+  once that is resolved. That command is theirs to re-run at any time; it
+  writes nothing.
+
+Nothing else counts as a proof line. If none of the three appears, treat
+it as a failed proof, not as a pass.
+
+On both non-PASSED outcomes the install says nothing about what the gate
+makes of the user's own code, on purpose — a verdict from a gate that
+failed its proof, or that could not run at all, is not an observation
+about their repository. Do not fill that gap with a guess.
+
+It also reads their `CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md` for a
+guard-registration convention (a register of build-breaking checks, a
+mutation harness) and, if it finds one, says the new gate has NOT been
+registered with it, quoting the line. It never edits their harness, and
+**neither do you** — the harness is theirs, you do not know its shape,
+and guessing means writing into files you have not read. Pass it to the
+user as work they own. The check is a keyword read: it misses
+conventions phrased other ways, and a false hit costs one glance.
+
 Everything that can refuse refuses before the first byte is written, and
-the workflow is written last, after the manifest. So a non-zero exit
-means at worst a partly-copied `ci-secure/`, never a live workflow with
-no gate behind it. It refuses on: a vendored copy trying to install, a
+the workflow is written last, after the manifest. So a refusal means at
+worst a partly-copied `ci-secure/`, never a live workflow with no gate
+behind it. A non-zero exit is now two different things, and the output
+says which: a refusal (nothing wired up) or a complete install whose
+self-proof failed (files on disk, gate not to be trusted). It refuses
+on: a vendored copy trying to install, a
 missing licence, an incomplete skill, a `<repo-root>` that is a
 subdirectory of a repository rather than its root, a destination
 redirected by a symlink, a `ci-secure` that exists and is not a
@@ -622,8 +682,11 @@ stop; do not retry blind.
 
 If it reports that `.github/workflows/ci-secure.yml` already existed, the
 install did NOT wire anything up — resolve that with the user before
-telling them they have a gate. The exit code is 0 either way, so read
-the output; do not infer success from it.
+telling them they have a gate. Read the output; never infer success from
+the exit code. `--into` exits 0 for a proved install AND for one whose
+proof could not run, and exits 1 both for a refusal and for a failed
+proof, so the status alone cannot tell you which of the four you have —
+only the proof line and the refusal message can.
 
 The install leaves everything UNCOMMITTED, and nothing runs until those
 files are on a branch GitHub can see. Say that plainly when handing over
@@ -631,8 +694,10 @@ files are on a branch GitHub can see. Say that plainly when handing over
 bind. If their tree already had uncommitted work in it, say that too:
 the vendored files are now mixed in with it.
 
-Then walk the user through the following in the message that hands the
-work over. They need it whether or not a PR gets opened. Items 1, 3 and
+Then — **only if the self-proof PASSED** — walk the user through the
+following in the message that hands the work over. They need it whether
+or not a PR gets opened. On `self-proof FAILED` this runbook does not
+apply at all: it ends in making an unusable gate a required check. Items 1, 3 and
 4 also belong in the PR body; items 2, 5 and 6 name weaknesses the repo
 still has, so on a public repository keep those out of the PR body and
 say them to the user directly — the disclosure corollary below applies
@@ -653,6 +718,10 @@ to an install PR as much as to a fix PR:
    engine, zero workflows scanned, an unrecognised outcome or an
    incomplete scan stay red, because a ramp for findings must never
    become a mute button for a broken scan.
+   The install's self-proof already showed the gate failing on a
+   throwaway fixture, so "will this ever actually block?" is answered
+   before they commit anything — and `vendor.py --self-test` re-answers
+   it whenever they want, without touching their tree.
 3. **Going blocking**, once those are burned down: drop `--advisory`
    from the "Run ci-secure" step in
    `.github/workflows/ci-secure.yml`, then require **`ci-secure`** — the
@@ -721,6 +790,11 @@ only if they ask for one.
   downstream would catch that. If the template has changed in a way they
   want, show them the diff against `<ci-secure>/scaffold/ci-secure.yml`
   and let them choose.
+- **A refresh re-proves the gate**, on the same throwaway fixtures and
+  with the same three outcomes as an install. It replaces the engine,
+  the gate and the rule, which is exactly when a gate can stop being
+  able to fail — and their `git diff` shows code, not behaviour. Relay
+  the proof line as you would on an install.
 - There is no dry run, and `--verify` compares their copy against its own
   manifest, not against this skill — so "is it already current?" can only
   be answered after the refresh, from `git diff`. If that diff is empty,
