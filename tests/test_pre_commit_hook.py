@@ -64,7 +64,6 @@ _HOOK = _REPO / ".githooks" / "pre-commit"
 _PYPROJECT = _REPO / "pyproject.toml"
 _CI_WORKFLOWS = (
     _REPO / ".github" / "workflows" / "ci.yml",
-    _REPO / ".github" / "workflows" / "ci-fork.yml",
 )
 
 # Runners that build an isolated, throwaway environment. These CAN and MUST be
@@ -439,16 +438,21 @@ def test_ci_workflows_also_provision_pyyaml(workflow):
     with its own hardcoded `pip install` line rather than reading the dev extra.
     Nothing stops someone from trimming that line — and the failure would be the
     same INTERNALERROR wall, on the gate that protects `main`. So pin it here.
+
+    ci.yml runs the suite twice (test-self, test-fork), each with its own
+    install step — check EVERY install line, not just any one of them, so a
+    regression in only one job can't hide behind the other.
     """
     assert workflow.is_file(), f"{workflow} is missing"
     text = workflow.read_text()
     installs = [ln.strip() for ln in text.splitlines()
                 if "pip install" in ln and "uv" not in ln.split("pip install")[1]]
     assert installs, f"{workflow.name} has no dependency install step"
-    assert any("pyyaml" in ln.lower() or '".[dev]"' in ln or "'.[dev]'" in ln
-               for ln in installs), (
-        f"{workflow.name} runs the suite but never installs PyYAML "
-        f"(install lines: {installs}); pytest will abort at collection with "
+    missing = [ln for ln in installs
+               if not ("pyyaml" in ln.lower() or '".[dev]"' in ln or "'.[dev]'" in ln)]
+    assert not missing, (
+        f"{workflow.name} runs the suite but has an install step that never "
+        f"installs PyYAML ({missing}); pytest will abort at collection with "
         "INTERNALERROR. Install it explicitly or use the dev extra.")
 
 
