@@ -44,6 +44,13 @@ reads your run history over the GitHub API. That data stays on your machine:
 npx skills add starslingdev/skills --skill ci-speedup
 ```
 
+Or paste this into your agent:
+
+```text
+Run `npx skills add starslingdev/skills --skill ci-speedup` to install or
+update the ci-speedup skill.
+```
+
 Then invoke it by name (**`/ci-speedup`**, or `$ci-speedup` in Codex), or just
 ask *"why is my CI slow?"*
 
@@ -76,6 +83,13 @@ fixes.**
 npx skills add starslingdev/skills --skill ci-score
 ```
 
+Or paste this into your agent:
+
+```text
+Run `npx skills add starslingdev/skills --skill ci-score` to install or
+update the ci-score skill.
+```
+
 Then invoke it by name (**`/ci-score`**, or `$ci-score` in Codex), or just ask
 *"grade my CI"*. Runs fully offline.
 
@@ -86,6 +100,9 @@ passed over checks applicable; every failed check gets one ranked fix.
 
 **It measures adherence, not speed**, and it is **not a security audit**: two
 of the eleven checks are security-adjacent, and it claims nothing further.
+
+Example report from a real run:
+[`pallets/flask`](examples/pallets-flask/ci-score-report.md), scoring 89/100.
 
 Learn more: [starsling.dev/ci-score](https://starsling.dev/ci-score)
 
@@ -98,6 +115,13 @@ them.**
 
 ```bash
 npx skills add starslingdev/skills --skill ci-secure
+```
+
+Or paste this into your agent:
+
+```text
+Run `npx skills add starslingdev/skills --skill ci-secure` to install or
+update the ci-secure skill.
 ```
 
 Then invoke it by name (**`/ci-secure`**, or `$ci-secure` in Codex), or just
@@ -118,6 +142,37 @@ vectors, each a full outsider → compromise chain with a real incident behind i
 ([why these ten](skills/ci-secure/references/why-these-ten.md)). **Zero findings
 is a first-class result**, and a check that could not run says *did not run*,
 never "pass".
+
+Example reports from real runs over one workflow file in
+`snowflakedb/snowflake-connector-net`, scanned at two commits:
+[3 findings before the vendor's
+fix](examples/snowflakedb-snowflake-connector-net/ci-secure-report-4a1b8ce.md),
+and [0 findings
+after](examples/snowflakedb-snowflake-connector-net/ci-secure-report-1dc7766.md).
+
+### ci-secure CI check
+
+A scan says what is wrong today. The CI check runs the same engine on every
+pull request, so the findings do not come back. Paste this:
+
+```text
+Run `npx skills add starslingdev/skills --skill ci-secure` to install or
+update the ci-secure skill, then install ci-secure as a CI check in this repo.
+```
+
+It is **vendored, never fetched**: the engine, the gate and the licence are
+copied into your repository, so the code judging your PRs is code you can read
+and it cannot change underneath you. It is two files plus the engine:
+[`scaffold/gate.py`](skills/ci-secure/scaffold/gate.py), which decides pass or
+fail, and [`scaffold/ci-secure.yml`](skills/ci-secure/scaffold/ci-secure.yml),
+the workflow that runs it. [`scripts/vendor.py`](skills/ci-secure/scripts/vendor.py)
+is what copies them in. Because that writes into your working
+tree, the skill says exactly what it will write and asks for a yes first, works
+on a branch as one setup PR, and never pushes without asking.
+
+It ships in `--advisory` mode, so it does not affect your merge path on day
+one. It becomes blocking when you drop `--advisory` and add the check to your
+repository's required checks.
 
 Learn more: [starsling.dev/ci-secure](https://starsling.dev/ci-secure)
 
