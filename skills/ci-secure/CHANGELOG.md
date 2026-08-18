@@ -78,6 +78,51 @@ entries are dated (UTC). Format loosely follows
   `CONTRIBUTING.md` are read for that convention and the matching line is
   quoted back. Detection only: registering into an arbitrary repository's
   harness means writing into files the installer knows nothing about.
+- **2026-08-17** — **The five behavioral eval cases are now runnable instead of
+  being documentation.** `evals/evals.json` described five scenarios in prose
+  and nothing executed them; the tests that referenced them (`test_loop_evals.py`
+  and `test_scan.py`) said so in their own docstrings, pinning the deterministic
+  scanner output underneath because the behavioral layer could not run. So a regression in the agent-facing
+  contract — the engine skipped in favour of eyeballing YAML, a skipped
+  network-gated check rendered as a pass, the complete finding table collapsing
+  into a capped four-option widget — was caught by nothing. The five cases are
+  now `evals/<case>/case.yaml` in the format `claude plugin eval` consumes,
+  each with a scaffold that materializes its cloaked fixtures into a real
+  `.github/workflows/` tree (and `git init`s it, so the skill's Phase 1 resolves
+  the sandbox rather than the harness's parent repository). Graders are
+  mechanical wherever the expectation allows: `tool_used` on the engine scripts,
+  and regexes anchored on strings only `run.py` or `report.py` can produce —
+  the scanner's string-sorted group list, the renderer's pre-drawn banner —
+  rather than on prose an agent could produce having merely read `SKILL.md`.
+  `evals.json` is retired; the case files are now the single source of truth.
+  **The suite has never been executed** — `claude plugin eval` is in early
+  access and gated on the authoring machine — and `evals/README.md` states
+  exactly what is and is not verified. `tests/test_evals_cases.py` validates
+  everything checkable without the runner, including a vacuity guard that fails
+  any trace regex matching text the skill itself ships — `SKILL.md`,
+  `references/`, `scripts/*.py` and `evals/README.md`, since the installer
+  copies all of them and one `Grep` puts any into the transcript — and guards
+  for the traps that fail silently:
+  a `Skill` `tool_used` grader demoted to unscored without `arm: both`, and
+  `max: 0` without `min: 0`. `evals/results/` is gitignored and now blocked from
+  the install surface by `tests/test_ci_secure_install_surface.py`, since the
+  installer honours no ignore file. The shared scaffold now refuses any working
+  directory that is not empty, and refuses one it cannot list rather than
+  reading an unreadable directory as an empty one: run by hand from a checkout
+  it would otherwise overwrite that repository's live `.github/workflows/` with
+  the vulnerable fixtures and commit them to the current branch. Three further
+  silent bypasses of the vacuity rule are closed: a regex grader with no
+  `target:` was exempt from it, a `not_contains` pattern could match its own
+  declaration and so never pass, and a pattern opening with a bare digit
+  matched inside a longer number — `0 critical findings` is contained in `10
+  critical findings`, so the zero-findings case passed under the one regression
+  it exists to catch. `allowed_tools` entries are now checked against the names
+  the runner can actually grant. And every case must carry an anchor that a
+  *completed* engine run satisfies and a failed one does not: `tool_used` sees
+  only that a command mentioned `run.py`, and an occurrence line on a short
+  fixture is one `grep -n` away, so `template-injection` gains the engine's own
+  printed group list alongside them.
+
 - **2026-08-17** — **A finding whose job sits behind a security gate that
   cannot work now says so.** Previously every gate got the same sentence —
   *"the finding stands only if that gate can be bypassed; verify it"* — which
@@ -156,6 +201,15 @@ entries are dated (UTC). Format loosely follows
   renderer delegates to it rather than keeping a copy: two copies of an
   escaping rule eventually differ, and the surface with the weaker copy is the
   one an attacker aims at.
+
+### Changed
+
+- **2026-08-17** — **`evals/evals.json` is retired.** Its prose moved into each
+  case's `description` and `expected_outcome` so the case files are the single
+  source of truth. Two expectations it carried are now documented rather than
+  graded — fix subagents staying inside their one target file, and the report's
+  scope-honesty line — and `evals/README.md` names both under "Not covered by
+  any grader".
 
 ### Fixed
 
