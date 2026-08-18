@@ -22,7 +22,7 @@ fix recipe consumed by per-finding fix subagents.
 - [P14.15 — Attacker-Controlled Write to `$GITHUB_ENV` or `$GITHUB_PATH`](#p1415--attacker-controlled-write-to-github_env-or-github_path)
 - [P14.18 — `pull-requests: write` Granted to Workflow With Untrusted Trigger](#p1418--pull-requests-write-granted-to-workflow-with-untrusted-trigger)
 - [P14.19 — Cache or Artifact `path:` Includes Known Credential Files](#p1419--cache-or-artifact-path-includes-known-credential-files)
-- [P14.24 — Unverified Remote Script Execution (`curl | bash`)](#p1424--unverified-remote-script-execution-curl--bash)
+- [P14.24 — Unverified Remote Code Execution (`curl | bash` and mutable fetch-and-run)](#p1424--unverified-remote-code-execution-curl--bash-and-mutable-fetch-and-run)
 - [P14.25 — Dependency Install Scripts Executed in a Privileged Job](#p1425--dependency-install-scripts-executed-in-a-privileged-job)
 - [Severity scale](#severity-scale)
 - [METADATA schema](#metadata-schema)
@@ -37,8 +37,8 @@ Catalog `severity` records the unfixed attack's potency (HIGH / MEDIUM).
 critical finding by definition — the catalog IS the critical set. Two entries
 carry catalog-severity MEDIUM, both for the same documented reason — their
 potency depends on a live condition outside the repo rather than on an in-repo
-defect: P14.24 (whether the remote host serving the piped script is or becomes
-malicious) and P14.25 (whether a dependency in the tree is or becomes
+defect: P14.24 (whether the remote code — the host serving the piped script, or
+the repository behind the mutable ref — is or becomes malicious) and P14.25 (whether a dependency in the tree is or becomes
 malicious). Both render as findings all the same. P14.9 was raised to HIGH
 when its detector was rebuilt as a real chain detector.
 
@@ -134,6 +134,7 @@ The `yaml-run-injection` detector walks `jobs.*.steps.*.run` and only fires when
 **Real incidents:**
 
 - **nx / s1ngularity (Aug 2025)**: `pull_request_target` interpolated `${{ github.event.pull_request.title }}` into a shell step. A PR title containing a command substitution executed as the workflow with a publishing token in scope. Over [5,000 private repos were briefly made public](https://www.wiz.io/blog/s1ngularity-supply-chain-attack).
+- **snowflakedb/snowflake-connector-net (Jun 2026)**: `jira_issue.yml` ran on `issues: opened` and built `TITLE=$(echo '${{ github.event.issue.title }}' | sed ...)` — escaping that runs *after* template expansion, so a single quote in the title closed the `echo` and ran the rest as shell. An issue title exfiltrated a Jira API token with read access across Snowflake's engineering, security-compliance and bug-bounty projects. The vulnerable line was introduced five days earlier by a commit co-authored by GitHub Copilot Autofix, which *removed* the repo's existing safe `env:` + `jq --arg` pattern — the fix recipe below, already in place, undone by an AI cleanup. The job's `if:` gate also compared `github.event.pull_request.user.login` against a bot account, under `issues` and `issue_comment` triggers where no `pull_request` object exists: the comparison read `null != '...'` and admitted everyone. The detector reports a dead `github.event.*` field in the gate alongside the finding, and calls the gate INERT when the whole condition is that one comparison. The real file's gate is a disjunction, so it gets the dead-field fact and no verdict: nothing here evaluates a compound condition. Found by an autonomous agent within five days of introduction; fixed same-day. [Wiz write-up](https://www.wiz.io/blog/red-agent-snowflake-copilot-cicd-bug).
 - **elementary-data (Apr 2026)**: `issue_comment` workflow echoed `${{ github.event.comment.body }}` into bash. A 2-day-old account left a comment that closed the echo string and curled a stager. Within 10 minutes: forged `github-actions[bot]` commit, dispatched release workflow, malicious wheel on PyPI and image on GHCR.
 
 **Prioritization**: every occurrence is a HIGH finding. Attack first the ones on an untrusted-event trigger (`pull_request_target`, `issue_comment`, `workflow_run`, …), where any stranger supplies the attacker text with no prior access. Occurrences on trusted triggers still execute attacker-influenced text as shell and are mechanical to fix.
@@ -155,6 +156,8 @@ For values that flow into a multi-line shell script, set them in `env:` once and
 Zizmor's [`template-injection`](https://docs.zizmor.sh/audits/#template-injection) audit catches this with a more comprehensive expression model.
 
 **Risk of the change.** Moving the value into an `env:` var changes the shell's view of it — the text is no longer substituted before bash parses the line, so quoting semantics change: verify any comparison or gate built on that value still rejects a wrong value and still accepts the real one.
+
+**Check the job's `if:` gate against the workflow's own `on:` triggers before you claim you preserved its intent.** A gate reading a `github.event.*` object that none of the declared triggers populates — `github.event.pull_request` on an `issues` workflow — is comparing against an empty value and never restricted anything, so "it still behaves the same" is not the goal there. Fix the injection regardless: the occurrence is a finding on its own merits and a dead gate never makes it skippable. Then, in the same change, either repoint the gate at an object those triggers do populate (under `issues`, `github.event.issue.user.login`) or remove it, and say in your summary which you did and why.
 
 ---
 
@@ -569,24 +572,26 @@ For caches: the file becomes restorable by any future workflow that restores the
 
 ---
 
-### P14.24 — Unverified Remote Script Execution (`curl | bash`)
+### P14.24 — Unverified Remote Code Execution (`curl | bash` and mutable fetch-and-run)
 
 <!-- METADATA
 pattern: P14.24
 severity: MEDIUM
-detector: yaml-run-injection
-match: "(?:(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:bash|sh)\b|\b(?:bash|sh)\s+<\(\s*(?:curl|wget)\b|\bdeno\s+run\b[^\n]*https?://)"
+detector: yaml-job-correlated
+correlation: unverified-remote-code-execution
 affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
 fix_strategy: pin-and-verify-remote-script
 fix-surface: yaml
-title_template: "Unverified remote script execution in {basename}"
+title_template: "Unverified remote code execution in {basename}"
 -->
 
-**TL;DR.** A `run:` step pipes a remotely-fetched script straight into a shell — `curl … | bash`, `wget … | sh`, `bash <(curl …)`, or `deno run <url>`. The runner executes whatever the remote server returns *at that moment*, with no integrity check. If the URL's host is compromised (or the response is MITM'd, or the maintainer pushes malicious content), the workflow runs attacker code at full job privilege.
+**TL;DR.** A job executes remotely-fetched code that nothing pins — a script piped straight into a shell, or another repository fetched at a mutable ref (by `git clone`, `git fetch`, or `actions/checkout`) and then run out of. **The piped installer**: a `run:` step pipes a remotely-fetched script straight into a shell — `curl … | bash`, `wget … | sh`, `bash <(curl …)`, or `deno run <url>`. **The mutable fetch**: a job clones or fetches a git tree at a BRANCH, TAG, `HEAD`, or an abbreviated commit id — anything but a full 40-hex commit — and then executes a file out of that tree. Both run whatever the other side serves *at that moment*, with no integrity check, at full job privilege. A fetch pinned to a full 40-character commit id is immutable and is NOT a finding: that is the same trust model this catalog recommends for action pins.
 
-**What an attacker can do.** Whoever controls the fetched URL — the upstream host, a hijacked CDN, a compromised installer endpoint — runs arbitrary code on the runner with access to the job's secrets and `GITHUB_TOKEN`. Unlike a pinned action (immutable by SHA), a piped remote script is re-fetched live on every run, so a one-time host compromise hits every subsequent CI run until someone notices.
+**What an attacker can do.** Whoever controls the fetched code — the upstream host, a hijacked CDN, a maintainer account on the cloned repository — runs arbitrary code on your runner with the job's secrets and `GITHUB_TOKEN`. The mutable-fetch shape needs no host compromise at all: a branch or tag is *designed* to move, so anyone who can push to (or re-point a tag on) that repository changes what your next CI run executes, and nothing in your repo has to change for it to happen. Unlike a SHA-pinned action, both shapes re-resolve live on every run, so a one-time compromise hits every subsequent run until someone notices.
 
-**Anti-pattern**: a `run:` scalar that fetches and executes in one step without verifying integrity. The detector only inspects `run:` scalars (not comments or `env:`), and matches:
+**Anti-pattern**: executing code the repo never pinned, in either of two shapes.
+
+*Shape 1 — the piped installer*: a `run:` scalar that fetches and executes in one step without verifying integrity. The detector only inspects `run:` scalars (not comments or `env:`), and matches:
 
 - `curl … | bash` / `curl … | sh` (with or without `sudo`)
 - `wget … | bash` / `wget … | sh`
@@ -604,25 +609,62 @@ what makes those unsafe is the pipe into a shell, not the address being
 fetched; the `deno run` form is the exception — it has no pipe, so that arm
 does key on a literal URL.)
 
-PowerShell `iex (New-Object Net.WebClient).DownloadString(...)` is the same class on Windows runners but is not matched here (casing / Windows-runner rarity); flag it in manual review if you run Windows jobs.
-
-**Severity**: MEDIUM. Real RCE vector, but it depends on the remote host being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/…`) materially reduces the risk; the detector still flags it, so treat a pinned-URL hit as low-priority.
-
-**Fix recipe**: Download, verify, then execute as separate steps — pin the expected content by checksum:
+*Shape 2 — the mutable fetch*: within ONE job, a `git clone` / `git fetch` / `actions/checkout` of another repository at a mutable reference, followed by a command that executes out of the directory it landed in.
 
 ```yaml
-# RIGHT — fetch, verify a known-good digest, then run
+# WRONG — `main` is whatever that branch points at when the job runs
+- run: git clone --branch main "<tools-repo-url>" tools
+- run: python3 tools/setup.py
+```
+
+Execution shapes matched: an interpreter running a fetched file (`python3`/`node`/`bash`/`sh`/`ruby`/`perl`/`pwsh` …), `source`ing a fetched script, `pip install <fetched-dir>` (including `-e`, but never a flag's value — `--target` names a destination and `-r` names a file pip reads), and a fetched path invoked directly (`./tools/install`). `cd` into the fetched directory is followed within the step that ran it, so `cd tools && ./install` connects — and, because `cd` dies with its step, a later step is read from the workspace root again.
+
+**Detection**, and where it deliberately stops short. The pairing must be VISIBLE: the fetch's destination directory and the executed path have to connect inside the same job, which the scanner reads off the shell text. Its consequences, stated rather than implied:
+
+- **A full 40-hex pin silences it — a short sha does not, and neither does a late one.** `git clone … && git -C dir checkout <40-hex>` is immutable and never reported, and the pin has to land BETWEEN the fetch and the execution: pinning is a claim about the code that ran, so a pin before the fetch pinned the tree as it stood and a pin after the execution pinned nothing that had already run. Every suppression is recorded — in the scan's `suppressed_findings`, which is informational and never counts against coverage. An abbreviated id (`a1b2c3d`) is re-resolved by git at fetch time and is treated as mutable.
+- **A destination the scanner cannot see is not reported.** `git clone "$TOOLS_URL"` with no explicit target directory leaves the destination unknowable, so no connection is claimed and no finding is raised — a deliberate false negative in favour of never inventing a chain. It is recorded as a coverage note, so "no finding" is distinguishable from "nothing here". Shell the scanner cannot parse (an unbalanced quote) contributes nothing; it is recorded as a coverage note when the text it could not read mentions a fetch or an execution, and only an unreadable `cd` abandons the rest of the step, since that is the case that leaves the working directory stale.
+- **`git fetch` fires only for a third-party remote** — a URL, a variable holding one, or a name this job just added with `git remote add <name> <url>` — that something then brings into the tree (`git checkout FETCH_HEAD`, or `reset` / `switch` / `merge` / `rebase` on it). `git fetch origin main` pulls the repository's own history and is not this vector. Unlike the clone arm, a `git fetch` lands in the job's working directory, so the destination is that directory and the finding renders it as `.`.
+- **The shell arm reads `git clone`, `git fetch` and `git remote add`, and nothing else.** Everything below is the same trust model and is NOT reported — a clean P14.24 is not a statement that the repo has no mutable fetch-and-run, only that no `git`-spelled one is visible:
+  - other fetchers: `gh repo clone`, `svn checkout`, `git submodule update --remote`, and package managers pointed at a git ref (`pip install "git+…@main"`, `go install …@latest`, an npm/cargo git dependency);
+  - a tarball fetched with `curl`/`wget`, unpacked, and then run;
+  - a fetch and its execution separated by a rename (`mv tools built && python3 built/setup.py`);
+  - the mirror of that rename — a third-party tree whose bytes are OVERWRITTEN by the repo's own content before the named file runs (`rm -rf dir/*; cp -r "$GITHUB_WORKSPACE/mine" dir/`), so the fetch into `dir` is real but the executed file is self-owned; the finding names the fetch it can see, and whether a copy-in later replaced those bytes is not tracked;
+  - a remote whose URL is set with `git config remote.<name>.url` rather than `git remote add`;
+  - execution through an interpreter's INLINE program — `bash -c "…"`, `perl -e`, `php -r`, `pwsh -Command`, `powershell -EncodedCommand` — whose text is not read as commands;
+  - an execution whose path BEGINS with a variable this scan cannot resolve (`"$TOOLS/setup.sh"`) — it could hold an absolute path that escapes the fetched tree, so it is recorded as a coverage note rather than resolved and reported; the runner's own absolute variables (`$GITHUB_WORKSPACE/…`) are the exception, treated as absolute, and a variable DEEPER in a path rooted at the fetched directory (`tools/$V/run.sh`) is inside the tree whatever it holds and still fires;
+  - execution through a build driver rather than an interpreter (`make -C tools`), or through a versioned interpreter (`python3.11`);
+  - a fetch whose execution happens in a different job (different runner, different tree).
+
+  Review those by hand. Widening the shell arm to guess at them would cost the property the whole entry rests on: every reported chain is one a reader can see in their own YAML.
+- **A clone of your OWN repository is not reported.** `${{ github.repository }}` is the scanned repo by definition, and a literal `github.com/<owner>/<repo>` is compared against the checkout's `origin` remote — including the authenticated spelling that carries a token in the URL's userinfo. No third party is involved in re-cloning yourself, and the fix this entry recommends (pin to a full commit id) is unactionable for a release workflow that must run at the branch head. In an exported tree with no `.git`, `origin` is unknown and the literal form is reported like any other clone.
+- **`working-directory:` is followed** — on the step, and through `defaults.run.working-directory` on the job and on the workflow. A `working-directory:` computed at run time (`apps/${{ matrix.app }}`) is not knowable, so it becomes an opaque directory: a fetch and an execution both inside it still connect to each other, and nothing inside it can match a directory anywhere else.
+- **`actions/checkout` of another `repository:` is covered too**, since it is how most workflows fetch a second repository. The same rules apply: a full 40-hex `ref:` is silent, your own repository is silent, and something in a LATER step of the same job has to execute out of the `path:` it landed in. With NO `path:` the checkout replaces the workspace, so anything the job runs afterwards counts. A `repository:`, `ref:` or `path:` computed at run time is recorded as a coverage gap rather than guessed at.
+
+PowerShell `iex (New-Object Net.WebClient).DownloadString(...)` is the same class on Windows runners but is not matched here (casing / Windows-runner rarity); flag it in manual review if you run Windows jobs.
+
+**Severity**: MEDIUM. Real RCE vector, but it depends on the remote code being (or becoming) malicious — a live condition rather than an in-repo defect. A SHA-pinned raw URL (`raw.githubusercontent.com/owner/repo/<sha>/…`) materially reduces the risk of the piped-installer arm; the detector still flags it, so treat a pinned-URL hit as low-priority.
+
+**Fix recipe**: pin what you execute, or vendor it. A mutable fetch is pinned to a full 40-character commit id — the same immutability an action SHA-pin buys, re-pinned deliberately when you want the update. A piped installer becomes three steps: download, verify a known digest, then run the local copy. One block, both shapes — apply the half that matches the occurrence:
+
+```yaml
+# RIGHT (mutable fetch) — the tree is one immutable commit, verified by git
+- run: |
+    git clone "<tools-repo-url>" tools
+    git -C tools checkout <full-40-hex-commit>
+- run: python3 tools/setup.py
+
+# RIGHT (piped installer) — fetch, verify a known-good digest, then run
 - run: |
     curl -fsSL -o install.sh "<installer-url>"
     echo "<known-sha256>  install.sh" | sha256sum -c -
     bash install.sh
 ```
 
-Prefer a package manager or a SHA-pinned action over an ad-hoc installer where one exists. For tools distributed only via `curl | bash`, vendor the script into the repo (so it's reviewed and pinned by git) and run the local copy.
+Prefer a package manager or a SHA-pinned action over an ad-hoc installer where one exists. For tools distributed only as a piped installer, or a repository you must build from source, vendor the code into the repo (so it is reviewed and pinned by git) and run the local copy.
 
 **Sources**: poutine `unverified_script_exec` rule (boostsecurityio/poutine); OpenSSF "Mitigating attack vectors in GitHub workflows".
 
-**Risk of the change.** A pinned installer can drift from the toolchain the build expects: freezing the script at one checksum makes upgrades a deliberate step, and CI will fail — correctly, but loudly — the day upstream rotates the script.
+**Risk of the change.** Pinning freezes the version you execute: a pinned installer or commit can drift from the toolchain the build expects, so upgrades become a deliberate step and CI will fail — correctly, but loudly — the day you actually need the newer code.
 
 ---
 
@@ -719,6 +761,7 @@ motivated removed patterns are not cited here.
 - **Miasma / `@redhat-cloud-services` (June 2026)** — [Microsoft Security Blog, "Preinstall to persistence: Inside the Red Hat npm Miasma credential-stealing campaign", June 2 2026](https://www.microsoft.com/en-us/security/blog/2026/06/02/preinstall-persistence-inside-red-hat-npm-miasma-credential-stealing-campaign/). 32 malicious packages across 90+ versions published to the `@redhat-cloud-services` npm namespace, each carrying a weaponized `preinstall` hook that ran a dropper automatically on `npm install` — through transitive dependencies as well as direct ones. The payload harvested GitHub tokens and Actions/org secrets, npm credentials and cloud credentials reachable from instance metadata, and scraped GitHub Actions runner memory for secrets before republishing poisoned packages downstream. Source for P14.25.
 - **npm install-script defaults (2026)** — [GitHub Changelog, June 9 2026 announcement; npm v12.0.0 shipped July 8 2026](https://github.blog/security/supply-chain-security/disrupting-supply-chain-attacks-on-npm-and-github-actions/). Dependency `preinstall`/`install`/`postinstall` scripts — and the implicit `binding.gyp` rebuild — no longer run by default; git and remote-URL dependencies now require an explicit flag. The announcement follows the Miasma compromise above, which used the same install-time execution point. Source for P14.25.
 - **GitHub, "Disrupting supply chain attacks on npm and GitHub Actions" (July 28 2026)** — [post](https://github.blog/security/supply-chain-security/disrupting-supply-chain-attacks-on-npm-and-github-actions/). The platform's own account of the 2026 changes: npm install-script defaults, read-only Actions cache tokens for untrusted triggers (June 26 2026), safer `actions/checkout` defaults under `pull_request_target` (June 18 2026), and opt-in workflow-trigger policies (June 18 2026). Source for P14.25 and for the dated platform notes on P14.7, P14.9 and P14.18.
+- **snowflakedb/snowflake-connector-net (Jun 2026)** — [Wiz writeup](https://www.wiz.io/blog/red-agent-snowflake-copilot-cicd-bug). `issues` / `issue_comment` + template injection into a `run:` step holding a Jira API token; the vulnerable line was introduced by a Copilot Autofix commit that removed the safe `env:` pattern, and the job's trust gate read an event object neither trigger populates. Source for P14.10.
 - **elementary-data (Apr 2026)** — [StepSecurity writeup](https://www.stepsecurity.io/blog/elementary-data-compromised-on-pypi-and-ghcr-forged-release-pushed-via-github-actions-script-injection). `issue_comment` + template injection + default-write `GITHUB_TOKEN` → forged commit → PyPI + GHCR in 10 minutes. Source for P14.10 and P14.18.
 - **Ultralytics (Dec 2024)** — [Yossarian writeup](https://blog.yossarian.net/2024/12/06/zizmor-ultralytics-injection). `pull_request_target` + cache poisoning across a trust boundary. Source for P14.7 and P14.10.
 - **Codecov bash-uploader breach (Apr 2021)** — [Codecov security update](https://about.codecov.io/security-update/). An altered upload script served from the vendor's own host exfiltrated environment variables — including CI secrets — from every job that piped it into a shell. Source for P14.24.

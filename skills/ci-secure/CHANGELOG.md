@@ -11,7 +11,845 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **2026-08-17** — **A finding whose job sits behind a security gate that
+  cannot work now says so.** Previously every gate got the same sentence —
+  *"the finding stands only if that gate can be bypassed; verify it"* — which
+  is the wrong instruction when the gate compares against an event field the
+  workflow's own triggers never populate. Snowflake's `jira_issue.yml` (Wiz,
+  Jun 2026) gated on `github.event.pull_request.user.login` under an `issues`
+  trigger, where there is no pull request: the comparison ran against an empty
+  value, so the gate admitted every GitHub user while reading like it admitted
+  one bot. The evidence now names the dead field, and calls the gate INERT
+  where the condition is that comparison and nothing else. Deciding this is a lookup of
+  which trigger fills which event object, not a judgement about bypassability —
+  a gate is only called inert when NO trigger the workflow declares could
+  populate the field, and a trigger whose payload we cannot know (`workflow_call`
+  runs on the caller's event) yields no verdict at all. The direction is read
+  off the condition rather than assumed: the same dead comparison written with
+  `==` admits *nobody* instead of everybody, and a dead term sitting next to a
+  live one settles nothing, so those get the dead-field fact and the ordinary
+  "verify it" instead of a verdict. Injection findings
+  (P14.10) carry the gate note now — the dead-field half of it only, since an
+  injection is worth fixing whether or not its gate holds — and carry it
+  alongside the quoted excerpt rather than inside it, so the scanner's own
+  conclusion is never rendered as a line of your workflow file. Two payload
+  corrections ride along: `deployment` and `deployment_status` do populate
+  `github.event.workflow_run`, and a step with its own `if:` withdraws a
+  verdict about who reaches the job. Where no verdict is available, the note
+  says the dead comparison always evaluates the same way and stops there — it
+  does not call the term harmless, because a constant is the opposite of
+  harmless beside another term: `A && (empty == 'x')` is always false and shuts
+  the gate on its own, and `A || (empty != 'x')` is always true and opens it
+  whatever `A` says. No finding is added, removed, or re-scored by this — it changes what the
+  evidence tells you about findings the scan already reports.
+
+- **2026-08-15** — **The blocking rule is now part of the skill, as three
+  independent names in `config.py`.** `BLOCKING_OUTCOMES` (which fact outcomes
+  fail a build), `KNOWN_OUTCOMES` (which are recognised at all) and
+  `OUTCOME_MARKS` (how each is displayed), plus `coverage_is_complete()`, which
+  says whether the three agree. None is derived from another — in particular
+  the first two are never computed from the display table, because that
+  coupling lets a cosmetic edit widen the set of accepted outcomes and ship a
+  new failure state as a pass. Anything running ci-secure as a CI gate imports
+  these instead of hardcoding a copy that can drift from the engine's.
+
+- **2026-08-15** — **You can now set ci-secure up as a CI check in your own
+  repository.** Say *"install ci-secure as a CI check"* and it (1) COPIES the
+  engine, gate and licence into your repo plus one workflow, as a pull request
+  you review and merge; (2) REPORTS WITHOUT BLOCKING on the first run, so the
+  setup does not brick your merge path on day one; (3) becomes blocking when
+  YOU delete the `--advisory` flag and add `ci-secure` to your required checks;
+  (4) is undone by removing that required check, never by deleting the
+  workflow. Nothing happens on its own, and it blocks only after you make it
+  required.
+
+  Nothing is fetched and executed at CI time — a pin can be moved or deleted in
+  a repository you do not control, and we ship a detector for that shape
+  (P14.24). `scripts/vendor.py` does the copying and writes a `VENDORED.json`
+  of per-file hashes that your own CI re-checks every run, so a local edit to
+  the copied gate is loud instead of invisible. `--advisory` downgrades failed
+  FACTS only: a crashed engine, zero workflows scanned, an unrecognised outcome
+  or an incomplete scan stay red, because a ramp for findings must never become
+  a mute button for a broken scan. Updating re-copies the code and never
+  rewrites your workflow file — the runner, the triggers and the flag you
+  deleted are yours. The copied gate is held byte-identical to the one this
+  repo runs on itself, so a weaker copy cannot ship.
+
+  Setup refuses anything that is not plainly your repository rather than
+  writing and hoping: a destination that resolves outside it, a subdirectory
+  rather than the root, or a `ci-secure/` directory already holding files of
+  yours. `--verify` treats compiled bytecode and symlinks under the copied tree
+  as drift even when the manifest lists them, since the manifest is repository
+  content and cannot exempt them.
+
+- **2026-08-15** — **`config.py` now owns the one definition of how a scanned
+  string is neutralized.** `flatten_scanned()` collapses whitespace, replaces
+  the backtick and escapes the pipe — the rule the report renderer already
+  applied, moved somewhere a stdlib-only CI gate can import it too. The
+  renderer delegates to it rather than keeping a copy: two copies of an
+  escaping rule eventually differ, and the surface with the weaker copy is the
+  one an attacker aims at.
+
 ### Fixed
+
+- **2026-08-15** — **The gate setup instructions cover the paths a real
+  session actually takes.** Setup and refresh are the same command, and which
+  one runs is decided by whether `VENDORED.json` is already there — so an
+  agent following the setup steps on a repo that had the vendored copy but no
+  workflow announced a workflow that was never written. The instructions now
+  name that discriminator, stop rather than guessing when the destination is
+  not a git work tree, warn when a repository has no workflows at all (the gate
+  reds permanently on "nothing scanned", which `--advisory` does not clear),
+  say that the copied files are left uncommitted and nothing runs until they
+  are committed, complete the list of refusals, and require checking for local
+  edits before a refresh overwrites them. "Make ci-secure block my PRs" now has
+  a procedure of its own instead of resolving to a setup run that changes
+  nothing. Backing the gate out has an order: the workflow first, then the
+  vendored directory.
+
+- **2026-08-15** — **`--verify` no longer passes a vendored copy that was made
+  smaller than the one that was reviewed.** Deleting a vendored file *and* its
+  `VENDORED.json` entry left every remaining hash correct, so the drift check
+  reported a match — the manifest was allowed to define its own domain. This is
+  not the documented "anyone who can edit the gate can edit the manifest"
+  caveat: nothing is edited-with-a-matching-hash, the copy is simply shrunk. It
+  matters most for `config.py`, the rule that says which outcomes block: with
+  the vendored copy gone the gate falls back to a path *inside the repository
+  being audited*, so one pull request could delete the rule here, add its own
+  there, and be judged by a rule it wrote — under a green drift check. The
+  manifest is now checked for completeness before any hash is compared.
+
+- **2026-08-15** — **The setup no longer asks the wrong repository whether a
+  destination is a repository root.** `GIT_DIR` overrides `git -C`, so an
+  exported one — from a hook, a `rebase -x`, a worktree-driven session — made
+  the subdirectory guard read an unrelated repository's toplevel, refuse a
+  perfectly good install, and tell you to vendor the gate and a live workflow
+  into *that other repository* instead. The same variable made the recorded
+  source commit a stranger's HEAD. All git calls now run with the ambient
+  `GIT_*` variables stripped. Relatedly, the working-tree-dirty check now has
+  the timeout and return-code check its sibling call always had: any failure of
+  `git status` previously read as "clean" and stamped the manifest with a bare
+  sha, which asserts this copy is byte-for-byte the published commit.
+
+- **2026-08-15** — **`--verify` escapes what it reads out of your repository
+  before printing it.** `VENDORED.json` arrives with a branch, a pull request
+  checkout or a fork clone, and its strings went to a step log unescaped — a
+  newline in the recorded version forged a `::notice::all clear` on the check
+  run, and one in a `files` key emitted `::stop-commands::`, swallowing every
+  drift reason printed after it so the step red with no stated cause. The gate
+  has escaped engine output for this reason all along; the drift check runs in
+  the step above it and reads from the same trust class.
+
+- **2026-08-15** — **`PYTHONDONTWRITEBYTECODE` now covers the whole scan job.**
+  Scoped to the gate step alone, it stopped one step short of the drift check
+  itself — the step whose entire purpose is rejecting bytecode was the one
+  Python was free to write it from.
+
+- **2026-08-15** — **The skill imports again on Python 3.9**, the floor
+  `pyproject.toml` declares. `config.py` was the only module under `scripts/`
+  without `from __future__ import annotations`, so the PEP 604 (`X | Y`)
+  annotations added alongside the outcome tables were evaluated at definition
+  time and raised `TypeError` on import — taking `scan.py`, `report.py` and any
+  CI gate down with it for every 3.9 user. Every workflow in this repository
+  pins 3.12, so CI could not see the break. A test now asserts the rule for
+  every module under `scripts/` rather than leaving it to habit.
+
+### Changed
+
+- **2026-08-15** — **`__version__` / `VERSION` bumped to 0.2.0** for the
+  changes in this entry. The constant is stamped into the report's Scanner row,
+  so an installed skill carries it as its provenance marker.
+
+- **2026-08-14** — **P14.24's rendered finding title is now "Unverified remote
+  code execution", not "Unverified remote script execution".** The entry covers
+  two shapes and a title naming only one of them would misdescribe half its
+  findings. Reports generated before and after this change print different
+  titles for the identical defect; the pattern id, the severity and the fix
+  anchor are unchanged, so anything keyed on those still matches.
+
+- **2026-08-14** — **A single-star branch filter (`branches: ['*']`) no longer
+  certifies a required check.** GitHub's filter glob `*` matches a run of
+  characters that does NOT include a slash, so `feature/x`, `dependabot/…` and
+  every slashed head branch escape it — an always-running job under `['*']`
+  cannot be shown to run on every pull request. It was read as match-all and
+  certified the check while the reachable PR producer could skip; it routes to
+  UNKNOWN now, alongside the other specific-branch filters. `**` still certifies.
+
+- **2026-08-14** — **A push that ignores every branch (`branches-ignore:
+  ['**']`) is treated as a non-producer, not a bypass.** The push fires on no
+  branch, so it can never report a check on a pull request — the check stays
+  pending and the merge is blocked, it does not green. Left as UNKNOWN, a sole
+  skippable producer under it was counted as a bypassable required check and the
+  fact went RED on a repository whose merges are in fact always blocked.
+
+- **2026-08-14** — **A bypassable required check found on a partially-read
+  branch protection now discloses that the required-check list was itself a
+  floor.** When only one protection source could be read (the other 403'd), the
+  fail evidence dropped the partial-read caveat the pass and unmeasured arms
+  both carry, so the reader was judged against a list they were never told was
+  incomplete — a check configured only in the unread source is invisible here.
+
+- **2026-08-14** — **P14.24: an execution whose path BEGINS with an unresolved
+  shell variable (`$MYVAR/tool.sh`) is a coverage note, not a finding.** It was
+  joined onto the working directory and, inside a third-party checkout, fired —
+  but the variable could hold an absolute path that escapes the tree, so
+  resolving it was a guess. The runner's own absolute variables are still
+  resolved, and a variable DEEPER in a path rooted at the fetched directory
+  (`tools/$V/run.sh`) is inside the tree whatever it holds and still fires.
+
+- **2026-08-14** — **P14.24: `bash -o pipefail tools/run.sh` and its kin no
+  longer miss the execution.** `-o` (and bash's `-O`) name a shell OPTION as
+  their value, so the script is the next word; read flatly, `pipefail` was taken
+  for the path and the real execution silently missed. Scoped to the shells —
+  python's `-O` is a boolean and still runs its script.
+
+- **2026-08-14** — **P14.24: a nested command substitution
+  (`OUT=$(echo $(tools/setup.sh))`) is now scanned.** `$(…)` runs its body and a
+  body can hold another `$(…)`; reading only the outer level left the inner
+  execution a silent false clean — no finding, no gap.
+
+- **2026-08-14** — **P14.24: a re-clone of a directory after an earlier pin is
+  no longer read as pinned.** clone → pin → re-clone → run: the tree that runs
+  is the unpinned re-clone, but keeping the FIRST fetch let the pin (which sat
+  between the stale first clone and the execution) suppress the finding, so the
+  job went silent while it ran unpinned remote code. The last unpinned fetch
+  into a destination wins; a genuine pin of that surviving fetch still
+  suppresses.
+
+- **2026-08-14** — **P14.24: a trailing re-clone nothing runs from no longer
+  buries an earlier clone that WAS executed.** The last-unpinned-fetch-wins rule
+  (above) overwrote the destination with a re-clone even when nothing ran from
+  it; the ordering guard then found no execution after that trailing fetch and
+  the job went silent while an earlier clone had already been executed —
+  `clone → run → re-clone` read as clean. Overwritten clones are now kept as
+  fall-back candidates: the surviving fetch is tried first, and the earlier tree
+  a command actually ran from still fires (and still suppresses when it was
+  pinned before it ran).
+
+- **2026-08-14** — **P14.24: a single-line `run:` value written with YAML quotes
+  is read as the parser saw it.** `run: "git clone … && bash x.sh"` was scraped
+  raw, so the quotes reached the shell tokenizer and the whole line came back as
+  one quoted word — the clone and the execution both vanished, a silent false
+  clean. Block scalars and multi-line scalars are unaffected.
+
+- **2026-08-14** — **Test and doc surface reshaped so it stops tripping the
+  registry's own scanner.** No behaviour change: every URL these tests build is
+  byte-identical at run time, and nothing any test asserts moved. The scanner
+  reads SOURCE text, and it was reading this branch's fixtures as obscured
+  download endpoints — its own words: "template/placeholders or format-string
+  git endpoints (e.g. containing `{…}`, `$-vars`, `%s` or embedded userinfo)".
+  The branch sat on its decision boundary and tipped to a CRITICAL verdict on
+  roughly one run in five, which for a public listing that gets one scan per
+  audit cycle is a launch risk rather than a flake. Test URLs are now assembled
+  at run time from fragments that are not URLs in source, and the README
+  describes a piped installer in prose instead of spelling the token. The
+  vector's own title keeps its name — it is anchor-paired with the catalog's
+  table of contents and rendered into findings.
+
+- **2026-08-14** — **A path-filtered push no longer certifies a required check
+  just because its branch filter matches everything.** `branches: ['**']` was
+  answered before `paths:` / `paths-ignore:` was read, so an always-running job
+  in such a workflow was accepted as proof that the check always reports — when
+  a pull request touching nothing under those paths never starts it, and the
+  real producer skips. The check greened with neither job having run. That
+  combination is UNKNOWN now: it still counts against the check, so a
+  bypassable job there is still found, but it can never be the evidence that
+  one always reports. A `branches-ignore:` written alongside
+  `branches: ['**']` defeats the shortcut for the same reason — the two
+  contradict each other, so "runs on every push" is not a claim this scan
+  can make about the pair — though GitHub does not accept both filters on one
+  event, so that guard is defensive rather than a live defect. The shape that
+  IS expressible, and was a live false pass, is a `!` pattern inside
+  `branches:` — GitHub's documented (and only) way to write "everything
+  except". `branches: ['**', '!release/**']` was read as match-all and
+  certified a check that never reports on an excluded branch. An otherwise
+  unfiltered `branches: ['**']` push still certifies.
+
+- **2026-08-14** — **A constant `if:` no longer certifies a verdict job that
+  has `needs:`.** `if: true` (and `${{ 1 == 1 }}`) is not `always()`: GitHub
+  skips a dependent when a dependency skips unless the condition is `always()`
+  or `!cancelled()`, so a constant-conditioned verdict job with dependencies is
+  exactly as bypassable as the suite it gates — and the fact returned a
+  measured pass for it. The same false green as `success() || failure()`, one
+  condition over. Without `needs:` a constant still certifies, since it cannot
+  be false and reding it would be a false RED on a repository that did nothing
+  wrong.
+
+- **2026-08-14** — **A matrix job no longer certifies the bare context it never
+  emits.** GitHub appends the combination to a matrix job's check name, so a
+  job named `test` reports `test (3.11)` and `test (3.12)` and never `test`.
+  Matching the exact display name before considering the expansion meant a
+  branch requiring the bare `test`, with only that matrix job to produce it,
+  read as a measured PASS — a green over a required check that can never
+  report at all. Such a context is unproduced now, and routes exactly where
+  every other unproduced context does. The evidence names the near miss rather
+  than the generic "no job reports it", so a reader is not sent hunting for an
+  external app that is not there: it says which matrix job is involved and that
+  requiring one of its expansions is the fix. A templated display name stays
+  generic, since the producer match cannot read it either.
+
+- **2026-08-14** — **A pin applied after an `actions/checkout` can suppress
+  again — the fix recipe's own shape had stopped being recognised.** Giving
+  checkout-arm fetches a suppression window (so a pin applied to a tree the
+  checkout later replaced could not silence a finding) opened that window at
+  the first EXECUTION-shaped command after the fetch. That execution is the
+  reported one, so the interval was empty and no later pin could ever land in
+  it: checkout, `git -C tools checkout <40-hex>`, run — exactly what the
+  catalog teaches — was reported, and whether it was depended on an unrelated
+  command happening to sit in between. The window opens at the first shell
+  command of any kind now. The `git clone` arm was never affected, and the
+  shipped test covered only the direction that fires.
+
+- **2026-08-14** — **`success() || failure()` no longer certifies a verdict job
+  that has `needs:` — the recommended fix was itself bypassable.** It reads
+  like `always()` and behaves like it only while the job has no dependencies.
+  Once it does, a SKIPPED dependency makes both predicates false, so GitHub
+  skips the verdict job too — and a skipped required check is precisely what it
+  reports as passed. The fact was therefore certifying the exact shape it
+  recommends, with the hole it exists to find. `always()` and `!cancelled()`
+  both still run when a dependency skips, and are what the fix recipe names
+  now, in the census document and in the code's own docstring.
+
+- **2026-08-14** — **A runner-absolute path is no longer resolved inside a
+  checkout.** `$GITHUB_WORKSPACE`, `$HOME`, `$RUNNER_TEMP` and the runner's own
+  directories are absolute by GitHub's contract, but they were joined onto the
+  step's `working-directory:` — so a `vale` binary downloaded from its own
+  release page and sha256-verified was reported as executing "from" a docs
+  checkout on a real repository. That was one of only two findings the scanner
+  produced across a seven-repository corpus, and its evidence was fabricated.
+
+- **2026-08-14** — **The second chain on a line is described, not just named.**
+  One line is one place to fix, so folding two findings is right — but the kept
+  finding's prose described only the first chain, so what runs out of the
+  second tree was stated nowhere. Its claim is folded in now.
+
+- **2026-08-14** — **Three smaller losses, and the tests that had been missing
+  under them.** An expression's inner spacing split a directory in two:
+  `apps/${{ matrix.app }}` and `apps/${{matrix.app}}` are the same place to
+  GitHub, but keying on the raw text made them two unknown ones, so a chain
+  across them produced no finding and no gap. Sourcing an extensionless fetched
+  path (`. tools/env`) was invisible to the relevance test — and the shipped
+  test for that used `tools/env.sh`, whose `.sh` matched on the unfixed code
+  too, so it passed either way and masked the hole it claimed to close. And
+  coverage notes from the checkout arm carried no line number, so two steps
+  with the same unresolvable expression deduped into one entry and the banner
+  under-counted.
+
+  Alongside them, three mutants that had been surviving a green suite now die:
+  the memo returning a different answer on a cache hit (its only test asserted
+  a call count and `is not None`, and the "unknown" type IS not None), the
+  coverage-note headline restoring the "were NOT scanned" wording the channel
+  split exists to prevent, and notes no longer breaking the completeness flag —
+  which let the header call a scan complete directly above a warning banner.
+
+- **2026-08-14** — **The partial-read disclosure named the source that
+  ANSWERED.** The sentence hardcoded "read from rulesets only" and cut the
+  unread source's name out of the error list, so when the RULESETS arm was the
+  one that 403'd — a GitHub App token, a fine-grained PAT — the shipped
+  markdown told the reader that rulesets could not be read. Both halves come
+  from which source actually succeeded now.
+
+- **2026-08-14** — **A 404 means "not protected" only when GitHub says so.**
+  The comment claimed the status AND the reason were matched; the regex was a
+  bare `404`, so a branch renamed between the two calls, a plan-gated endpoint,
+  even a 502 quoting 404 in its body all became "nothing required here" — a
+  measured PASS over a source that was never read.
+
+- **2026-08-14** — **The expression stand-in can no longer leak into a
+  report.** `${{ env.DIR }}2` tokenized to the stand-in followed by a literal
+  digit, which the render pattern swallowed, so the lookup missed and the
+  scanner's own token appeared where the reader's directory belongs. The token
+  is delimited with the NUL sentinel now — untypeable in YAML, so nothing a
+  workflow contains can collide with it. The token registry was also a module
+  global never reset, letting one workflow's expression text render inside
+  another's finding depending on scan order; it resets per scan. And
+  `verify_report.py` gained the invariant that no scanner-internal marker
+  survives into the report — it had been passing on a leaking one.
+
+- **2026-08-14** — **Which flags mean "the program is on the command line"
+  depends on the interpreter, and only leading flags are the interpreter's.** A
+  flat whitelist scanned over every argument leaked both ways. `-e`/`-E`/`-p`/
+  `-n` are ordinary shell and Python options, so `bash -e tools/install.sh` and
+  `bash tools/install.sh -n` — where the flag belongs to the FETCHED SCRIPT —
+  became silent false cleans on exactly the chain this vector catches. And
+  spellings the list did not carry (`bash -lc`, `perl -lane`, `php -r`,
+  `pwsh -Command`, `powershell -EncodedCommand`) still rendered the program
+  text as "the executed path". A flag's VALUE is no longer read as the path
+  either (`python3 -W ignore tools/setup.py`).
+
+- **2026-08-14** — **`$( … )` runs its body, and the body is read again as
+  commands.** Collapsing the substitution before tokenizing killed the
+  `$(ls tools/x.sql)` nonsense fire and took real executions with it:
+  `OUT=$(tools/setup.sh)` after a mutable clone produced no finding, no gap and
+  no suppression — while the backtick spelling of the same construct still
+  recorded one, so the scanner disagreed with itself about the same shape.
+
+- **2026-08-14** — **A checkout of your OWN repository no longer raises the
+  "not a clean result" banner.** The `repository:`-expression gap ran before
+  the self-repository test, so `repository: ${{ github.repository }}` — the
+  exact spelling the clone arm was taught to recognise — was recorded as
+  "whether it fetches a third party was NOT established". Two real repositories
+  open their reports with that warning over nothing but self-checkouts. The
+  genuinely unknowable fork-PR spelling stays a disclosed gap. The environment
+  variable `$GITHUB_REPOSITORY` is recognised as self-identifying too.
+
+- **2026-08-14** — **Two wiring bugs in how the composed-YAML step marks are
+  used, and the pin bookkeeping beside them.** The checkout arm collected the
+  line of EVERY step carrying a `uses:` key while its index counted only
+  `actions/checkout` steps, so any `actions/setup-*` step ahead of the
+  third-party checkout — nearly every real workflow — shifted the mapping. The
+  evidence quoted the wrong step, and when the shift moved the checkout earlier
+  than a `run:` step it invented a chain whose execution happens BEFORE the
+  fetch, breaking the ordering contract the arm rests on.
+
+  A step's `working-directory:` was matched to the first shell start at or
+  after its `run:` line, searched over the whole file rather than the step. A
+  flow-style `- {run: …, working-directory: vendor/x}` — which the line regex
+  cannot see as a shell start at all — therefore donated its directory to the
+  next block-scalar step, in a DIFFERENT job, fabricating a destination there
+  and moving a real chain out of the fetched tree here. Both are now bounded to
+  the step's own source span.
+
+  Pins: only the earliest per destination was kept, while the rule needs ANY
+  pin between the fetch and the execution — so a repository that pinned an old
+  tree, discarded it, re-cloned and re-pinned (the fix recipe, applied twice)
+  was told it executes unpinned remote code. And a checkout-step fetch had no
+  position at all, so every pin in the job counted as "before anything ran from
+  it", including one applied to a tree the checkout then replaced.
+
+- **2026-08-14** — **A filtered `push` workflow's jobs are no longer dropped as
+  producers — that re-opened the lever this fact exists to close.** Rejecting
+  every branch- or path-filtered push removed the producer entirely, and when
+  it was the only one the fact went UNMEASURED: an unmeasured fact scores
+  nothing while a fail scores zero, so a repository whose required check really
+  could be bypassed came out ahead of one that configured protection properly.
+  The same "unmeasurable beats failing" lever, moved out of the API arm and
+  into the producer arm. It also failed the reverse direction — a genuine
+  always-running producer under `branches: ['**']` was vetoed and a correctly
+  gated repository went RED.
+
+  A workflow's ability to report on a pull request is three-valued now. A
+  `pull_request` workflow, a plain `push`, or a push over every branch CAN
+  report and may certify a check. A tags-only push provably CANNOT and is not a
+  producer. A push filtered to specific branches or paths — including
+  `paths-ignore:`, which was not considered at all — is UNKNOWN: its jobs still
+  count against the check, but can never be the evidence that one always
+  reports. Unknown is never treated as absent.
+
+- **2026-08-14** — **Smaller corrections found alongside the round-2 review.**
+  A rulesets response of an unexpected shape (an error object, a paginated
+  envelope) was skipped while the source was still marked READ, so it meant
+  "this branch requires nothing" — the classic arm treats an unexpected shape
+  as unread, and an asymmetry between two sources decides the verdict. A
+  constant condition written the long way (`if: ${{ 1 == 1 }}`) still read as
+  a bypass. `${{ github.repository }}` was matched ANYWHERE in a clone URL, so
+  a stranger's URL that merely embeds yours (`…/evil/${{ github.repository
+  }}-mirror`) was treated as a self-clone and silenced — a guard that
+  suppresses findings has to match exactly. An `actions/checkout` whose
+  `repository:` is computed at run time is now a coverage gap instead of a
+  finding naming a third party the scan never established. And the `needs:`
+  walk is memoized: a 12-level graph two jobs wide took 8,191 visits where 26
+  suffice.
+
+- **2026-08-14** — **A branch- or path-filtered `push` workflow can no longer
+  veto the real producer.** Only the tag-only shape was rejected, but
+  `on: push: branches: [main]` — the deploy-workflow shape, far commoner — does
+  not run on a pull request's branch either. A job named `test` in one was
+  accepted as an always-running producer of the required `test` context and
+  turned the real, gated producer's bypass green.
+
+- **2026-08-14** — **Unreadable shell that looks like an EXECUTION is recorded
+  again.** The relevance test matched command names only, so a bare path
+  (`tools/setup.py --msg=it's here` — an apostrophe `shlex` refuses) matched
+  nothing: a visible clone at a branch followed by that line produced zero
+  findings AND zero gaps, a silent false clean on precisely the chain this
+  vector exists to catch. A directly-invoked path is now recognised, while a
+  `jq` filter with an unbalanced quote still stays quiet, which is what keeps
+  the channel from becoming noise.
+
+- **2026-08-14** — **`working-directory:` and checkout steps are read from the
+  parsed document, not scraped off raw lines.** Three defects, one root cause —
+  a regex over the same bytes the parser had already read correctly:
+  `working-directory: .   # repo root` took the YAML comment into the value and
+  rendered a destination of `` `.   # repo root/tools` ``; a
+  `working-directory:` written inside a HEREDOC BODY — text the step generates,
+  not configuration of the step — was read as the step's own, so a finding
+  stated a destination lifted from generated content; and checkout steps were
+  tied to lines by counting `uses:` occurrences in order, so the same words
+  appearing in a heredoc shifted every later step and the evidence quoted a
+  line of shell script.
+
+- **2026-08-14** — **A pin now has to land between the fetch and the
+  execution.** A `git checkout <40-hex>` written BEFORE a fetch pinned the tree
+  as it stood, not the code the fetch then brought in — and it suppressed the
+  finding while stating the fetch "was pinned before anything ran from it".
+
+- **2026-08-14** — **Two fetches on one line no longer collapse into one that
+  names only the first.** Deduplication treats one line as one place to fix,
+  which is right, but the second chain was disappearing without a trace because
+  the finding identified itself by the whole LINE. It identifies itself by the
+  fetch — destination and ref — so both are named.
+
+- **2026-08-14** — **Expressions are opaque, consistently, and never rendered
+  as scanner internals.** One family of defects, all from `${{ }}` values:
+
+  - A computed `defaults.run.working-directory` was skipped rather than treated
+    as unknown, so the finding named a directory the data does not contain —
+    and an unreadable JOB default fell through to the WORKFLOW's, inverting
+    GitHub's precedence and placing the step somewhere it demonstrably did not
+    run. `defaults: {run: {working-directory: apps/${{ matrix.app }}}}` is a
+    mainstream monorepo shape. It gets the same opaque treatment a step's does.
+  - A step's `working-directory:` was resolved AGAINST the job default instead
+    of replacing it, putting a step under `app` into `app/app` and losing real
+    chains through the job's own default directory.
+  - Every expression collapsed to ONE shared token, so a clone into
+    `${{ env.DIR_A }}` and an execution from `${{ env.DIR_B }}` matched — a
+    chain the reader cannot find in their own YAML. Tokens are per expression
+    text now: the same expression twice is one place, two different ones never
+    are.
+  - The opaque root was keyed by step LINE, so two steps under the same
+    `apps/${{ matrix.app }}` were two different unknown places and produced no
+    finding and no gap, while the single-step spelling fired. Keyed by
+    expression text now — and splitting fetch and execution across steps is the
+    more idiomatic form, so this was the common case.
+  - The opaque sentinel — a NUL byte — reached `derived_note`, findings.json
+    and the rendered markdown, showing the reader a raw control character where
+    their directory belonged. Findings now render the text as the YAML wrote
+    it, with an artifact-level guard asserting no scanner-internal marker
+    survives into the report.
+
+- **2026-08-14** — **A deliberate non-report no longer reads as missing
+  coverage.** Pin suppressions were written into the same list as genuine
+  coverage gaps, which the report renders as *"Incomplete coverage — N run:
+  step(s) … were NOT scanned … This is **not** a clean result"* — so a
+  repository that did exactly what the fix recipe says (clone, pin to a full
+  commit id, run) got the report's loudest honesty warning, with a bullet
+  underneath explaining that the step had been read completely. The same
+  banner fired for `actions/checkout` with `ref: ${{ inputs.ref }}`, the
+  standard `workflow_dispatch` spelling, so most real repositories carried a
+  permanent false alarm on the one signal that has to stay credible.
+
+  There are three channels now. An unanchorable `run:` step keeps the existing
+  headline, which was written for it. A step that WAS read but carries a value
+  the YAML does not contain — a computed `working-directory:`, a `ref:` chosen
+  at run time, shell no parser accepts — gets its own sentence, still "not a
+  clean result" but described accurately. A suppression is informational and
+  never touches coverage at all.
+
+  Alongside it, the two ordinary pin spellings are recorded at last: a clone
+  whose own `--branch` is a full sha, and a checkout with a 40-hex `ref:`,
+  both returned silently while the catalog and the changelog claimed every
+  suppression was recorded.
+
+- **2026-08-14** — **P14.24 no longer reports an interpreter's inline script as
+  "the executed path".** `-e` / `-pe` / `-ne` / `-p` / `-n` put the program on
+  the command line exactly as `-c` does, and `-` reads it from stdin, but only
+  `-c` and `-m` were recognised — so the script TEXT became the path, and being
+  relative it satisfied the containment test and completed a chain. A real
+  public repository's three fires included "executes `chomp if eof` from it"
+  (the line was `perl -i -pe 'chomp if eof'`) and "executes `<<PY`" (the line
+  was `python3 - <<'PY'`). A `<<NAME` token is now rejected too, and a command
+  substitution is collapsed before the command is read: `FILE=$(ls tools/x.sql)`
+  had its assignment prefix stripped and the `ls` ARGUMENTS read as the
+  command, so a path `ls` merely listed was reported as executed — `ls` being
+  the code's own docstring example of something that is not execution.
+
+- **2026-08-14** — **`git remote add` makes the same self-clone judgment
+  `git clone` makes.** The two-step spelling registered any URL-shaped remote,
+  including the repository's own, so the identical URL was silent through the
+  clone arm and a finding through the fetch arm — two arms, opposite verdicts,
+  same repository.
+
+  Measured across five real checkouts (143 workflow files) before and after:
+  P14.24 fires 3 → 1, and the one that remains is the true positive (a clone at
+  a version variable followed by `./configure`). Coverage gaps 14 → 13.
+
+- **2026-08-14** — **A `404 Branch not protected` is an answer, not an unread
+  source.** GitHub returns it from the classic protection endpoint precisely
+  when classic protection is NOT configured — the normal state of every
+  repository that uses rulesets, which is the population
+  `sec.required-checks.skippable` was built for. Reading it as a failure made
+  the fact unmeasurable for all of them, and unmeasurable scores *better* than
+  failing: a repository with a genuinely bypassable required check came out
+  ~11 points ahead of the same repository with classic protection configured
+  empty. The 404 now means "nothing required here", scoped to that one endpoint
+  — a 404 from the repository or rulesets endpoint is still a missing
+  repository or a wrong path, and the fetcher's requested paths stay asserted
+  literally in the suite so a typo cannot hide behind it.
+
+- **2026-08-14** — **A partial read now says which source it could not read.**
+  When classic protection 403s — the ordinary case for anyone without admin on
+  the repository — the rulesets answer is used, and it was rendered as
+  complete: "all 1 required check(s) …". A check configured only in classic is
+  invisible to that read, so the count is a floor rather than a total, and the
+  evidence now says so.
+
+
+- **2026-08-14** — **`sec.required-checks.skippable` no longer reports a green
+  over checks it never examined.** Five ways it did: `always()` was matched as a
+  SUBSTRING, so `always() && <fork guard>` — the bypass this fact exists to
+  catch, with two tokens prepended — read as never-skipping; `success() ||
+  failure()`, the third spelling of the verdict-job condition, was not
+  recognised and failed a job that always reports; a required context produced
+  by no job here was excluded from judgment but still counted toward a sentence
+  claiming "every required check is produced by a job that always runs", which
+  when ALL of them were external made the row a claim about an empty set; a
+  `needs:` naming a job that is not in the file (and a `needs:` cycle) resolved
+  to "always runs" instead of "unknown". Each context now resolves three ways —
+  gated, bypassable, or NOT JUDGED — the pass sentence states how many of the required checks it
+  actually traced, and a scan that traced none of them is unmeasured rather
+  than green.
+
+- **2026-08-14** — **A malformed `needs:` graph no longer takes exponential
+  time to walk.** The unknown-dependency branch called the recursion twice per
+  level — once to test the result's type, once to use it — so the work doubled
+  with every link: a linear chain ending in a typo'd job name took 3.4 seconds
+  at depth 22 and about a quarter of an hour by depth 30. That is precisely the
+  hang the cycle guard's own docstring promises cannot happen. Each dependency
+  is walked once now.
+
+- **2026-08-14** — **P14.24 covers `actions/checkout` of another repository.**
+  It is how most workflows fetch a second repository, and at a branch or tag it
+  is the identical trust model — but the detector read `run:` shell only, so
+  the most common spelling was the one it could not see. A checkout naming
+  another `repository:` at a mutable `ref:`, with something in a later step of
+  the same job executing out of its `path:`, now reports. A full 40-hex `ref:`
+  is silent, your own repository is silent, and a `ref:` or `path:` computed at
+  run time is recorded as a coverage gap rather than guessed at.
+
+- **2026-08-14** — **A `working-directory:` computed at run time no longer
+  blinds the step it is on.** `apps/${{ matrix.app }}` is extremely common;
+  skipping those steps lost every chain inside them. Such a directory is now
+  opaque instead: a fetch and an execution both inside it still connect to each
+  other, and nothing inside it can match a directory anywhere else. Unreadable
+  shell is likewise only recorded as a coverage gap when the text that could
+  not be parsed mentions a fetch or an execution — reporting every `jq` filter
+  with an unbalanced quote produced about eight notes per repository.
+
+- **2026-08-14** — **P14.24 stops claiming executions pip does not perform, and
+  stops going quiet without saying so.** Five edges:
+
+  - **`pip install` flag VALUES were read as executed paths.**
+    `pip install --target tools/deps requests` reported "executes
+    `tools/deps`", and `-r tools/requirements.txt` reported executing a file
+    pip only reads. Options that take a separate value are skipped now;
+    `pip install ./tools` and `-e ./tools` still report.
+  - **A remote added by name is a remote.** `git remote add upstream <url>`
+    followed by `git fetch upstream` is the same third-party fetch spelled in
+    two steps, and two characters of indirection made the arm blind to it —
+    while the catalog promised any `git`-spelled mutable fetch-and-run was
+    visible.
+  - **A pin has to come before the code runs.** Pinning is a claim about what
+    executed, but any full-40-hex pin anywhere in the job suppressed the
+    finding, so a `git checkout <sha>` written AFTER the execution hid a real
+    chain. Pins now carry their position, and every suppression is recorded.
+  - **A clone with no visible destination** is still not reported — the
+    destination is unknowable — but it is now recorded, so a job that could not
+    be read is distinguishable from a job with nothing in it.
+  - **Shell that cannot be parsed** (an unbalanced quote) abandons the rest of
+    that step and is recorded. It used to contribute nothing silently, and an
+    unreadable `cd` left the working directory stale, so every path resolved
+    after it in the step was wrong.
+
+- **2026-08-14** — **`sec.required-checks.skippable` stops passing on partial
+  evidence, and stops reding conditions that cannot be false.** Four cases
+  where the outcome said more than the scan had established:
+
+  - A **pass now requires every required check to have been traced.** It was
+    returned as soon as ONE was gated, so the ordinary shape of a mature
+    repository — a dozen required contexts, eleven of them external app checks
+    — earned a machine `pass` that counted toward `passed` and never reached
+    `unmeasured`, which meant no coverage caveat fired either.
+  - A job with **`needs:` and no condition of its own is skippable**, not
+    always-running: it is skipped whenever something it needs fails, which is
+    exactly the state GitHub reports as a passed check. The producer has to
+    carry the never-skip condition itself, which is what the fix recipe says.
+    `needs:` written as a scalar string is read now too.
+  - **Conditions that cannot be false are no longer reported as bypasses.**
+    `if: true`, `if: ${{ always() }}` (the spelling GitHub's own documentation
+    shows), `success()||failure()` written without spaces, and
+    `success() || failure() || cancelled()` all failed — a false RED against
+    repositories that had implemented the recommended fix correctly.
+    `success()` counts as never-skipping only for a job with no `needs:`,
+    since that is the only time it cannot be false.
+  - A **demonstrated bypass now outranks an unreadable producer**: a real fail
+    was being downgraded to "not judged" by a second producer whose skip walk
+    had no answer.
+
+- **2026-08-14** — **P14.24 no longer reports a repository for cloning
+  ITSELF.** On a 2,920-workflow corpus this was 3 of the detector's 15 fires —
+  all one repository's release workflows, cloning their own repo at the branch
+  they release from. No third party is involved, and the advice the finding
+  carries (pin to a full commit id) is unactionable for a workflow that must
+  run at the branch head. The `git fetch` arm already refused the repo's own
+  history; the `clone` arm now does too, recognising `${{ github.repository }}`,
+  a literal `github.com/<owner>/<repo>` matching the checkout's `origin`
+  remote, and the authenticated form that carries a token in the URL's
+  userinfo. A tree with no `.git`
+  cannot resolve `origin`, so the literal form reports there as before.
+
+- **2026-08-14** — **P14.24 follows `working-directory:`.** It was read
+  nowhere — not on the step, not in `defaults.run` — so a clone written under
+  `working-directory: vendor` was placed at the workspace root, and a later
+  `python3 tools/build.py` reading the repository's OWN file was reported as
+  executing the fetched tree. That is a finding asserting a fact that is not in
+  the data, which this scanner may never do. The mirror case, a
+  `working-directory:` on the executing step, was a silent miss. Step, job and
+  workflow levels now resolve in GitHub's order; a value computed at run time
+  is recorded as a coverage gap instead of being guessed at.
+
+- **2026-08-14** — **Branch protection read from only ONE of its two sources
+  no longer renders as a complete, measured pass.** A repository can require
+  checks through rulesets or through classic branch protection, so both are
+  read and unioned — but the completeness guard sat inside the classic
+  endpoint's `except`, leaving three ways for an unread source to render as a
+  clean one: rulesets answering while classic failed for a non-403 reason (rate
+  limit, timeout, 5xx) returned a PARTIAL set as complete; rulesets failing
+  while classic answered lost the rulesets error entirely; and rulesets
+  throwing while classic answered EMPTY returned "requires no status check",
+  which scores as a pass — a claim about a source never read. All three
+  rendered a green that counted toward `passed` and stayed out of
+  `unmeasured`, so a consumer blended them as clean AND fully measured. The
+  guard is now per-source and outside both calls; only the ordinary admin-only
+  403, alongside a source that actually found something, still measures.
+
+- **2026-08-14** — **A here-string no longer silences the rest of a step.**
+  `<<<` carries its value on the line and opens no body, but the here-doc
+  opener pattern retried at the second `<` and matched it — so everything after
+  a `grep -q x <<< foo` was treated as here-doc body and never scanned, losing
+  real findings with no trace. A here-doc named inside a quoted string
+  (`echo "use << EOF for heredocs"`) did the same. The operator is now required
+  to be shell syntax rather than text, using the quoting split this file
+  already computes once, while the delimiter may still be quoted — `<<'EOF'`
+  is the idiom. And when a here-doc really is open at the end of a step, that
+  step is recorded in the scan's dropped-matches list, so a step that stopped
+  being read is no longer indistinguishable from a step with nothing in it.
+
+- **2026-08-14** — **A job in a workflow that cannot run on a pull request is
+  no longer accepted as the thing gating one.** Producers are matched by
+  display name across every workflow, with no check that the workflow runs on
+  pull requests at all — so a `test` job in a tag-only release workflow (and
+  the same shape under `workflow_dispatch:` / `workflow_call:`) was read as an
+  always-running producer and vetoed the real, conditional one, turning a fail
+  into a pass. Only `pull_request` / `pull_request_target` workflows, and
+  `push` workflows not restricted to tags, can produce a pull request's checks.
+
+- **2026-08-14** — **Path- and branch-filtered workflows are no longer reported
+  as a bypass — that rule was backwards.** A workflow those filters skip never
+  reports its check, so the required check stays PENDING and the pull request
+  is BLOCKED; only a skipped JOB reports Success. Failing the filtered repo red
+  a repository whose merges were already blocked, while the shape that really
+  is green-without-running — GitHub's recommended always-succeeding stub job
+  with the same name — passed. `pull_request.branches` also filters the base
+  branch, the branch whose protection was just read, so every pull request this
+  fact gates is inside that filter by construction. The clause is gone.
+
+- **2026-08-14** — **A verdict job can no longer alibi the suite job it was
+  added to cover for.** `name (value)` is a MATRIX expansion, but the fact
+  offered that prefix match to every job — so an always-running job named
+  `test` was read as a producer of the required context `test (self-hosted)`,
+  and its always-runs answer covered for the suite job that really reports that
+  context and really can skip. That is this repository's own CI shape, which
+  means the bypass was hiding behind the fix for the bypass. The expansion
+  match now applies only to a job that carries `strategy.matrix`, and only for
+  the COMBINATIONS that matrix can actually run — joined in the order its axes
+  are declared, with `exclude:` honoured. A job named `test` running over
+  `3.11`/`3.12` is not a producer of `test (self-hosted)`, and neither is one
+  over `os: [self-hosted, ubuntu]` crossed with a second axis: a flattened
+  value set said yes to any tokens appearing anywhere, including a single
+  value from a two-axis matrix, a reordered pair, and an excluded combination.
+  A matrix this scan cannot enumerate (an expression, `fromJSON`, a nested
+  shape, or an `include:` block, which can add combinations and rename axes)
+  produces no match at all, which leaves the context disclosed as not judged
+  rather than silently gated.
+
+- **2026-08-14** — **A workflow the scan could not read no longer costs
+  `sec.required-checks.skippable` its API round-trips.** An unscannable
+  workflow forces the fact to unmeasured — rightly, since the file nobody could
+  read may be the one holding an always-running producer — but the fact was
+  computed first and the answer thrown away, spending two or three `gh api`
+  calls to reach a verdict nothing would read.
+
+- **2026-08-14** — **Branch protection that could not be read in full is no
+  longer reported as "requires no status check".** The rulesets endpoint is
+  readable with repo read access; classic branch protection is admin-only. For
+  the reader this fact is written for — auditing a repository they do not
+  administer — the ordinary result is an empty rulesets response plus a 403,
+  and that pair was returning "no required checks", which the fact scored as a
+  pass. A repository can require checks through either mechanism, so an empty
+  answer from one and no answer from the other is unread, not unprotected: the
+  fact is now unmeasured, with the admin-only endpoint named as the reason.
+
+- **2026-08-14** — **Evidence that describes what was actually read.**
+  `sec.fork-approval.effective` printed `first_time_contributors`' sentence for
+  `all_external_contributors` too, understating the reader's own setting and
+  stating something false about what GitHub gates; each tier now has its own
+  sentence. `sec.required-checks.skippable` quoted Python's `True` back at a
+  file that says `if: true`. Both facts' unmeasured evidence told the operator
+  to "pass --repo owner/name" — a flag they never type, since the skill's own
+  flow derives it — and named the wrong cause: the reachable remedy is
+  `gh auth login`, and it now says so. The census document gains the fix recipe
+  for each new fact (the verdict job; the repository Actions setting, which no
+  YAML edit can close), a source note for the skipped-required-check behaviour
+  the whole fact rests on, and the caveat that the score's denominator is
+  token-dependent and therefore not comparable across differently
+  authenticated scans. SKILL.md and `run.py` no longer describe `--repo` as
+  being for the dormancy lookup alone, or a missing token as costing one check.
+
+- **2026-08-14** — **The skill description is back under the 1024-character
+  cap.** Naming both of P14.24's shapes in the vector enumeration pushed it to
+  1037 — over the limit, so the loader truncates it, and what gets truncated is
+  the tail: the "Do NOT trigger for …" clauses that keep ci-secure from
+  answering ci-speedup's and ci-score's questions. Trimmed to 1019, and a
+  repo-level guard (`tests/test_skill_description_budget.py`) now measures every
+  shipped skill's description so the next enumeration cannot cross it silently.
+
+- **2026-08-14** — **P14.24's catalog entry states the shapes it does NOT
+  catch.** The entry promised its stopping points were "stated rather than
+  implied" and then named two. The shell arm reads `git clone` / `git fetch`
+  only, so `gh repo clone`, `svn`, `pip install git+…@branch`, a submodule
+  `--remote` update, a fetched tarball, a rename between fetch and execution, a
+  build driver rather than an interpreter, and a versioned interpreter are all
+  the same trust model and all unreported. All now listed in the entry, so a
+  clean P14.24 is not read as a guarantee. (Self-clones were also listed here
+  at the time; they stopped being reported at all later the same day — see the
+  self-clone entry above, which is the final behaviour.)
+  The entry's TL;DR opening also names what is checked again, since the report's
+  "what each vector checks" appendix quotes that first sentence verbatim.
+
+- **2026-08-14** — **P14.24 no longer reads a step's working directory into the
+  step after it, and no longer forgets it at a blank line.** Step boundaries
+  were inferred from line adjacency, which is wrong in both directions: two
+  one-line `- run:` steps are adjacent lines in different steps, so a `cd` into
+  a freshly cloned directory leaked forward and the scan reported an execution
+  that never happened in that tree; and a blank line inside a single `run: |`
+  block broke adjacency mid-step, so a real fetch-then-execute chain was lost.
+  Boundaries now come from where each `run:` scalar begins. Two more shell
+  readings were wrong alongside it: a HEREDOC body (`cat <<'EOF' > install.sh`)
+  was read as commands the step runs, so documentation could be reported as a
+  live chain; and pairing compared line numbers only, so
+  `python3 tools/setup.py && git clone … tools` reported a script that ran
+  BEFORE the clone as having come out of it.
+
+- **2026-08-14** — **P14.24 no longer misreads a clone URL written as a `${{ }}`
+  expression.** The runner substitutes an expression before the shell sees it,
+  so it is one word; the scanner split it on its spaces, every positional
+  argument after it shifted, and the destination was read out of the
+  expression's insides. That is worse than an unknowable destination: the
+  detector correlated against a directory that does not exist, so the chain
+  went unreported AND a correct 40-hex pin on the real directory would not have
+  matched it either.
+
+- **2026-08-14** — **P14.24's mutable-fetch arm no longer goes blind on a
+  `git clone --recurse-submodules`.** That option takes its value attached
+  (`=<pathspec>`) or not at all, but the clone parser treated it as taking a
+  separate argument, so it swallowed the next token and shifted the URL, the
+  destination and the ref by one. The detector then correlated against a
+  directory that never existed and reported nothing — a clone at a mutable ref
+  followed by executing a file out of it went unreported whenever that flag was
+  present. Only options that genuinely take a separate value are consumed now.
 
 - **2026-08-12** — **The `sec.checkout.credentials-scoped` fact no longer fails
   workflows triggered only by `fork`/`watch`.** Those events fire when someone
@@ -26,6 +864,62 @@ entries are dated (UTC). Format loosely follows
   other checks use is unchanged.
 
 ### Added
+
+- **2026-08-14** — **A scored config fact for required status checks a job can
+  skip.** GitHub counts a SKIPPED required check as a pass, so a required check
+  produced only by a job carrying an `if:` condition is not a gate: a pull
+  request that does not satisfy the condition merges with the check green and
+  the suite never run — a bypass this repository shipped and had to close. The
+  new `sec.required-checks.skippable` fact reads the branch's required contexts
+  over the API, maps each to the workflow jobs that could report it by display
+  name (matrix expansions included), and fails when every producer of a
+  required context can skip — through its own condition or through a `needs:`
+  chain that skips. The pass shape, and the fix recipe, is the always-running
+  verdict job that `needs:` the conditional suites and asserts their results;
+  `always()` / `!cancelled()` conditions are recognised as never-skipping.
+  Required contexts no workflow job produces (external app checks) are named in
+  the evidence, never failed — the scan cannot read them. Evidence names the
+  required context, the workflow and job, and the condition that skips it.
+
+- **2026-08-14** — **A scored config fact for fork-PR approval that gates
+  nobody real.** `sec.fork-approval.effective` reads the repository's fork-PR
+  workflow approval policy and fails only its weakest setting — approval
+  required just from accounts NEW TO GITHUB — because any outside account old
+  enough clears it and starts CI unapproved. Requiring approval from first-time
+  contributors to this repository (GitHub's default) is a legitimate trust
+  judgment and passes, as does requiring it from every outside account. The
+  fact is hygiene, not an exploit chain, and says so: fork runs still carry no
+  secrets and a read-only token, so an unapproved run buys compute under the
+  repository's name and quiet iteration against its CI surface, not a path to
+  secrets. The policy enum is the one GitHub documents and a live repository
+  returns; a value outside it is disclosed as unrecognised rather than judged.
+
+- **2026-08-14** — **Both new facts are token-gated and never silently green.**
+  They read the GitHub API rather than workflow YAML, so with no repository or
+  no token they report as UNMEASURED with the reason stated — the same contract
+  the impostor-SHA vector keeps. An unmeasured fact scores nothing and stays in
+  the applicable count as a named coverage gap, so an offline scan reads as a
+  smaller measurement rather than a cleaner repository. The scored basis grows
+  from six facts to eight for a scan that can reach the API.
+
+- **2026-08-14** — **P14.24 now catches remote code fetched with git, not just
+  piped into a shell.** The vector was written around `curl … | bash`, so a
+  workflow that cloned or fetched somebody else's repository at a BRANCH, TAG,
+  `HEAD`, or a short commit id — and then ran a file out of the tree it
+  landed in — passed the scan clean. It is the same trust model in different
+  clothes: a branch or tag is designed to move, so whoever can push to that
+  repository chooses what the next CI run executes, with nothing in your own
+  repo changing. The entry keeps its id, its severity, and its place among the
+  ten; its detector now has two arms, and the piped-installer arm is the code
+  that was already shipping, unchanged. A fetch pinned to a full 40-character
+  commit is immutable and is deliberately NOT a finding — that is the trust
+  model this catalog recommends for action pins — while an abbreviated sha,
+  which git re-resolves at fetch time, is. The pairing has to be visible
+  inside one job (destination directory ↔ executed path, `cd` followed), so a
+  clone whose destination the YAML does not show, and an execution in another
+  job, are not reported rather than guessed at. Execution shapes covered:
+  interpreters running a fetched file, `source`, `pip install <fetched-dir>`,
+  and a fetched path invoked directly.
 
 - **2026-08-10** — **A repo guard for installer-shaped literals.** Two shapes
   now fail the build if they appear in tracked text: a fetch of a literal

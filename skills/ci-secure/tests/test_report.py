@@ -180,7 +180,7 @@ def test_finding_order_is_the_action_plan_no_duplicate_summary_sections() -> Non
     assert "Quick wins" not in md and "Bigger projects" not in md
     assert "| **Risk** |" not in md and "| Risk |" not in md
     # the curated action verb survives, inside the finding's Fix block
-    assert "**Do this:** Download + checksum-verify remote scripts" in md
+    assert "**Do this:** Pin remote code to a full commit SHA" in md
     # HIGH finding renders before the MEDIUM one — severity order, not input
     # order — and that order is the plan.
     assert md.index("## 🟥 Finding 1:") < md.index("## 🟧 Finding 2:")
@@ -2218,3 +2218,90 @@ def test_skill_md_coverage_recipe_reads_the_provenance_row() -> None:
     assert lines.index(row) < banner, "Coverage is above the banner, not under it"
     assert "PARTIAL" in row and "b.yml" not in row
     assert any("Incomplete coverage" in ln and "b.yml" in md for ln in lines)
+
+
+def test_the_coverage_note_headline_does_not_claim_the_step_was_unscanned():
+    """The whole point of splitting the channels: a step that WAS read but
+    carries an unknowable value must not be described with the sentence
+    written for steps that were never scanned. A mutant restoring that wording
+    left the suite green, and the report layer had no test at all."""
+    banner = report._coverage_gap_banner(
+        scan_incomplete=[],
+        dropped_matches=[],
+        coverage_notes=[{"workflow_file": "ci.yml",
+                         "reason": "a `ref:` computed at run time"}],
+    )
+    assert "Incomplete coverage" in banner
+    assert "NOT scanned" not in banner, banner
+    assert "were read" in banner, banner
+
+
+def test_coverage_notes_break_the_completeness_flag():
+    """A note is a real gap, so the header cannot say the scan was complete
+    while the banner warns underneath it. A mutant dropping notes from the
+    completeness test left header and banner contradicting each other, green."""
+    assert report._coverage_is_complete([], [], []) is True
+    assert report._coverage_is_complete(
+        [], [], [{"workflow_file": "ci.yml", "reason": "x"}]) is False
+
+
+def test_a_pin_suppression_alone_leaves_the_report_complete():
+    """And the property the split exists for: a repository that pinned exactly
+    as the fix recipe says gets no banner and no incomplete-coverage flag."""
+    assert report._coverage_is_complete([], [], []) is True
+    assert report._coverage_gap_banner([], [], []) == ""
+
+
+# ---------------------------------------------------------------------------
+# The renderer half of the shared neutralization rule
+# ---------------------------------------------------------------------------
+# `flatten_scanned` moved into config.py so the stdlib-only CI gate and this
+# renderer neutralize scanned strings identically — "two copies of an escaping
+# rule eventually differ, and the surface with the weaker copy is the one an
+# attacker aims at." The gate's half is covered by tests/test_ci_secure_gate.py.
+# This half had no coverage at all, so re-inlining a WEAKER rule here — the
+# precise drift the refactor exists to prevent — was green across the whole
+# repository suite.
+
+def test_the_renderer_neutralizes_scanned_strings_via_the_shared_rule() -> None:
+    """Newline, backtick and pipe all lose their structural meaning."""
+    hostile = "a`b|c\nd  e"
+    flat = report._flatten_scanned(hostile)
+
+    assert "\n" not in flat, "a newline lets a scanned name start a row of its own"
+    assert "`" not in flat, "a backtick closes the inline code span this lands in"
+    assert "|" not in flat.replace("\\|", ""), "an unescaped pipe forges a table column"
+    assert flat == "a'b\\|c d e"
+
+
+def test_the_renderer_does_not_keep_its_own_copy_of_the_rule() -> None:
+    """It must DELEGATE, so the two surfaces cannot drift apart.
+
+    Asserting on behaviour alone would let a re-inlined identical copy pass and
+    then rot independently. This asserts the single definition itself.
+    """
+    import inspect
+
+    sys.path.insert(0, _SCRIPTS)
+    try:
+        import config  # noqa: PLC0415
+    finally:
+        try:
+            sys.path.remove(_SCRIPTS)
+        except ValueError:
+            pass
+
+    for probe in ("x`y|z\n w", "", "  ", "a\tb", None, 12, "ünïcode`|"):
+        assert report._flatten_scanned(probe) == config.flatten_scanned(probe), (
+            f"the renderer and the gate disagree about {probe!r}; the rule has "
+            "been copied instead of shared")
+
+    # Either it IS the shared rule, or its body calls it. Asserting the
+    # absence of `replace` was both evadable (a re-inline via `translate` or
+    # `re.sub` passed) and prone to a false red (a direct alias makes
+    # `getsource` return config's own body, which contains `replace`).
+    if report._flatten_scanned is not config.flatten_scanned:
+        body = inspect.getsource(report._flatten_scanned)
+        assert "_flatten_rule" in body or "config.flatten_scanned" in body, (
+            "report._flatten_scanned has re-inlined the escaping rule instead "
+            f"of delegating to config.flatten_scanned:\n{body}")

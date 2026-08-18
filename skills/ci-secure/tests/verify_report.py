@@ -857,6 +857,33 @@ def _cell_text(value: object) -> str:
     return " ".join(str(value or "").split()).replace("|", "\\|")
 
 
+def check_no_scanner_internal_markers(report: str) -> Check:
+    """No scanner-internal stand-in survives into the rendered report.
+
+    The detector rewrites two things it cannot resolve into placeholders — an
+    opaque directory (a NUL-prefixed `wd:` key) and an expression token
+    (`$EXPRn`) — and both have escaped into `derived_note`, findings.json and
+    the markdown at different times. A reader shown a raw control character
+    where their own directory belongs cannot check the finding at all, and this
+    verifier passed on a report that was leaking. Cheap to assert, and it
+    catches any future marker that forgets to be rendered back.
+    """
+    name = "no scanner-internal marker reaches the report"
+    banned = [
+        ("\x00", "the opaque-directory sentinel (a NUL byte)"),
+        ("\\u0000", "an escaped NUL"),
+        ("\x00wd:", "the opaque-directory prefix"),
+        ("$SUBST", "the command-substitution stand-in"),
+        ("$SELF_REPO", "the self-repository stand-in"),
+    ]
+    hits = [why for token, why in banned if token in report]
+    if re.search(r"\$EXPR\d", report):
+        hits.append("an expression stand-in (`$EXPRn`)")
+    if hits:
+        return Check(name, False, "; ".join(hits))
+    return Check(name, True, "clean")
+
+
 def check_no_rendered_security_score(report: str) -> Check:
     """The report renders NO aggregate score — no number, no ratio, no /100.
 
@@ -947,6 +974,50 @@ _ALLOWED_H2 = (
 )
 
 
+def check_source_fences_quote_only_source(report: str) -> Check:
+    """A ```yaml evidence fence must contain nothing but numbered source lines.
+
+    report.py reserves the fenced, line-numbered block for text quoted
+    verbatim from the workflow file. A sentence the scanner assembled that
+    lands in there is dressed as source, and a reader who opens the file
+    looking for it never finds it — the exact defect `_derived_evidence_block`
+    was introduced to fix, and nothing enforced it until a later change put
+    scanner prose back inside a fence.
+    """
+    name = "```yaml evidence fences quote only numbered source lines"
+    # A blank quoted line renders as a bare `NN:` with nothing after it, so
+    # the space is optional. Requiring it failed the self-check on any report
+    # quoting a workflow with a blank line in the excerpt — which is most.
+    gutter = re.compile(r"\d+:(?: |$)")
+    bad: list[str] = []
+    fence: list[str] | None = None
+    for raw in report.splitlines():
+        line = raw.strip()
+        if fence is None:
+            if line == "```yaml":
+                fence = []
+            continue
+        if line == "```":
+            # An EVIDENCE fence is one where ANY line carries the
+            # line-number gutter. The catalog's fix recipes are also ```yaml
+            # and are legitimately gutter-free, so they are not policed. Keying
+            # off the FIRST line instead would let a fence whose excerpt opens
+            # on a blank source line smuggle prose through unchecked.
+            if any(gutter.match(ln) for ln in fence):
+                bad += [ln[:110] for ln in fence if not gutter.match(ln)]
+            fence = None
+            continue
+        if line:
+            fence.append(line)
+    if bad:
+        return Check(
+            name, False,
+            f"{len(bad)} non-source line(s) inside a yaml evidence fence — "
+            f"first: {bad[0]!r}",
+        )
+    return Check(name, True, "every fenced evidence line carries a gutter")
+
+
 def check_no_forged_headings(report: str) -> Check:
     """Every `## ` heading (outside code fences) is one the renderer emits.
 
@@ -1004,8 +1075,10 @@ def run_checks(
         check_banner_present_and_consistent(report),
         check_vector_status_table_covers_the_ten(report),
         check_no_rendered_security_score(report),
+        check_no_scanner_internal_markers(report),
         check_config_hygiene_facts_rendered(report, findings_path),
         check_no_forged_headings(report),
+        check_source_fences_quote_only_source(report),
     ]
 
 
