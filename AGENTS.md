@@ -42,14 +42,16 @@ pyproject.toml            pytest config; testpaths span the skill + maintainers/
 From the repo root:
 
 ```bash
+pip install -e ".[dev]"    # pytest + PyYAML; the suite needs both
 python3 -m pytest -v
 ```
 
 This runs every suite — the root `pyproject.toml` wires the paths so one command
 finds tests under `tests/`, `skills/ci-speedup/tests/`, and
 `maintainers/ci-speedup/tests/`. **CI runs the identical command**, so green on
-your machine means green in CI. Enable the local pre-commit hook to run the same
-suite before each commit:
+your machine means green in CI — as long as the dev dependencies are installed.
+Without PyYAML, pytest aborts at collection with `INTERNALERROR` and runs nothing.
+Enable the local pre-commit hook to run the same suite before each commit:
 
 ```bash
 git config core.hooksPath .githooks

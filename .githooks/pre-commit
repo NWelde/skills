@@ -2,16 +2,43 @@
 
 echo "Running tests..."
 
-cd "$(git rev-parse --show-toplevel)"
+# Guarded: if this cd ever fails, the hook must NOT go on to run pytest from
+# whatever directory it happens to be in.
+cd "$(git rev-parse --show-toplevel)" || exit 1
 
 # Run the SAME full suite as CI (pytest -v over every testpath in
-# pyproject.toml), not just the root tests/. Uses pipx/uvx when available so it
+# pyproject.toml), not just the root tests/. Uses uvx/pipx when available so it
 # works on systems with an externally managed Python.
-if command -v pipx &> /dev/null; then
-    pipx run pytest -v
-elif command -v uvx &> /dev/null; then
-    uvx pytest -v
+#
+# Every arm MUST provision PyYAML alongside pytest (issue #31). The uvx/pipx arms
+# build a throwaway environment containing pytest and NOTHING else; without yaml,
+# `skills/ci-score/scripts/collect_config.py` — exec'd at module scope by several
+# ci-score tests — hits its `except ImportError: sys.exit(1)`, and a SystemExit
+# during pytest's COLLECTION phase blows up the whole run with INTERNALERROR. The
+# symptom is a wall of traceback on a clean tree with zero tests having run.
+# `tests/test_pre_commit_hook.py` enforces this invariant.
+#
+# uvx is tried FIRST because it is the arm verified end-to-end (full suite, same
+# pass/skip counts as CI). The pipx arm is correct as written — `run` takes
+# `--with`, NOT the `--preinstall` that belongs to `pipx install` — but the
+# minimum pipx version carrying `run --with` is unconfirmed. Rather than trust
+# that unconditionally, probe for the flag at runtime: a contributor on an old
+# pipx (and no uvx) would otherwise get an opaque argument-parsing error and a
+# fully blocked commit with zero tests run. If the probe fails, fall through to
+# the python3 arm below, which has its own preflight and can still succeed.
+if command -v uvx &> /dev/null; then
+    uvx --with pyyaml pytest -v
+elif command -v pipx &> /dev/null && pipx run --help 2>/dev/null | grep -q -- '--with'; then
+    pipx run --with pyyaml pytest -v
 else
+    # This arm uses whatever python3 is on PATH, so it can't provision anything.
+    # Fail with a readable one-liner instead of the INTERNALERROR wall.
+    if ! python3 -c "import yaml" &> /dev/null; then
+        echo ""
+        echo "ERROR: PyYAML is required to run the test suite, and python3 can't import it."
+        echo "       Install it with:  pip install -e \".[dev]\"   (or: pip install pytest pyyaml)"
+        exit 1
+    fi
     python3 -m pytest -v
 fi
 

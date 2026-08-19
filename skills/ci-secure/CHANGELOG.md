@@ -11,6 +11,59 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **2026-08-19** — **A deferred file that cannot be read is now a stop, not an
+  improvisation.** SKILL.md defers load-bearing procedure to reference files in
+  several places, each phrased as "read this before acting". While that
+  procedure was inline, an unreadable reference was not a state the contract
+  could reach; behind a pointer it is — a partial install, a packaging slip, a
+  truncated copy — and nothing said what to do about it, so the agent would
+  improvise the runbook the pointer exists to protect. A NEVER rule now says to
+  stop and name the file. It was paid for WITHOUT moving another rule behind a
+  link: two of the NEVER bullets were reflowed to reclaim exactly the two lines
+  it needed, so the body stays at 499 of 500 and no rule left the always-loaded
+  surface to make room for the rule about deferral failing.
+
+- **2026-08-19** — **Three smaller review findings, and a misinstruction in
+  the impostor-status rule.** The gate runbook still said to install "as one
+  setup PR" while the NEVER rules forbid opening one unless asked; on main both
+  sentences sat in one file where a reader met them together, so the trim is
+  what left the permissive one alone in a reference. It now defers to the NEVER
+  rules explicitly. The link and heading guards read a `#` shell comment inside
+  a fenced example as a markdown heading, so a renamed section could resolve
+  against an example's comment; they now skip fenced blocks, and a red-proof
+  fixture pins it. The "still has substance" floor was one global minimum of 20
+  non-blank lines, which protected the large references and almost nothing else
+  — `troubleshooting.md` has 26, so most of its failure-mode table could be
+  deleted with the suite green; each reference now carries its own floor and
+  section count, and a second guard fails if a required reference has no floor
+  of its own. Finally, three places told the agent to read the impostor word as
+  the banner's "last token", but one of the four states is the two-word `not
+  recorded`, whose last token reads as its exact opposite; all three now say the
+  word ENDS the line and may be two words.
+
+- **2026-08-19** — **Four holes the trim opened or left open, each pinned by a
+  guard that was proven to fail first.** (1) The always-loaded body named
+  `scan_incomplete` as the only coverage key while the engine computes
+  completeness from three arrays, so an agent reading the body alone could call
+  a degraded run complete — the exact rule the coverage contract forbids, and
+  the exact bug this branch had just fixed in the deferred file. It now names
+  all three, plus `evidence_kind`, and a guard reads the channel list off
+  `report._coverage_is_complete` so a fourth channel fails the build until the
+  contract mentions it. (2) `REPO` was expanded in Phase 2 while its only
+  assignment had moved into `references/troubleshooting.md`; an agent that did
+  not open that file scanned with no `--repo` and silently degraded the four
+  gh-gated checks to skipped. It is bound in the body again, and a guard fails
+  on any shell variable the command blocks expand without binding. (3) The
+  `## The self-proof` section — the 81 lines this branch narrates rescuing —
+  could be deleted, table-of-contents line and all, with the suite green, while
+  SKILL.md still branched on three outcomes whose mechanics no longer existed;
+  the three branch labels are now bound to the runbook that explains them.
+  (4) The grep-recipe check started from its needle list, so a recipe matching
+  nothing in any report was exercised by nothing; a closure assertion now
+  requires every published recipe to be covered.
+
 ### Added
 
 - **2026-08-18** — **The behavioral eval cases are executed, and a session that
@@ -99,6 +152,33 @@ entries are dated (UTC). Format loosely follows
   both export — would have pointed the probe at another repository, found no
   workflows there, reported no gap, and silently restored the "complete
   coverage" claim this fix exists to remove.
+
+### Changed
+
+- **2026-08-17** — **SKILL.md is about a third shorter, with the detail moved
+  into reference files.** Anthropic's skill-authoring guidance puts the ceiling
+  for a SKILL.md body at 500 lines, and ci-secure's had grown to 854. The
+  runbook for adding ci-secure as a CI gate, the terminal summary's provenance
+  table, the findings-JSON shape, and the troubleshooting table now live in
+  `references/ci-gate.md`, `references/terminal-summary.md`,
+  `references/scan-output.md` and `references/troubleshooting.md`, each linked
+  from the point in SKILL.md that used to carry them. The scan-and-report
+  contract keeps every rule it had: the phase sequence, every close-question
+  option string and its ordering, the honesty invariants and all eight NEVER
+  rules are still in SKILL.md, re-wrapped and tightened but unchanged in what
+  they oblige — the incident anecdotes that motivated some of them were cut.
+  The gate mode is the exception: its rules moved wholesale into
+  `references/ci-gate.md`, which SKILL.md directs the agent to read before it
+  does anything. `references/troubleshooting.md` also gains a row SKILL.md
+  never had, for a `run.py` argv failure.
+  `references/security-facts.md` and `references/why-these-ten.md`
+  gained tables of contents, which the same guidance asks for on reference files
+  over 100 lines. The install-time self-proof moved with the gate runbook: its
+  three outcomes, the two-fixture minimal pair, the "nothing is written into
+  your tree" guarantee and the re-prove-on-refresh rule are all in
+  `references/ci-gate.md`, while what the agent must DO on `self-proof FAILED`
+  — never report a working install, stop before the hand-over, say what is on
+  disk — stays in SKILL.md, where a rule that binds every run belongs.
 
 ### Added
 
@@ -275,6 +355,75 @@ entries are dated (UTC). Format loosely follows
   any grader".
 
 ### Fixed
+
+- **2026-08-19** — **The `Coverage:` line is copied, not recomputed, and a
+  section link that stops resolving now fails the build.** Phase 3 defined
+  `complete` as "every workflow file was scanned", which is one of the three gap
+  channels the engine actually computes completeness from, so an agent deriving
+  its own Coverage row could print `complete` over a real gap — the one thing
+  the coverage rule forbids. It now copies the report's row. Alongside it, the
+  reference guard resolves `#section` anchors instead of stripping them: a
+  pointer into a named section is a pointer to a RULE, and renaming the heading
+  used to leave the agent at the top of a 162-line file with nothing failing.
+  `references/prompts.md` was also missing from the set of references required
+  to stay reachable — it carries Phase 5's untrusted-content containment and
+  its edit-only-this-file scope limit, and Phase 5 is the only phase that writes
+  to the user's repository. Both new guards were proven by mutation first.
+
+- **2026-08-19** — **Two corrections in the findings-JSON reference, and the
+  Phase 6 close template carries the vector id it always required.**
+  `references/scan-output.md` said Phase 6 reads a `Timing:` line after the
+  render; no such line is rendered into the report, and an agent grepping for
+  one would find nothing and either drop the timing or invent it. It composes
+  that line from the `timings` block, which is why the render has to happen
+  first. The same file documented `workflow_activity` in its enriched shape
+  only, where the engine has three and warns that an attempted-and-failed
+  enrichment must never be read as "active". Phase 6's literal close template
+  wrote `Fix Finding N — {short title}` while Phase 4 mandates the `{vector id}`
+  that bridges an option to its receipt row; the template now carries it.
+
+- **2026-08-19** — **The guard on the moved runbooks now checks that the agent
+  can actually follow the pointer, and that there is something behind it.** The
+  check that SKILL.md still names every reference it defers a rule to was a
+  search for the path anywhere in the page, so it was satisfied by the path
+  appearing as a link's caption, as a backticked prose mention, or as the label
+  on a link pointing at a different file — repointing the CI-gate pointer at
+  another reference left the whole suite green while the gate runbook became
+  unreachable. It now asserts the path is a real link TARGET. A second gap sat
+  beside it: the references were checked for existence only, so emptying
+  `references/ci-gate.md` to zero bytes stayed green while SKILL.md still
+  ordered the agent to read the full runbook before doing anything. Each
+  deferred runbook is now also checked for substance. Both were proven by
+  mutation before the fix.
+
+- **2026-08-19** — **Contract corrections found while trimming.** Phase 6's
+  close claimed the same options and verbatim text as Phase 4 while writing a
+  template without the vector id Phase 4 mandates; the vector receipt did not
+  say where its ten rows come from; the impostor-status bullet said all four
+  states come from `gh_checks` and then said the fourth cannot be; the honesty
+  imperative "Never print `complete` over a coverage gap" was restored;
+  `references/scan-output.md` misdescribed the `timings` block and omitted
+  `gh_check_details`; `references/ci-gate.md` used the `<ci-secure>` placeholder
+  without defining it; and the Phase 4 worked example regained the second active
+  group that makes it demonstrate the slot-sizing rules it sits under.
+
+- **2026-08-17** — **The terminal summary can no longer be read as three
+  lines total.** Trimming SKILL.md left "three lines, no fourth" standing on
+  its own where an inline example used to scope it to the header block, so it
+  contradicted the mandatory contract lines twenty lines below — including
+  the ten-row vector receipt the summary exists to deliver. Both SKILL.md and
+  `references/terminal-summary.md` now say HEADER BLOCK, and state that the
+  contract lines follow it and are not optional. The body-length ceiling that
+  motivated the trim is now pinned by a test
+  (`tests/test_skill_body_budget.py`, with a red-proof), so it cannot regrow
+  unnoticed the way it did to 854 lines. Two more gaps the same review found
+  are closed alongside it: `tests/test_reference_links.py` fails if a
+  reference file SKILL.md links has been renamed or dropped (deleting
+  `references/terminal-summary.md` used to leave the suite fully green — the
+  risk this PR creates by moving four runbooks behind links), and
+  `tests/test_report.py`'s recipe check now covers the `^CI Secure` banner
+  recipe, which its needle list never selected: mangling the one line SKILL.md
+  orders copied VERBATIM also used to pass.
 
 - **2026-08-15** — **The gate setup instructions cover the paths a real
   session actually takes.** Setup and refresh are the same command, and which
