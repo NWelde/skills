@@ -1,5 +1,12 @@
 # The security config facts — machine-only inputs, and why each is disjoint from ci-score
 
+## Contents
+
+- [The disjointness census](#the-disjointness-census)
+- [What each fact asks, exactly](#what-each-fact-asks-exactly)
+
+---
+
 ci-secure computes eight deterministic, pass/fail configuration facts as
 MACHINE-ONLY inputs for a future blended score (the ci-advisor door, not yet
 public). They are aggregated `100 × passed / scored` with no weights and no

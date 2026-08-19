@@ -8,13 +8,18 @@ no ``.skillignore`` / frontmatter allowlist / dotfile exclusion. So the ONLY way
 to keep maintainer-only files out of an end-user install is to keep them out of
 ``skills/ci-secure/`` entirely.
 
-This guard is FORWARD-LOOKING. ci-secure has no maintainer-loop tree in this
-repo today, so nothing here is currently leaking; the point is that the day one
-is added it lands under ``maintainers/ci-secure/`` and not under the skill. The
-leak shape to expect is ci-speedup's: self-improvement loop infra (loop prompts,
-a summary schema, drafting scripts) plus the runtime capture directories those
-loops write into, which on a maintainer's machine hold third-party job logs and
-session transcripts. Rooted under the skill, every one of them would ship.
+ci-secure now HAS a maintainer-only tree — ``maintainers/ci-secure/`` holds
+``MAINTAINERS.md`` plus the behavioral-eval harness (``scripts/run_skill_evals.py``
+and its tests), which drives real ``claude -p`` sessions and is of no use to
+someone who installed the skill. So this guard is no longer purely
+forward-looking: it pins where that tree lives, and ``run_skill_evals.py`` is a
+forbidden basename under ``skills/ci-secure/`` for exactly that reason.
+
+The leak shape still to expect is ci-speedup's: self-improvement loop infra
+(loop prompts, a summary schema, drafting scripts) plus the runtime capture
+directories those loops write into, which on a maintainer's machine hold
+third-party job logs and session transcripts. Rooted under the skill, every one
+of them would ship.
 
 Independent checks (each its own test function, so a broken assertion in one
 never silently disables the others), plus a positive control. Every other
@@ -53,6 +58,10 @@ _FORBIDDEN_FILE_NAMES = {
     "loop-summary.schema.json",
     "draft_detector.py",
     "aggregate_lessons.py",
+    # The behavioral-eval harness. It drives a real, billed agent session per
+    # case, so it must never reach an end user's install and must never be
+    # collected by the ordinary `pytest` run.
+    "run_skill_evals.py",
 }
 
 # Directory names that mark the same thing.
@@ -102,6 +111,46 @@ def test_no_maintainer_only_files_under_skill():
     assert not leaked, (
         "maintainer-only infrastructure leaked into the installable skill "
         "(keep it outside skills/ci-secure/): " + ", ".join(leaked)
+    )
+
+
+def test_no_eval_results_under_skill():
+    """`claude plugin eval` writes `aggregate-result.json`, `report.html` and
+    kept sandbox copies to `<discovery root>/evals/results/` unless the operator
+    passes `--output-dir`. For ci-secure the discovery root IS the installable
+    skill, so the default lands run artifacts inside the tree the `skills` CLI
+    copies wholesale into every end-user install.
+
+    Gitignoring the path (which `.gitignore` also does) is NOT sufficient on its
+    own: the installer honours no ignore file, so an ignored directory ships
+    exactly like a tracked one. Those artifacts embed full prompts, transcript
+    excerpts and grader evidence from whatever repository the maintainer ran
+    against, which makes this a disclosure leak and not just clutter. The
+    remedy is `--output-dir` outside the skill; `evals/README.md` documents the
+    invocation.
+    """
+    results = _SKILL / "evals" / "results"
+    assert not results.exists(), (
+        f"{results.relative_to(_REPO)} exists and would ship into every "
+        "end-user install (gitignore does not stop the installer) — delete it "
+        "and re-run with `--output-dir` pointing outside skills/ci-secure/")
+
+
+def test_no_tracked_eval_results():
+    """The same directory, from the other side: nothing under it may be tracked.
+    The disk check above only fires on the machine that ran the suite, so this
+    is what stops a run artifact reaching `main` from someone else's checkout."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(_REPO), "ls-files", "-z",
+         "skills/ci-secure/evals/results"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    leaked = sorted(rel for rel in out.split("\0") if rel)
+    assert not leaked, (
+        "eval run artifacts are tracked under the installable skill: "
+        + ", ".join(leaked)
     )
 
 

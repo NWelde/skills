@@ -11,7 +11,260 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **2026-08-19** — **A deferred file that cannot be read is now a stop, not an
+  improvisation.** SKILL.md defers load-bearing procedure to reference files in
+  several places, each phrased as "read this before acting". While that
+  procedure was inline, an unreadable reference was not a state the contract
+  could reach; behind a pointer it is — a partial install, a packaging slip, a
+  truncated copy — and nothing said what to do about it, so the agent would
+  improvise the runbook the pointer exists to protect. A NEVER rule now says to
+  stop and name the file. It was paid for WITHOUT moving another rule behind a
+  link: two of the NEVER bullets were reflowed to reclaim exactly the two lines
+  it needed, so the body stays at 499 of 500 and no rule left the always-loaded
+  surface to make room for the rule about deferral failing.
+
+- **2026-08-19** — **Three smaller review findings, and a misinstruction in
+  the impostor-status rule.** The gate runbook still said to install "as one
+  setup PR" while the NEVER rules forbid opening one unless asked; on main both
+  sentences sat in one file where a reader met them together, so the trim is
+  what left the permissive one alone in a reference. It now defers to the NEVER
+  rules explicitly. The link and heading guards read a `#` shell comment inside
+  a fenced example as a markdown heading, so a renamed section could resolve
+  against an example's comment; they now skip fenced blocks, and a red-proof
+  fixture pins it. The "still has substance" floor was one global minimum of 20
+  non-blank lines, which protected the large references and almost nothing else
+  — `troubleshooting.md` has 26, so most of its failure-mode table could be
+  deleted with the suite green; each reference now carries its own floor and
+  section count, and a second guard fails if a required reference has no floor
+  of its own. Finally, three places told the agent to read the impostor word as
+  the banner's "last token", but one of the four states is the two-word `not
+  recorded`, whose last token reads as its exact opposite; all three now say the
+  word ENDS the line and may be two words.
+
+- **2026-08-19** — **Four holes the trim opened or left open, each pinned by a
+  guard that was proven to fail first.** (1) The always-loaded body named
+  `scan_incomplete` as the only coverage key while the engine computes
+  completeness from three arrays, so an agent reading the body alone could call
+  a degraded run complete — the exact rule the coverage contract forbids, and
+  the exact bug this branch had just fixed in the deferred file. It now names
+  all three, plus `evidence_kind`, and a guard reads the channel list off
+  `report._coverage_is_complete` so a fourth channel fails the build until the
+  contract mentions it. (2) `REPO` was expanded in Phase 2 while its only
+  assignment had moved into `references/troubleshooting.md`; an agent that did
+  not open that file scanned with no `--repo` and silently degraded the four
+  gh-gated checks to skipped. It is bound in the body again, and a guard fails
+  on any shell variable the command blocks expand without binding. (3) The
+  `## The self-proof` section — the 81 lines this branch narrates rescuing —
+  could be deleted, table-of-contents line and all, with the suite green, while
+  SKILL.md still branched on three outcomes whose mechanics no longer existed;
+  the three branch labels are now bound to the runbook that explains them.
+  (4) The grep-recipe check started from its needle list, so a recipe matching
+  nothing in any report was exercised by nothing; a closure assertion now
+  requires every published recipe to be covered.
+
 ### Added
+
+- **2026-08-18** — **The behavioral eval cases are executed, and a session that
+  never started no longer reads as a skill regression.** The five cases in
+  `evals/` were written for `claude plugin eval`, which is gated behind early
+  access, so nothing ran them and `evals/README.md` opened by saying so. They
+  now run on every pull request that touches this skill's contract, driven by a
+  maintainer-side harness. The README records what that harness does *not* do —
+  `llm` graders are reported rather than scored, and the cases' `allowed_tools`,
+  ablation arm, model pin and run count are not yet applied — so a pass under it
+  is not quoted as a pass under the runner the cases were written for. The
+  harness mounts a copy of the skill with the answer key removed, which closes
+  the free-pass half of the risk the vacuity rule documents *for that harness*;
+  under `claude plugin eval` the case files still ship and the residual stands.
+
+### Fixed
+
+- **2026-08-18** — **A case no longer fails because the agent read the file it
+  was asked to clear.** `pwn-request` asserts that no finding is attributed to
+  the clean workflow, and it looked for that attribution in the transcript —
+  which carries the output of every tool the session ran, not just the agent's
+  own words. The clean fixture's line 7 is the literal YAML key `jobs:`, so a
+  `grep -n` over the workflows printed the file, the line and the key on one
+  line and satisfied the pattern. A session that inspected the clean file
+  carefully — which the sibling grader rewards — was scored as having reported
+  a false finding. That grader now reads the rendered report, where no
+  `path:line:` prefix can occur, and a new invariant holds every
+  transcript-targeted negative to the same rule.
+
+- **2026-08-18** — **Counting graders count in the corpus they name.** The
+  `count:` match mode read the transcript whichever corpus its `target`
+  selected — the same wrong-corpus defect fixed for `contains`, surviving in
+  the branch beside it. No case uses `count:` today, so nothing was misreported;
+  the next one written against the report would have been.
+
+- **2026-08-18** — **A report the harness could not collect is reported as a
+  collection failure, not as a skill regression.** The guard for this only
+  fired when the session produced no file at all, and a session leaves scratch
+  files — so a missing report with any other file beside it failed every
+  report-anchored grader as though the scan had misbehaved. The guard now asks
+  for the report itself.
+
+- **2026-08-18** — **The skill's own changelog is no longer readable by a
+  graded session.** The harness mounts the skill for the agent under test and
+  withheld `evals/` and `tests/` as the answer key, but the changelog narrates
+  the graders and quotes their expected banner strings verbatim — so one read
+  of it satisfied a grader with no scan behind it. It is withheld too, and the
+  rule is now stated as a property (no mounted file may satisfy a grader)
+  rather than as a list of names.
+
+- **2026-08-18** — **A grader that pins a finding to its real file and line is
+  read against the report, not against whatever the session happened to print.**
+  Three graders are anchored on `report.py`'s `<file>:<line> — jobs:` evidence
+  bullet, deliberately: a model can paraphrase its summary a dozen ways, but
+  that bullet is byte-identical every run. The skill renders it into a report
+  file and prints a summary, and the harness graded only the transcript — so
+  `pwn-request` and `impostor-check-skipped` failed on runs where the scan had
+  found the right thing, at the right line, and written exactly the asserted
+  text, while `template-injection` passed on the same pattern only because that
+  session happened to run `grep -n`. Those three now declare `target: files`,
+  and the harness collects what the session wrote off disk alongside the
+  transcript, keeping the two corpora separate. The vacuity rule extends to
+  `files` graders, because `report.py` inlines catalog prose into the report it
+  renders.
+
+- **2026-08-17** — **A partial checkout no longer reports as complete
+  coverage.** Every detector reasons about the files it can see on disk, so a
+  `git sparse-checkout`, a partial clone, or a locally-deleted workflow was
+  invisible to the scanner: it ran on what was present, found nothing in what
+  was absent, and rendered `Coverage | ✅ complete — every workflow file was
+  scanned`. On a checkout holding 1 of a repository's 8 workflow files that
+  sentence reads as a clean bill of health for a repository the scan never
+  looked at, and it let the config facts assert *"all 1 workflow(s) declare
+  `permissions:`"* about seven files nobody opened. The scan now asks git for
+  the audited commit's own tree (`git ls-tree` reads the object database, so it
+  sees files a sparse checkout left out of the working tree) and folds every
+  absentee into `scan_incomplete`, which flips Coverage to **PARTIAL**, raises
+  the incomplete-coverage banner naming each unscanned file, and degrades the
+  affected config facts to `unmeasured`. This is the impostor check's rule
+  ("a check that could not run is NOT a pass") applied one layer down, to a
+  file that was never read. An inconclusive probe — not a git checkout, or git
+  cannot answer — reports no gap, so ordinary runs are unaffected. The probe
+  clears every git repository-selection variable (`GIT_DIR`, `GIT_WORK_TREE`
+  and friends) before running: `git -C <dir>` chooses a working directory, not
+  a repository, so an inherited `GIT_DIR` — which git hooks and `git worktree`
+  both export — would have pointed the probe at another repository, found no
+  workflows there, reported no gap, and silently restored the "complete
+  coverage" claim this fix exists to remove.
+
+### Changed
+
+- **2026-08-17** — **SKILL.md is about a third shorter, with the detail moved
+  into reference files.** Anthropic's skill-authoring guidance puts the ceiling
+  for a SKILL.md body at 500 lines, and ci-secure's had grown to 854. The
+  runbook for adding ci-secure as a CI gate, the terminal summary's provenance
+  table, the findings-JSON shape, and the troubleshooting table now live in
+  `references/ci-gate.md`, `references/terminal-summary.md`,
+  `references/scan-output.md` and `references/troubleshooting.md`, each linked
+  from the point in SKILL.md that used to carry them. The scan-and-report
+  contract keeps every rule it had: the phase sequence, every close-question
+  option string and its ordering, the honesty invariants and all eight NEVER
+  rules are still in SKILL.md, re-wrapped and tightened but unchanged in what
+  they oblige — the incident anecdotes that motivated some of them were cut.
+  The gate mode is the exception: its rules moved wholesale into
+  `references/ci-gate.md`, which SKILL.md directs the agent to read before it
+  does anything. `references/troubleshooting.md` also gains a row SKILL.md
+  never had, for a `run.py` argv failure.
+  `references/security-facts.md` and `references/why-these-ten.md`
+  gained tables of contents, which the same guidance asks for on reference files
+  over 100 lines. The install-time self-proof moved with the gate runbook: its
+  three outcomes, the two-fixture minimal pair, the "nothing is written into
+  your tree" guarantee and the re-prove-on-refresh rule are all in
+  `references/ci-gate.md`, while what the agent must DO on `self-proof FAILED`
+  — never report a working install, stop before the hand-over, say what is on
+  disk — stays in SKILL.md, where a rule that binds every run belongs.
+
+### Added
+
+- **2026-08-17** — **Installing the gate now proves it can fail, before it is
+  handed back.** The gate ships in `--advisory` mode, so its first runs are
+  green by construction, and the runbook then asks for `--advisory` to come off
+  and the check to be made required — a blocking check trusted on the strength
+  of never having been seen go red, which is the failure this skill's own
+  reports preach against one level up. `vendor.py --into` now fires the freshly
+  vendored gate at a throwaway workflow that fails a named security fact
+  (`sec.permissions.workflow-declares`) and requires a non-zero exit that names
+  it, then at the same workflow with the hole closed and requires a 0 — a gate
+  wedged red reds on everything and proves nothing. It then reports what the
+  gate makes of the adopter's real tree, so "can it block" and "would it block
+  me" are both answered before anything is committed. **Nothing is written into
+  the adopter's repository to do this**: both fixtures are temporary files,
+  deleted afterwards, and no workflow of theirs is broken to stage a red. The
+  three outcomes are kept apart — proved, FAILED (do not report a working
+  install), and could-not-run (the engine needs Python 3.12 and PyYAML; the
+  installer needs neither) — because a missing interpreter and a gate that
+  cannot fail must never read as the same thing. Refreshes re-prove on the same
+  fixtures, there is no flag to skip the proof, and `vendor.py --self-test
+  <vendored dir>` re-runs it on demand. The proof also runs with bytecode
+  writing disabled, so it cannot leave a `__pycache__` that the adopter's own
+  drift check would then red on forever. The report of what the gate makes of
+  the adopter's real tree keeps the two kinds of red apart: failed facts, which
+  the shipped `--advisory` reports without blocking, and scan-integrity
+  failures, which survive the ramp and make the very first run red. That report
+  is withheld entirely unless the proof passed — a verdict from a gate that
+  just failed its own proof, or that could not run at all, is not an
+  observation about the adopter's code and is not offered as one — and a gate
+  that exits non-zero on their tree without naming a single finding is reported
+  as a scan that produced no usable result, never as a repository with nothing
+  to block.
+- **2026-08-17** — **An install into a repository that documents a
+  guard-registration convention says the new gate is not registered with it.**
+  A repository keeping a register of its build-breaking checks — a harness that
+  mutates each one and asserts it fires — gains, on install, a check that
+  register does not cover, and nothing said so. `CLAUDE.md`, `AGENTS.md` and
+  `CONTRIBUTING.md` are read for that convention and the matching line is
+  quoted back. Detection only: registering into an arbitrary repository's
+  harness means writing into files the installer knows nothing about.
+- **2026-08-17** — **The five behavioral eval cases are now runnable instead of
+  being documentation.** `evals/evals.json` described five scenarios in prose
+  and nothing executed them; the tests that referenced them (`test_loop_evals.py`
+  and `test_scan.py`) said so in their own docstrings, pinning the deterministic
+  scanner output underneath because the behavioral layer could not run. So a regression in the agent-facing
+  contract — the engine skipped in favour of eyeballing YAML, a skipped
+  network-gated check rendered as a pass, the complete finding table collapsing
+  into a capped four-option widget — was caught by nothing. The five cases are
+  now `evals/<case>/case.yaml` in the format `claude plugin eval` consumes,
+  each with a scaffold that materializes its cloaked fixtures into a real
+  `.github/workflows/` tree (and `git init`s it, so the skill's Phase 1 resolves
+  the sandbox rather than the harness's parent repository). Graders are
+  mechanical wherever the expectation allows: `tool_used` on the engine scripts,
+  and regexes anchored on strings only `run.py` or `report.py` can produce —
+  the scanner's string-sorted group list, the renderer's pre-drawn banner —
+  rather than on prose an agent could produce having merely read `SKILL.md`.
+  `evals.json` is retired; the case files are now the single source of truth.
+  **The suite has never been executed** — `claude plugin eval` is in early
+  access and gated on the authoring machine — and `evals/README.md` states
+  exactly what is and is not verified. `tests/test_evals_cases.py` validates
+  everything checkable without the runner, including a vacuity guard that fails
+  any trace regex matching text the skill itself ships — `SKILL.md`,
+  `references/`, `scripts/*.py` and `evals/README.md`, since the installer
+  copies all of them and one `Grep` puts any into the transcript — and guards
+  for the traps that fail silently:
+  a `Skill` `tool_used` grader demoted to unscored without `arm: both`, and
+  `max: 0` without `min: 0`. `evals/results/` is gitignored and now blocked from
+  the install surface by `tests/test_ci_secure_install_surface.py`, since the
+  installer honours no ignore file. The shared scaffold now refuses any working
+  directory that is not empty, and refuses one it cannot list rather than
+  reading an unreadable directory as an empty one: run by hand from a checkout
+  it would otherwise overwrite that repository's live `.github/workflows/` with
+  the vulnerable fixtures and commit them to the current branch. Three further
+  silent bypasses of the vacuity rule are closed: a regex grader with no
+  `target:` was exempt from it, a `not_contains` pattern could match its own
+  declaration and so never pass, and a pattern opening with a bare digit
+  matched inside a longer number — `0 critical findings` is contained in `10
+  critical findings`, so the zero-findings case passed under the one regression
+  it exists to catch. `allowed_tools` entries are now checked against the names
+  the runner can actually grant. And every case must carry an anchor that a
+  *completed* engine run satisfies and a failed one does not: `tool_used` sees
+  only that a command mentioned `run.py`, and an occurrence line on a short
+  fixture is one `grep -n` away, so `template-injection` gains the engine's own
+  printed group list alongside them.
 
 - **2026-08-17** — **A finding whose job sits behind a security gate that
   cannot work now says so.** Previously every gate got the same sentence —
@@ -92,7 +345,85 @@ entries are dated (UTC). Format loosely follows
   escaping rule eventually differ, and the surface with the weaker copy is the
   one an attacker aims at.
 
+### Changed
+
+- **2026-08-17** — **`evals/evals.json` is retired.** Its prose moved into each
+  case's `description` and `expected_outcome` so the case files are the single
+  source of truth. Two expectations it carried are now documented rather than
+  graded — fix subagents staying inside their one target file, and the report's
+  scope-honesty line — and `evals/README.md` names both under "Not covered by
+  any grader".
+
 ### Fixed
+
+- **2026-08-19** — **The `Coverage:` line is copied, not recomputed, and a
+  section link that stops resolving now fails the build.** Phase 3 defined
+  `complete` as "every workflow file was scanned", which is one of the three gap
+  channels the engine actually computes completeness from, so an agent deriving
+  its own Coverage row could print `complete` over a real gap — the one thing
+  the coverage rule forbids. It now copies the report's row. Alongside it, the
+  reference guard resolves `#section` anchors instead of stripping them: a
+  pointer into a named section is a pointer to a RULE, and renaming the heading
+  used to leave the agent at the top of a 162-line file with nothing failing.
+  `references/prompts.md` was also missing from the set of references required
+  to stay reachable — it carries Phase 5's untrusted-content containment and
+  its edit-only-this-file scope limit, and Phase 5 is the only phase that writes
+  to the user's repository. Both new guards were proven by mutation first.
+
+- **2026-08-19** — **Two corrections in the findings-JSON reference, and the
+  Phase 6 close template carries the vector id it always required.**
+  `references/scan-output.md` said Phase 6 reads a `Timing:` line after the
+  render; no such line is rendered into the report, and an agent grepping for
+  one would find nothing and either drop the timing or invent it. It composes
+  that line from the `timings` block, which is why the render has to happen
+  first. The same file documented `workflow_activity` in its enriched shape
+  only, where the engine has three and warns that an attempted-and-failed
+  enrichment must never be read as "active". Phase 6's literal close template
+  wrote `Fix Finding N — {short title}` while Phase 4 mandates the `{vector id}`
+  that bridges an option to its receipt row; the template now carries it.
+
+- **2026-08-19** — **The guard on the moved runbooks now checks that the agent
+  can actually follow the pointer, and that there is something behind it.** The
+  check that SKILL.md still names every reference it defers a rule to was a
+  search for the path anywhere in the page, so it was satisfied by the path
+  appearing as a link's caption, as a backticked prose mention, or as the label
+  on a link pointing at a different file — repointing the CI-gate pointer at
+  another reference left the whole suite green while the gate runbook became
+  unreachable. It now asserts the path is a real link TARGET. A second gap sat
+  beside it: the references were checked for existence only, so emptying
+  `references/ci-gate.md` to zero bytes stayed green while SKILL.md still
+  ordered the agent to read the full runbook before doing anything. Each
+  deferred runbook is now also checked for substance. Both were proven by
+  mutation before the fix.
+
+- **2026-08-19** — **Contract corrections found while trimming.** Phase 6's
+  close claimed the same options and verbatim text as Phase 4 while writing a
+  template without the vector id Phase 4 mandates; the vector receipt did not
+  say where its ten rows come from; the impostor-status bullet said all four
+  states come from `gh_checks` and then said the fourth cannot be; the honesty
+  imperative "Never print `complete` over a coverage gap" was restored;
+  `references/scan-output.md` misdescribed the `timings` block and omitted
+  `gh_check_details`; `references/ci-gate.md` used the `<ci-secure>` placeholder
+  without defining it; and the Phase 4 worked example regained the second active
+  group that makes it demonstrate the slot-sizing rules it sits under.
+
+- **2026-08-17** — **The terminal summary can no longer be read as three
+  lines total.** Trimming SKILL.md left "three lines, no fourth" standing on
+  its own where an inline example used to scope it to the header block, so it
+  contradicted the mandatory contract lines twenty lines below — including
+  the ten-row vector receipt the summary exists to deliver. Both SKILL.md and
+  `references/terminal-summary.md` now say HEADER BLOCK, and state that the
+  contract lines follow it and are not optional. The body-length ceiling that
+  motivated the trim is now pinned by a test
+  (`tests/test_skill_body_budget.py`, with a red-proof), so it cannot regrow
+  unnoticed the way it did to 854 lines. Two more gaps the same review found
+  are closed alongside it: `tests/test_reference_links.py` fails if a
+  reference file SKILL.md links has been renamed or dropped (deleting
+  `references/terminal-summary.md` used to leave the suite fully green — the
+  risk this PR creates by moving four runbooks behind links), and
+  `tests/test_report.py`'s recipe check now covers the `^CI Secure` banner
+  recipe, which its needle list never selected: mangling the one line SKILL.md
+  orders copied VERBATIM also used to pass.
 
 - **2026-08-15** — **The gate setup instructions cover the paths a real
   session actually takes.** Setup and refresh are the same command, and which
