@@ -53,6 +53,7 @@ written to prevent.
 from __future__ import annotations
 
 import ast
+import os
 import shlex
 import tomllib
 from pathlib import Path
@@ -307,6 +308,45 @@ def _aborts(arm_lines: list[str]) -> bool:
     return False
 
 
+def _yaml_preflight_guards_exit(arm_lines: list[str]) -> bool:
+    """True iff some ``if``/``fi`` span in the arm both tests the yaml import in
+    its OWN condition and contains an ``exit`` somewhere in its body.
+
+    ``_real_yaml_preflight`` and ``_aborts`` were previously checked independently
+    over the whole arm, so a hook could satisfy both while the two were unrelated:
+
+        python3 -c "import yaml"      # unconditional; failure silently ignored
+        if [ -n "$FORCE" ]; then
+            exit 0                    # a real exit, but gated on FORCE, not on yaml
+        fi
+        python3 -m pytest -v
+
+    That passes "a real import exists" and "a real exit exists" separately while
+    pytest still runs without yaml. Requiring the exit to live inside the SAME
+    conditional whose condition performs the import check closes that gap.
+    """
+    depth = 0
+    guard_depth: int | None = None
+    for raw in arm_lines:
+        line = _strip(raw)
+        if not line:
+            continue
+        words = _command_words(line)
+        if words and words[0] == "if":
+            depth += 1
+            if guard_depth is None and _real_yaml_preflight([line]):
+                guard_depth = depth
+            continue
+        if words and words[0] == "fi":
+            if guard_depth is not None and depth == guard_depth:
+                guard_depth = None    # left the guarded block without an exit
+            depth -= 1
+            continue
+        if guard_depth is not None and _aborts([line]):
+            return True
+    return False
+
+
 def _unmodellable(hook_text: str) -> list[str]:
     """Constructs the parser cannot read. Reported as violations, never ignored."""
     problems = []
@@ -376,11 +416,12 @@ def _violations(hook_text: str) -> list[str]:
                             "can fail readably instead of hitting INTERNALERROR; no "
                             "such command found ahead of the pytest invocation in "
                             "that arm")
-                    elif not _aborts(preceding):
+                    elif not _yaml_preflight_guards_exit(preceding):
                         problems.append(
-                            "the bare python3 arm preflights yaml but never `exit`s on "
-                            "failure before running pytest, so pytest still runs "
-                            "without yaml and still hits INTERNALERROR")
+                            "the bare python3 arm preflights yaml but the `exit` on "
+                            "failure is not actually gated on that import check (either "
+                            "missing, or guarding an unrelated condition), so pytest can "
+                            "still run without yaml and hit INTERNALERROR")
                 else:
                     problems.append(
                         f"unknown test runner {runner!r} — if this is a new isolated "
@@ -394,6 +435,9 @@ def _violations(hook_text: str) -> list[str]:
 
 def test_hook_exists_and_is_executable():
     assert _HOOK.is_file(), f"{_HOOK} is missing"
+    assert os.access(_HOOK, os.X_OK), (
+        f"{_HOOK} is not executable; git silently ignores non-executable hooks "
+        "under core.hooksPath — the suite would stop running with no error")
 
 
 def test_every_arm_provisions_pyyaml():
@@ -577,6 +621,25 @@ else
 fi
 """
 
+# A real import check and a real `exit` both exist in the arm, but they are not
+# connected: the import's failure is silently ignored (no `if`/no `set -e`), and
+# the `exit` is gated on an unrelated condition. `_real_yaml_preflight` and
+# `_aborts`, checked independently, would both pass this; pytest still runs
+# without yaml.
+_PREFLIGHT_RESULT_IGNORED = """#!/bin/bash
+if command -v uvx &> /dev/null; then
+    uvx --with pyyaml pytest -v
+elif command -v pipx &> /dev/null; then
+    pipx run --with pyyaml pytest -v
+else
+    python3 -c "import yaml"
+    if [ -n "$FORCE" ]; then
+        exit 0
+    fi
+    python3 -m pytest -v
+fi
+"""
+
 
 @pytest.mark.parametrize("label,text", [
     ("the original issue-31 hook", _BROKEN_ORIGINAL),
@@ -593,6 +656,7 @@ fi
     ("a case-statement dispatch", _CASE_DISPATCH),
     ("an unrecognized fourth runner", _FOURTH_ARM),
     ("preflight runs AFTER pytest, not before", _PREFLIGHT_AFTER_PYTEST),
+    ("import result ignored; exit gated on something else", _PREFLIGHT_RESULT_IGNORED),
 ])
 def test_checker_rejects_known_bad_hooks(label, text):
     """Without these, a parser that silently matched everything would ship green."""
