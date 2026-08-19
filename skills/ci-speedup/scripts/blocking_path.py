@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import claims  # same-skill module; typed claims layer (increment 1: headline family)
+import untrusted_wrap as uw  # same-skill module; BEGIN/END untrusted-log marking (#29)
 
 _LBLW = 33
 _BARW = 22
@@ -358,6 +359,28 @@ def _fence_safe(s: object) -> str:
     s = _FENCE_CTRL_RE.sub("", str(s))
     s = re.sub(r"[\r\n]+", " ", s)
     return _redact_secrets(_defuse_backtick_runs(s))
+
+
+def _evidence_fence(ev: list[str]) -> list[str]:
+    """Render a list of verbatim log-evidence lines as a self-contained ```text fence,
+    with the untrusted-content trust boundary marked STRUCTURALLY in the text (#29), on
+    top of the existing per-line fence-safety + credential masking. Order matters: each
+    line is made fence-safe FIRST (backtick defusal, control-char strip, credential
+    masking — `_fence_safe`), THEN the whole already-safed block is wrapped in a
+    per-render, nonce-bearing BEGIN/END pair with any forged marker-shaped text already
+    in the log neutralized (`untrusted_wrap.wrap_untrusted_block`) — so a log line can't
+    fake an early close and make text that follows it look like it's back in trusted
+    territory. The one chokepoint every self-contained evidence fence in the report
+    renders through (`_llm_analysis_block`, `_offcategory_note_block`, the main `render()`
+    evidence block) — matches `_fence_safe`'s own one-chokepoint discipline, so a future
+    evidence-rendering site can't quietly skip the wrap. NOT used by `_build_agent_prompt`,
+    the one remaining site that quotes log evidence: its lines sit inside ONE larger fence
+    spanning the whole agent hand-off prompt, where a second nested ```text fence isn't
+    possible, so it splices `wrap_untrusted_block()`'s output in as plain inline lines
+    instead. (`_build_generic_agent_prompt` needs no wrap at all — it is the no-catalog-
+    match hand-off and quotes no log evidence.)"""
+    safe = [_fence_safe(e) for e in ev]
+    return ["```text", *uw.wrap_untrusted_block(safe), "```"]
 
 
 def _safe_span(s: object) -> str:
@@ -2804,7 +2827,13 @@ def _build_agent_prompt(leaf: dict[str, Any] | None, pole: dict[str, Any],
     out += ["THE MEASURED CAUSE", f"- {meta['cause']}"]
     ev = (leaf.get("evidence") or [])[:2]
     if ev:
-        out += ["  Verbatim from the run:"] + [f"    {_fence_safe(e)}" for e in ev]
+        # No nested fence possible here (this whole prompt is already ONE ```text
+        # fence the agent runs verbatim - SKILL.md's phase-6 hand-off) - the
+        # BEGIN/END boundary goes in as plain lines instead, at the same indent as
+        # the evidence they bound (#29).
+        safe = [_fence_safe(e) for e in ev]
+        out += ["  Verbatim from the run:"] + [f"    {line}"
+                                                for line in uw.wrap_untrusted_block(safe)]
     out += [""]
 
     addr = _addressable_plain(pole, candidates)
@@ -3027,7 +3056,7 @@ def _llm_analysis_block(a: dict[str, Any], cross_run_rendered: bool = False) -> 
         out.append("")
     if evidence:
         out += ["**Evidence — verbatim from the captured job log:**", "",
-                "```text", *[_fence_safe(e) for e in evidence], "```", ""]
+                *_evidence_fence(evidence), ""]
     return out
 
 
@@ -4116,7 +4145,7 @@ def _offcategory_note_block(leaf: dict[str, Any], pole: dict[str, Any]) -> list[
            "cleanup."]
     ev = leaf.get("evidence") or []
     if ev:
-        out += ["", "```text", *[_fence_safe(e) for e in ev], "```"]
+        out += ["", *_evidence_fence(ev)]
     out.append("")
     return out
 
@@ -8876,7 +8905,7 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
             if ev:
                 lead = ("Verbatim from one of those runs' log:" if sample
                         else "**🔬 Evidence** — verbatim from the captured job log:")
-                out += [lead, "", "```text", *[_fence_safe(e) for e in ev], "```", ""]
+                out += [lead, "", *_evidence_fence(ev), ""]
         elif analysis:
             # LLM gap-fill: no catalog match, so the agent's grounded reading of the
             # captured log stands in for the measured cause (clearly labelled).

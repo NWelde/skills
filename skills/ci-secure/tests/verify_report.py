@@ -974,6 +974,50 @@ _ALLOWED_H2 = (
 )
 
 
+def check_source_fences_quote_only_source(report: str) -> Check:
+    """A ```yaml evidence fence must contain nothing but numbered source lines.
+
+    report.py reserves the fenced, line-numbered block for text quoted
+    verbatim from the workflow file. A sentence the scanner assembled that
+    lands in there is dressed as source, and a reader who opens the file
+    looking for it never finds it — the exact defect `_derived_evidence_block`
+    was introduced to fix, and nothing enforced it until a later change put
+    scanner prose back inside a fence.
+    """
+    name = "```yaml evidence fences quote only numbered source lines"
+    # A blank quoted line renders as a bare `NN:` with nothing after it, so
+    # the space is optional. Requiring it failed the self-check on any report
+    # quoting a workflow with a blank line in the excerpt — which is most.
+    gutter = re.compile(r"\d+:(?: |$)")
+    bad: list[str] = []
+    fence: list[str] | None = None
+    for raw in report.splitlines():
+        line = raw.strip()
+        if fence is None:
+            if line == "```yaml":
+                fence = []
+            continue
+        if line == "```":
+            # An EVIDENCE fence is one where ANY line carries the
+            # line-number gutter. The catalog's fix recipes are also ```yaml
+            # and are legitimately gutter-free, so they are not policed. Keying
+            # off the FIRST line instead would let a fence whose excerpt opens
+            # on a blank source line smuggle prose through unchecked.
+            if any(gutter.match(ln) for ln in fence):
+                bad += [ln[:110] for ln in fence if not gutter.match(ln)]
+            fence = None
+            continue
+        if line:
+            fence.append(line)
+    if bad:
+        return Check(
+            name, False,
+            f"{len(bad)} non-source line(s) inside a yaml evidence fence — "
+            f"first: {bad[0]!r}",
+        )
+    return Check(name, True, "every fenced evidence line carries a gutter")
+
+
 def check_no_forged_headings(report: str) -> Check:
     """Every `## ` heading (outside code fences) is one the renderer emits.
 
@@ -1034,6 +1078,7 @@ def run_checks(
         check_no_scanner_internal_markers(report),
         check_config_hygiene_facts_rendered(report, findings_path),
         check_no_forged_headings(report),
+        check_source_fences_quote_only_source(report),
     ]
 
 

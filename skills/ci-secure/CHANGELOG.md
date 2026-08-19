@@ -13,6 +13,211 @@ entries are dated (UTC). Format loosely follows
 
 ### Added
 
+- **2026-08-18** — **The behavioral eval cases are executed, and a session that
+  never started no longer reads as a skill regression.** The five cases in
+  `evals/` were written for `claude plugin eval`, which is gated behind early
+  access, so nothing ran them and `evals/README.md` opened by saying so. They
+  now run on every pull request that touches this skill's contract, driven by a
+  maintainer-side harness. The README records what that harness does *not* do —
+  `llm` graders are reported rather than scored, and the cases' `allowed_tools`,
+  ablation arm, model pin and run count are not yet applied — so a pass under it
+  is not quoted as a pass under the runner the cases were written for. The
+  harness mounts a copy of the skill with the answer key removed, which closes
+  the free-pass half of the risk the vacuity rule documents *for that harness*;
+  under `claude plugin eval` the case files still ship and the residual stands.
+
+### Fixed
+
+- **2026-08-18** — **A case no longer fails because the agent read the file it
+  was asked to clear.** `pwn-request` asserts that no finding is attributed to
+  the clean workflow, and it looked for that attribution in the transcript —
+  which carries the output of every tool the session ran, not just the agent's
+  own words. The clean fixture's line 7 is the literal YAML key `jobs:`, so a
+  `grep -n` over the workflows printed the file, the line and the key on one
+  line and satisfied the pattern. A session that inspected the clean file
+  carefully — which the sibling grader rewards — was scored as having reported
+  a false finding. That grader now reads the rendered report, where no
+  `path:line:` prefix can occur, and a new invariant holds every
+  transcript-targeted negative to the same rule.
+
+- **2026-08-18** — **Counting graders count in the corpus they name.** The
+  `count:` match mode read the transcript whichever corpus its `target`
+  selected — the same wrong-corpus defect fixed for `contains`, surviving in
+  the branch beside it. No case uses `count:` today, so nothing was misreported;
+  the next one written against the report would have been.
+
+- **2026-08-18** — **A report the harness could not collect is reported as a
+  collection failure, not as a skill regression.** The guard for this only
+  fired when the session produced no file at all, and a session leaves scratch
+  files — so a missing report with any other file beside it failed every
+  report-anchored grader as though the scan had misbehaved. The guard now asks
+  for the report itself.
+
+- **2026-08-18** — **The skill's own changelog is no longer readable by a
+  graded session.** The harness mounts the skill for the agent under test and
+  withheld `evals/` and `tests/` as the answer key, but the changelog narrates
+  the graders and quotes their expected banner strings verbatim — so one read
+  of it satisfied a grader with no scan behind it. It is withheld too, and the
+  rule is now stated as a property (no mounted file may satisfy a grader)
+  rather than as a list of names.
+
+- **2026-08-18** — **A grader that pins a finding to its real file and line is
+  read against the report, not against whatever the session happened to print.**
+  Three graders are anchored on `report.py`'s `<file>:<line> — jobs:` evidence
+  bullet, deliberately: a model can paraphrase its summary a dozen ways, but
+  that bullet is byte-identical every run. The skill renders it into a report
+  file and prints a summary, and the harness graded only the transcript — so
+  `pwn-request` and `impostor-check-skipped` failed on runs where the scan had
+  found the right thing, at the right line, and written exactly the asserted
+  text, while `template-injection` passed on the same pattern only because that
+  session happened to run `grep -n`. Those three now declare `target: files`,
+  and the harness collects what the session wrote off disk alongside the
+  transcript, keeping the two corpora separate. The vacuity rule extends to
+  `files` graders, because `report.py` inlines catalog prose into the report it
+  renders.
+
+- **2026-08-17** — **A partial checkout no longer reports as complete
+  coverage.** Every detector reasons about the files it can see on disk, so a
+  `git sparse-checkout`, a partial clone, or a locally-deleted workflow was
+  invisible to the scanner: it ran on what was present, found nothing in what
+  was absent, and rendered `Coverage | ✅ complete — every workflow file was
+  scanned`. On a checkout holding 1 of a repository's 8 workflow files that
+  sentence reads as a clean bill of health for a repository the scan never
+  looked at, and it let the config facts assert *"all 1 workflow(s) declare
+  `permissions:`"* about seven files nobody opened. The scan now asks git for
+  the audited commit's own tree (`git ls-tree` reads the object database, so it
+  sees files a sparse checkout left out of the working tree) and folds every
+  absentee into `scan_incomplete`, which flips Coverage to **PARTIAL**, raises
+  the incomplete-coverage banner naming each unscanned file, and degrades the
+  affected config facts to `unmeasured`. This is the impostor check's rule
+  ("a check that could not run is NOT a pass") applied one layer down, to a
+  file that was never read. An inconclusive probe — not a git checkout, or git
+  cannot answer — reports no gap, so ordinary runs are unaffected. The probe
+  clears every git repository-selection variable (`GIT_DIR`, `GIT_WORK_TREE`
+  and friends) before running: `git -C <dir>` chooses a working directory, not
+  a repository, so an inherited `GIT_DIR` — which git hooks and `git worktree`
+  both export — would have pointed the probe at another repository, found no
+  workflows there, reported no gap, and silently restored the "complete
+  coverage" claim this fix exists to remove.
+
+### Added
+
+- **2026-08-17** — **Installing the gate now proves it can fail, before it is
+  handed back.** The gate ships in `--advisory` mode, so its first runs are
+  green by construction, and the runbook then asks for `--advisory` to come off
+  and the check to be made required — a blocking check trusted on the strength
+  of never having been seen go red, which is the failure this skill's own
+  reports preach against one level up. `vendor.py --into` now fires the freshly
+  vendored gate at a throwaway workflow that fails a named security fact
+  (`sec.permissions.workflow-declares`) and requires a non-zero exit that names
+  it, then at the same workflow with the hole closed and requires a 0 — a gate
+  wedged red reds on everything and proves nothing. It then reports what the
+  gate makes of the adopter's real tree, so "can it block" and "would it block
+  me" are both answered before anything is committed. **Nothing is written into
+  the adopter's repository to do this**: both fixtures are temporary files,
+  deleted afterwards, and no workflow of theirs is broken to stage a red. The
+  three outcomes are kept apart — proved, FAILED (do not report a working
+  install), and could-not-run (the engine needs Python 3.12 and PyYAML; the
+  installer needs neither) — because a missing interpreter and a gate that
+  cannot fail must never read as the same thing. Refreshes re-prove on the same
+  fixtures, there is no flag to skip the proof, and `vendor.py --self-test
+  <vendored dir>` re-runs it on demand. The proof also runs with bytecode
+  writing disabled, so it cannot leave a `__pycache__` that the adopter's own
+  drift check would then red on forever. The report of what the gate makes of
+  the adopter's real tree keeps the two kinds of red apart: failed facts, which
+  the shipped `--advisory` reports without blocking, and scan-integrity
+  failures, which survive the ramp and make the very first run red. That report
+  is withheld entirely unless the proof passed — a verdict from a gate that
+  just failed its own proof, or that could not run at all, is not an
+  observation about the adopter's code and is not offered as one — and a gate
+  that exits non-zero on their tree without naming a single finding is reported
+  as a scan that produced no usable result, never as a repository with nothing
+  to block.
+- **2026-08-17** — **An install into a repository that documents a
+  guard-registration convention says the new gate is not registered with it.**
+  A repository keeping a register of its build-breaking checks — a harness that
+  mutates each one and asserts it fires — gains, on install, a check that
+  register does not cover, and nothing said so. `CLAUDE.md`, `AGENTS.md` and
+  `CONTRIBUTING.md` are read for that convention and the matching line is
+  quoted back. Detection only: registering into an arbitrary repository's
+  harness means writing into files the installer knows nothing about.
+- **2026-08-17** — **The five behavioral eval cases are now runnable instead of
+  being documentation.** `evals/evals.json` described five scenarios in prose
+  and nothing executed them; the tests that referenced them (`test_loop_evals.py`
+  and `test_scan.py`) said so in their own docstrings, pinning the deterministic
+  scanner output underneath because the behavioral layer could not run. So a regression in the agent-facing
+  contract — the engine skipped in favour of eyeballing YAML, a skipped
+  network-gated check rendered as a pass, the complete finding table collapsing
+  into a capped four-option widget — was caught by nothing. The five cases are
+  now `evals/<case>/case.yaml` in the format `claude plugin eval` consumes,
+  each with a scaffold that materializes its cloaked fixtures into a real
+  `.github/workflows/` tree (and `git init`s it, so the skill's Phase 1 resolves
+  the sandbox rather than the harness's parent repository). Graders are
+  mechanical wherever the expectation allows: `tool_used` on the engine scripts,
+  and regexes anchored on strings only `run.py` or `report.py` can produce —
+  the scanner's string-sorted group list, the renderer's pre-drawn banner —
+  rather than on prose an agent could produce having merely read `SKILL.md`.
+  `evals.json` is retired; the case files are now the single source of truth.
+  **The suite has never been executed** — `claude plugin eval` is in early
+  access and gated on the authoring machine — and `evals/README.md` states
+  exactly what is and is not verified. `tests/test_evals_cases.py` validates
+  everything checkable without the runner, including a vacuity guard that fails
+  any trace regex matching text the skill itself ships — `SKILL.md`,
+  `references/`, `scripts/*.py` and `evals/README.md`, since the installer
+  copies all of them and one `Grep` puts any into the transcript — and guards
+  for the traps that fail silently:
+  a `Skill` `tool_used` grader demoted to unscored without `arm: both`, and
+  `max: 0` without `min: 0`. `evals/results/` is gitignored and now blocked from
+  the install surface by `tests/test_ci_secure_install_surface.py`, since the
+  installer honours no ignore file. The shared scaffold now refuses any working
+  directory that is not empty, and refuses one it cannot list rather than
+  reading an unreadable directory as an empty one: run by hand from a checkout
+  it would otherwise overwrite that repository's live `.github/workflows/` with
+  the vulnerable fixtures and commit them to the current branch. Three further
+  silent bypasses of the vacuity rule are closed: a regex grader with no
+  `target:` was exempt from it, a `not_contains` pattern could match its own
+  declaration and so never pass, and a pattern opening with a bare digit
+  matched inside a longer number — `0 critical findings` is contained in `10
+  critical findings`, so the zero-findings case passed under the one regression
+  it exists to catch. `allowed_tools` entries are now checked against the names
+  the runner can actually grant. And every case must carry an anchor that a
+  *completed* engine run satisfies and a failed one does not: `tool_used` sees
+  only that a command mentioned `run.py`, and an occurrence line on a short
+  fixture is one `grep -n` away, so `template-injection` gains the engine's own
+  printed group list alongside them.
+
+- **2026-08-17** — **A finding whose job sits behind a security gate that
+  cannot work now says so.** Previously every gate got the same sentence —
+  *"the finding stands only if that gate can be bypassed; verify it"* — which
+  is the wrong instruction when the gate compares against an event field the
+  workflow's own triggers never populate. Snowflake's `jira_issue.yml` (Wiz,
+  Jun 2026) gated on `github.event.pull_request.user.login` under an `issues`
+  trigger, where there is no pull request: the comparison ran against an empty
+  value, so the gate admitted every GitHub user while reading like it admitted
+  one bot. The evidence now names the dead field, and calls the gate INERT
+  where the condition is that comparison and nothing else. Deciding this is a lookup of
+  which trigger fills which event object, not a judgement about bypassability —
+  a gate is only called inert when NO trigger the workflow declares could
+  populate the field, and a trigger whose payload we cannot know (`workflow_call`
+  runs on the caller's event) yields no verdict at all. The direction is read
+  off the condition rather than assumed: the same dead comparison written with
+  `==` admits *nobody* instead of everybody, and a dead term sitting next to a
+  live one settles nothing, so those get the dead-field fact and the ordinary
+  "verify it" instead of a verdict. Injection findings
+  (P14.10) carry the gate note now — the dead-field half of it only, since an
+  injection is worth fixing whether or not its gate holds — and carry it
+  alongside the quoted excerpt rather than inside it, so the scanner's own
+  conclusion is never rendered as a line of your workflow file. Two payload
+  corrections ride along: `deployment` and `deployment_status` do populate
+  `github.event.workflow_run`, and a step with its own `if:` withdraws a
+  verdict about who reaches the job. Where no verdict is available, the note
+  says the dead comparison always evaluates the same way and stops there — it
+  does not call the term harmless, because a constant is the opposite of
+  harmless beside another term: `A && (empty == 'x')` is always false and shuts
+  the gate on its own, and `A || (empty != 'x')` is always true and opens it
+  whatever `A` says. No finding is added, removed, or re-scored by this — it changes what the
+  evidence tells you about findings the scan already reports.
+
 - **2026-08-15** — **The blocking rule is now part of the skill, as three
   independent names in `config.py`.** `BLOCKING_OUTCOMES` (which fact outcomes
   fail a build), `KNOWN_OUTCOMES` (which are recognised at all) and
@@ -59,6 +264,15 @@ entries are dated (UTC). Format loosely follows
   renderer delegates to it rather than keeping a copy: two copies of an
   escaping rule eventually differ, and the surface with the weaker copy is the
   one an attacker aims at.
+
+### Changed
+
+- **2026-08-17** — **`evals/evals.json` is retired.** Its prose moved into each
+  case's `description` and `expected_outcome` so the case files are the single
+  source of truth. Two expectations it carried are now documented rather than
+  graded — fix subagents staying inside their one target file, and the report's
+  scope-honesty line — and `evals/README.md` names both under "Not covered by
+  any grader".
 
 ### Fixed
 

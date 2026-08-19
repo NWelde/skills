@@ -913,6 +913,7 @@ def detect_yaml_run_injection(
         return
     compiled = re.compile(pattern)
     lines = text.splitlines()
+    triggers = _on_trigger_names(_get_on_node(doc))
     file_cursor = 0
     unanchored_reported = False
     for job in jobs.values():
@@ -1004,7 +1005,29 @@ def detect_yaml_run_injection(
                     f"{' <-- here' if i == lidx else ''}"
                     for i in range(start, stop)
                 )
-                yield RawHit(line=line_no, evidence=evidence, match_text=snippet)
+                # The gate note is a claim the SCANNER assembled, and this
+                # detector's evidence is a verbatim excerpt — concatenating
+                # them would render scanner prose inside the report's ```yaml
+                # source fence. `derived_note` is the channel for exactly
+                # this shape (see RawHit).
+                #
+                # Only the dead-field verdict is carried here. The generic
+                # "stands only if that gate can be bypassed" is true of the
+                # correlated chains, whose payoff leg IS the untrusted
+                # trigger; it is false of an injection, which this catalog
+                # entry says is worth fixing even on a trusted trigger. And a
+                # step with its own `if:` withdraws the verdict entirely: the
+                # finding is the STEP, so a statement about who reaches the
+                # JOB would talk past the live control.
+                gate = "" if step.get("if") is not None else _gate_note(
+                    job, triggers, dead_field_only=True,
+                )
+                yield RawHit(
+                    line=line_no,
+                    evidence=evidence,
+                    match_text=snippet,
+                    derived_note=gate.strip() or None,
+                )
 
 
 def detect_yaml_path_absent(
@@ -1302,6 +1325,75 @@ def _git_commit_sha(root: Path) -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None
+
+
+# Every environment variable that can override which repository a git command acts
+# on. `git -C <dir>` does NOT outrank them, so any probe that must read a specific
+# checkout has to clear them first.
+_GIT_REPO_SELECT_ENV = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+})
+
+
+def _workflow_files_absent_from_tree(root: Path) -> list[str]:
+    """Workflow files that exist in the audited COMMIT but not in the working tree.
+
+    Everything else in this scanner reasons about the files it can see on disk, so
+    a **partial** checkout (``git sparse-checkout``, a partial clone, a file deleted
+    without committing) is invisible to it: the detectors run on what is present,
+    find nothing in what is absent, and the report renders
+    ``✅ complete — every workflow file was scanned``. That is the single most
+    dangerous sentence this tool can emit, because it reads as a clean bill of
+    health for a repository the scan never looked at. It is the same failure the
+    network-gated impostor check already refuses to commit ("a skipped check is
+    NOT a pass"), one layer down.
+
+    Asking git for the commit's own tree is the only reliable way to see the gap:
+    ``git ls-tree`` reads the object database, so it lists files a sparse checkout
+    left out of the working tree entirely. Files that ARE present are handled by
+    ``_probe_scannability``; this only reports absence.
+
+    Returns repo-relative paths, sorted. Empty when the tree is complete, when
+    ``root`` is not a git checkout, or when git cannot answer — an inconclusive
+    probe must never manufacture a coverage gap, since that would degrade every
+    report run outside a git checkout.
+    """
+    # `git -C` selects a working DIRECTORY, not a repository: an inherited absolute
+    # GIT_DIR / GIT_WORK_TREE outranks it and would point this probe at some other
+    # repository entirely. That repo's tree lists no workflows, the probe reports no
+    # gap, and a partial checkout renders "complete coverage" again — the very bug
+    # this function exists to prevent, restored silently by an environment variable.
+    # git hooks and `git worktree` commands both export these, so scrub every
+    # repository-selection variable and let `-C` decide.
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REPO_SELECT_ENV}
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z",
+             "HEAD", "--", ".github/workflows"],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    absent = []
+    for rel in result.stdout.split("\0"):
+        rel = rel.strip()
+        # Match the discovery surface: only files `all_workflow_files` would have
+        # picked up, so a stray README in .github/workflows/ is not a "gap".
+        if not rel or not rel.endswith((".yml", ".yaml")):
+            continue
+        if not (root / rel).is_file():
+            absent.append(rel)
+    if absent:
+        logger.warning(
+            "coverage gap: %d workflow file(s) in the audited commit are absent "
+            "from the working tree (partial/sparse checkout) and were NOT scanned",
+            len(absent),
+        )
+    return sorted(absent)
 
 
 def _skill_commit_sha() -> str | None:
@@ -4043,14 +4135,167 @@ def _correlation_untrusted_trigger_writes_cache(
                 evidence=(
                     f"{line:>4}: workflow runs on `pull_request_target` AND "
                     f"jobs.{job_name} writes the shared cache <-- here"
-                    + _gate_note(job)
+                    + _gate_note(job, triggers)
                 ),
                 match_text=job_name,
                 derived=True,
             )
 
 
-def _gate_note(job: Any) -> str:
+# Which top-level `github.event.*` objects each trigger's payload populates.
+# Deliberately partial in BOTH directions: a trigger absent from this table
+# makes the whole verdict unknowable (see `_inert_gate_objects`), and an object
+# absent from `_GATE_CHECKED_OBJECTS` is never judged at all. Both omissions
+# fail toward silence, which is the only safe direction for a check whose
+# false-positive would read "your security gate does nothing".
+_TRIGGER_EVENT_OBJECTS: dict[str, frozenset[str]] = {
+    "issues": frozenset({"issue", "label"}),
+    "issue_comment": frozenset({"issue", "comment"}),
+    "pull_request": frozenset({"pull_request", "label"}),
+    "pull_request_target": frozenset({"pull_request", "label"}),
+    "pull_request_review": frozenset({"pull_request", "review"}),
+    "pull_request_review_comment": frozenset({"pull_request", "comment"}),
+    "push": frozenset({"head_commit", "commits", "pusher"}),
+    "discussion": frozenset({"discussion"}),
+    "discussion_comment": frozenset({"discussion", "comment"}),
+    "workflow_run": frozenset({"workflow_run", "workflow"}),
+    "workflow_dispatch": frozenset({"inputs"}),
+    "repository_dispatch": frozenset({"client_payload"}),
+    "release": frozenset({"release"}),
+    "fork": frozenset({"forkee"}),
+    "label": frozenset({"label"}),
+    "milestone": frozenset({"milestone"}),
+    # `deployment` and `deployment_status` carry a top-level `workflow_run`
+    # (and `workflow`, `check_run`) whenever the deployment came from a
+    # workflow — the normal case, and exactly what such a job gates on.
+    "deployment": frozenset({"deployment", "workflow", "workflow_run"}),
+    "deployment_status": frozenset({
+        "deployment", "deployment_status", "workflow", "workflow_run",
+        "check_run",
+    }),
+    "check_run": frozenset({"check_run"}),
+    "check_suite": frozenset({"check_suite"}),
+    "registry_package": frozenset({"registry_package"}),
+    "schedule": frozenset(),
+}
+
+# The objects a gate is actually judged on. Restricted to the ones that carry a
+# real trust decision and whose payload membership is unambiguous.
+_GATE_CHECKED_OBJECTS = frozenset({
+    "pull_request", "issue", "comment", "discussion", "workflow_run",
+    "head_commit", "release", "client_payload", "review", "forkee",
+})
+
+_GATE_EVENT_REF_RE = re.compile(r"github\.event\.([a-zA-Z_][a-zA-Z_0-9]*)")
+
+# A whole `if:` that is nothing but one comparison of a `github.event.*` path
+# against a quoted literal. Anything else — a second term, a negation, a
+# function call, a comparison to another expression — is left undecided.
+# JSON's number grammar, which is what GitHub uses to decide whether a string
+# becomes a number or NaN. Deliberately stricter than `float()`: no leading
+# `+`, no surrounding space, no `inf`/`nan`, no underscores, no hex.
+_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+
+_GATE_LONE_COMPARISON_RE = re.compile(
+    r"^\s*(?:\$\{\{\s*)?"
+    r"github\.event\.(?P<obj>[a-zA-Z_][a-zA-Z_0-9]*)"
+    r"(?:\.[a-zA-Z_][a-zA-Z_0-9]*)*"
+    r"\s*(?P<op>==|!=)\s*"
+    r"(?P<lit>'[^']*'|\"[^\"]*\")"
+    r"\s*(?:\}\}\s*)?$"
+)
+
+
+_QUOTED_SPAN_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _strip_quoted(condition: str) -> str:
+    """`condition` with string literals blanked out.
+
+    A gate reading `github.event.pull_request.user.login != 'filed by
+    github.event.discussion bot'` does not read `github.event.discussion` —
+    that text is data. Counting it made a live gate report a dead field.
+    """
+    return _QUOTED_SPAN_RE.sub(lambda m: " " * len(m.group(0)), condition)
+
+
+def _inert_gate_objects(condition: str, triggers: list[str]) -> list[str]:
+    """`github.event.*` objects this gate reads that NO declared trigger fills.
+
+    snowflakedb/snowflake-connector-net's `jira_issue.yml` (Wiz, Jun 2026)
+    gated on `github.event.pull_request.user.login != '...'` while triggering
+    on `issues` and `issue_comment`. Neither payload has a `pull_request`, so
+    the comparison was `null != '...'` — always true. The gate looked like it
+    restricted the job to one bot account; it admitted every GitHub user, and
+    the job interpolated the issue title into a shell step holding a Jira API
+    token.
+
+    The rule is "no DECLARED trigger populates it", not "this trigger doesn't":
+    a workflow on both `issues` and `pull_request_target` reading
+    `github.event.pull_request` has a gate that is live half the time, which is
+    an ordinary bypass question and not this check's business.
+
+    Returns [] — no verdict — whenever any declared trigger is missing from
+    `_TRIGGER_EVENT_OBJECTS`. `workflow_call` is the load-bearing case: a
+    reusable workflow runs on the CALLER's payload, which this file cannot see,
+    so its event objects are unknowable rather than absent.
+    """
+    if not triggers:
+        return []
+    populated: set[str] = set()
+    for trigger in triggers:
+        if trigger not in _TRIGGER_EVENT_OBJECTS:
+            return []
+        populated |= _TRIGGER_EVENT_OBJECTS[trigger]
+    referenced = {
+        m.group(1)
+        for m in _GATE_EVENT_REF_RE.finditer(_strip_quoted(condition))
+    }
+    return sorted(
+        (referenced & _GATE_CHECKED_OBJECTS) - populated
+    )
+
+
+def _dead_comparison_verdict(condition: str, dead: list[str]) -> str:
+    """`"open"`, `"closed"`, or `""` for a gate built from one dead comparison.
+
+    Knowing that a term always compares against an empty value does NOT say
+    which way the gate falls. `null != 'bot'` is always true and admits
+    everyone — Snowflake's bug. `null == 'bot'` is always false and admits
+    nobody: still a broken gate, but describing it as "does not restrict who
+    reaches this job" tells the reader the exact opposite of what it does.
+    And a dead term inside `a && b` decides nothing at all, because the live
+    conjunct still restricts.
+
+    So a verdict is only offered when the ENTIRE condition is that one
+    comparison, and the operator settles the direction. Everything else falls
+    through to the neutral wording, which states the lookup fact and stops.
+    """
+    match = _GATE_LONE_COMPARISON_RE.match(condition)
+    if match is None or match.group("obj") not in dead:
+        return ""
+    literal = match.group("lit")[1:-1]
+    # GitHub casts both sides to a number when the types differ, and an absent
+    # value casts to 0. So it compares EQUAL to `''`, to `'0'`, to `'0.0'` —
+    # any literal worth zero inverts the whole operator table. Decline those.
+    #
+    # The parser has to be GitHub's, not Python's: a string becomes a number
+    # only "from any legal JSON number format, otherwise NaN". `'+0'` and
+    # `' 0 '` are NOT legal JSON, so GitHub reads NaN and the comparison is
+    # not equal to an absent value — a verdict is available. `float()` accepts
+    # both and would have thrown those verdicts away.
+    if not literal:
+        return ""
+    if _JSON_NUMBER_RE.fullmatch(literal) and float(literal) == 0:
+        return ""
+    return "open" if match.group("op") == "!=" else "closed"
+
+
+def _gate_note(
+    job: Any,
+    triggers: list[str],
+    dead_field_only: bool = False,
+) -> str:
     """A sentence naming this job's own `if:` condition, or "".
 
     cal.com's `pr.yml` gates its cache-writing job behind
@@ -4059,6 +4304,25 @@ def _gate_note(job: Any) -> str:
     suppression — trust gates are routinely bypassable, and deciding that here
     would be guessing — but a reader who cannot see it cannot triage the
     finding.
+
+    The one case we DO decide is a gate whose whole condition is a comparison
+    against an event object no declared trigger populates
+    (`_inert_gate_objects` + `_dead_comparison_verdict`). "Verify it" is the
+    wrong instruction there — there is nothing to verify — and the reader most
+    likely to miss it is the one who does not know which payload carries which
+    object. That is a lookup, not a judgement call.
+
+    The lookup alone is not the verdict, though. It says the comparison runs
+    against an empty value; the operator says whether that admits everyone or
+    nobody, and a second conjunct can make it moot either way. When the shape
+    does not settle that, the note reports the dead term as a fact and keeps
+    the ordinary "verify it" rather than guessing a direction.
+
+    `dead_field_only` drops the generic "verify it" half and returns "" unless
+    there is a dead field to report. P14.10 asks for that: an injection is
+    worth fixing whether or not its gate holds, so telling an injection's
+    reader the finding "stands only if that gate can be bypassed" would
+    contradict the catalog entry the finding cites.
     """
     if not isinstance(job, dict):
         return ""
@@ -4067,6 +4331,51 @@ def _gate_note(job: Any) -> str:
         return ""
     text = " ".join(str(condition).split())
     if not text:
+        return ""
+    dead = _inert_gate_objects(text, triggers)
+    if dead:
+        names = ", ".join(f"`github.event.{obj}`" for obj in dead)
+        trigger_list = ", ".join(f"`{t}`" for t in sorted(set(triggers)))
+        plural = len(dead) > 1
+        lookup = (
+            f"\n      this job carries a gate condition: {text} — it reads "
+            f"{names}, which no trigger this workflow declares "
+            f"({trigger_list}) ever populates, so "
+            + ("those comparisons are" if plural else "that comparison is")
+            + " against an empty value"
+        )
+        verdict = _dead_comparison_verdict(text, dead)
+        if verdict == "open":
+            return (
+                f"{lookup} and " + ("are" if plural else "is")
+            + " always true: the gate is INERT — it does "
+                f"not restrict who reaches this job"
+            )
+        if verdict == "closed":
+            return (
+                f"{lookup} and " + ("are" if plural else "is")
+            + " always false: the gate is INERT as a trust "
+                f"control — rather than restricting who reaches this job it "
+                f"blocks every run of it, so this job never runs under any "
+                f"trigger the workflow declares"
+            )
+        # NOT "cannot restrict anything". A dead comparison is a CONSTANT, and
+        # a constant is the opposite of harmless once other terms are in play:
+        # `A && (null == 'x')` is always false, so the dead term closes the
+        # whole gate by itself, and `A || (null != 'x')` is always true, so it
+        # opens the gate whatever `A` says. Nothing here evaluates a compound
+        # condition, so the honest statement is that the term is fixed and the
+        # gate's overall behaviour is unexamined — never that the term is inert
+        # on its own.
+        return (
+            f"{lookup} and therefore always "
+            + ("evaluate" if plural else "evaluates")
+            + " the same way, whoever triggered the workflow. What "
+            f"the gate as a whole then does — including whether a fixed term "
+            f"decides it outright — depends on the rest of the condition, "
+            f"which is not evaluated here — verify it"
+        )
+    if dead_field_only:
         return ""
     return (
         f"\n      this job carries a gate condition: {text} — the finding "
@@ -4161,7 +4470,7 @@ def _correlation_untrusted_checkout_executes(file_path: Path) -> Iterator[RawHit
             evidence=(
                 f"{line:>4}: job `{job_name}` on `{trig}` checks out "
                 f"`{ref_text}` then executes from the tree <-- here"
-                + _gate_note(job)
+                + _gate_note(job, sorted(triggers))
             ),
             match_text=job_name,
             derived=True,
@@ -5122,6 +5431,19 @@ def scan(
             rel = str(wf.relative_to(root))
             logger.warning("coverage gap: %s — %s", rel, reason)
             scan_incomplete.append({"workflow_file": rel, "reason": reason})
+    # A file that is not in the working tree AT ALL is the same coverage gap as one
+    # that could not be parsed — the detectors never ran on it — so it rides the
+    # same channel, which is what flips the report's Coverage row to PARTIAL, raises
+    # the incomplete-coverage banner, and (via config_facts) stops the config facts
+    # from claiming "all N workflow(s) declare permissions" when N is a fraction of
+    # the repository. A partial checkout must not read as a clean repository.
+    for rel in _workflow_files_absent_from_tree(root):
+        scan_incomplete.append({
+            "workflow_file": rel,
+            "reason": "present in the audited commit but absent from the scanned "
+                      "working tree (partial or sparse checkout) — never read, so "
+                      "its absence from the findings is NOT a pass",
+        })
     # A match a detector found but could not anchor to a line is a coverage gap
     # too — but a DIFFERENT one, kept in its own list. See `_DROPPED_MATCHES`:
     # the file here read and parsed fine, so its config facts are perfectly

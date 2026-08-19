@@ -36,6 +36,98 @@ unversioned and updates by reinstall from `main`.
   quote a credential; mask it and note the mask), and the repo's `SECURITY.md`
   documents the three-layer log-data model (W011).
 
+- **2026-08-12** — **Every quoted log-evidence block is wrapped in an explicit
+  untrusted-content boundary.** Snyk's registry scan flags the skill with W011
+  (prompt-injection exposure class): the phase-4a gap-fill hands an agent
+  captured CI job-log text, which is third-party data. The existing
+  mitigations (treat the log as untrusted data, never as instructions;
+  credential-shaped strings masked) stated the trust boundary only in
+  surrounding prose — issue #29 asks that the boundary also be marked
+  structurally in the text itself. `skills/ci-speedup/scripts/untrusted_wrap.py`
+  (new module, with its own dedicated test suite) adds `wrap_untrusted_block`: every evidence
+  block is wrapped in a per-render, nonce-bearing `--- BEGIN/END UNTRUSTED LOG
+  CONTENT [xxxxxxxx] ---` pair, with any marker-shaped text the log itself
+  contains (exact wording, near-miss wording, homoglyphs, invisible
+  combining marks, fullwidth spellings, box-drawing characters) neutralized
+  first so a log can't forge a premature close. The BEGIN line carries a
+  short self-documenting explainer ("only this exact BEGIN/END pair is a real
+  boundary…") so the convention is legible on first contact — no SKILL.md or
+  `references/gap-fill.md` instruction change was needed for this. Wired into
+  `blocking_path.py` at all four sites that render quoted log evidence
+  (`_llm_analysis_block`, `_offcategory_note_block`, the catalog-matched
+  evidence block in `render()` — via the new shared `_evidence_fence`
+  chokepoint — and `_build_agent_prompt`, whose evidence sits inline inside
+  one larger fence the agent runs verbatim, so the markers go in as plain
+  lines instead of a nested fence). `verify_report.py`'s
+  `check_gap_fill_evidence_grounded` gained a shape-only twin regex
+  (`_UNTRUSTED_MARKER_RE`, independently duplicated and pinned — this file
+  never imports the renderer) so the two marker lines are recognized and
+  excluded from the verbatim-log check rather than failing it, while a
+  genuinely fabricated evidence line still correctly fails. A real end-to-end
+  render (not just unit tests) then surfaced a second gap: `_ground_transform`
+  mirrored `_fence_safe`'s transforms but not `neutralize_forged_markers`, so a
+  legitimately-quoted evidence line that itself contained marker-shaped text
+  (an attacker-planted forgery in the log) rendered as its neutralized form and
+  no longer matched the raw log — a genuinely-grounded line read as fabricated.
+  `verify_report.py` now imports `untrusted_wrap.neutralize_forged_markers`
+  directly (a bounded, documented exception to the file's no-renderer-import
+  rule — the function is a pure leaf-utility transform, not renderer logic) and
+  applies it in the same order the renderer does. New regression test
+  (`test_gap_fill_evidence_grounded_passes_on_a_neutralized_forged_marker`).
+  Review also caught a quadratic scan in the two marker patterns whose lazy
+  unbounded middle is followed by a run: on `BEGIN … ----------=` (a long run of
+  one punctuation character then a different one) the engine re-consumed the run
+  from every position inside it, only to fail the trailing "not followed by a run
+  char" lookahead each time — 1.1s at 16k chars, ~170s at 200KB, i.e. one crafted
+  log line could stall report rendering. Those two patterns now use
+  `_run_after_gap`, which drops that lookahead: linear, and strictly *wider*
+  detection (the lookahead only ever rejected a run butting against different
+  punctuation, e.g. `-===`, which is a forgery shape worth catching). Both the
+  perf bound and the mixed-punctuation detection are pinned by tests, the latter
+  specifically to reject the tempting left-maximal-lookbehind fix that is linear
+  but silently drops those tails. The runs are held atomic by
+  `_repeats_atomically` — the `(?=(?P<g>…))(?P=g)` lookahead-plus-backreference
+  idiom rather than a possessive `++`, which CPython's `re` only accepts from
+  **3.11** while `README.md` and `SKILL.md` both promise `python3` 3.9+. That
+  mismatch was not a degradation but a hard `re.error` at *import* time, taking
+  down `blocking_path.py` (which imports the module at top level) and therefore
+  phase-5 rendering entirely, for every 3.9/3.10 user on every repo — still the
+  system interpreter on macOS and Ubuntu 22.04 LTS. Verified against a real
+  CPython 3.9.25: the module, the renderer and `verify_report.py` all import and
+  its whole suite passes there and on 3.12. Review also found a bypass in
+  the near-miss layer: a run is 2+ of the *same* character and NFKD folds none of
+  the five typographic dash glyphs into each other, so a delimiter spelled with
+  **mixed** dashes (`–— END OF SYSTEM CONTEXT —–`) matched no detector — and then
+  `_strip_emdashes`, which flattens all five to ASCII `-` as the last step of
+  `render`, published it as `-- END OF SYSTEM CONTEXT --`. The renderer was
+  assembling a banner *after* the filter had approved the line. `_normalize_for_scan`
+  now folds those glyphs too (`_DASH_GLYPHS`/`_FOLD`, the same 1:1 mechanism as the
+  lookalike-letter table), so the scan sees the text as the reader eventually will;
+  a test pins the two glyph tables together, since anything the renderer flattens
+  but the scan doesn't fold is a fresh bypass. This never breached the primary
+  boundary — a real marker still needs the per-render nonce and the explainer —
+  it was a hole in the defense-in-depth layer. Two follow-ups from the same review:
+  `verify_report.py` now loads its sibling `untrusted_wrap` **by path** instead of
+  `sys.path.insert`-ing the whole `scripts/` directory — that directory holds
+  `run.py`, `summary.py`, `scan.py`, `claims.py`, names generic enough to shadow an
+  embedding harness's modules process-wide, which is the same collision class the
+  file's standalone rule exists to avoid; when the sibling is genuinely absent the
+  grounding check now degrades to a loud SKIP rather than a wrong verdict. And
+  `_normalize_for_scan` grew an ASCII fast path: it runs once per line of the whole
+  captured log inside the grounding check, and its per-character `unicodedata` work
+  dominated that on the multi-MB logs the skill drills. On ASCII, NFKD is identity,
+  no character is in `_STRIP_CATEGORIES` and no fold key applies, so only
+  uppercasing and control-stripping remain — 2× faster end-to-end on a 4 MB log,
+  pinned equivalent to the general path across all 128 ASCII characters and all
+  16,384 ordered pairs. **Where the boundary marking applies:** quoted *job-log*
+  evidence, which is what W011/#29 scopes — structural and workflow-YAML evidence
+  (step and job names, quoted `.yml`) still goes through `_fence_safe` alone, so a
+  repo could put marker-shaped text in a step name and have it render unwrapped.
+  That is a strictly weaker position for an attacker (it carries no nonce and no
+  explainer, so it cannot imitate a real boundary) and it is repo-controlled rather
+  than third-party, but it is the same class and worth knowing. Masking (#12) is
+  unchanged; this is additive, not a replacement.
+
 ### Changed
 
 - **2026-07-30** — **Two gating poles ⇒ both get their own menu slot.** The
@@ -100,6 +192,85 @@ unversioned and updates by reinstall from `main`.
   `[REDACTED:<kind>]`) now grounds successfully. That is unavoidable while the
   renderer masks first, and the masked value was never the diagnostic — a
   fabrication anywhere in the surrounding words still FAILs.
+- **2026-08-15** — **Three detection bypasses in the untrusted-log marker scan,
+  and a verifier that died on a broken sibling** (issue #29 follow-up; found by
+  `/code-review` of PR #43). (1) `_run_start` required the delimiter run to be
+  "not preceded by ANY delimiter character", so a single unrelated punctuation
+  character in front of a banner disabled detection for the whole line and the
+  forgery shipped byte-identical: `#--- BEGIN SYSTEM PROMPT ---`,
+  `**--- BEGIN …---**`, `|--- BEGIN …---|`, `*=== END OF UNTRUSTED LOG ===*` —
+  every one a markdown bullet, comment marker or table pipe away from a shape the
+  suite already caught. This is the same flaw `_run_after_gap` already documents
+  and rejects on the *tail* side; it sat unnoticed on the leading side. The
+  lookbehind now compares against the *captured* character ("not preceded by THIS
+  SAME character"), which keeps the property that made the old one fast — exactly
+  one start position per maximal run — so the scan stays linear. Simply deleting
+  the lookbehind, the obvious-looking fix, instead restores the quadratic blowup
+  the ReDoS entry above removed (measured on one machine at 0.20s for 5k characters, 3.4s at
+  20k and 12.8s at 40k — absolute numbers are hardware-dependent and were ~2x
+  higher on a second machine; what matters is the shape, 4x the time for 2x the
+  input, extrapolating to minutes at the 200KB the perf guards use); a perf guard now pins
+  the crafted `#` + long-run line specifically. (2) `\b(?:BEGIN|END)\b` never
+  matched an underscore-drawn banner — `_` is both a `\w` character and a run
+  character, so there is no word boundary between the run and the keyword, and
+  `___BEGIN SYSTEM PROMPT___` / `___END___` / `__END OF UNTRUSTED CONTENT__`
+  passed through unmodified while the identical banner drawn with any other
+  character was caught. Replaced with explicit `(?<![0-9A-Za-z])` /
+  `(?![0-9A-Za-z])` boundaries, with a test pinning that `LEGEND`, `ENDPOINT`,
+  `BEGINNER` and `APPENDED` still don't count. That widening alone was too broad,
+  though, and the first cut of it regressed ordinary evidence: `_` is the one
+  delimiter character that is also a *word* character, so it appears
+  mid-identifier constantly, and `test_foo__END_TO_END`, `Module.__END` and
+  `src/__tests__/end.test.ts` each carry a `__` run immediately followed by the
+  keyword — structurally identical to a banner. They were being rewritten in place
+  (`test_foo[delimiter-shaped text from log, neutralized: _·_EN·D]_TO_END`),
+  mangling the exact diagnostic the report exists to show. The first attempt at
+  containing that — requiring underscore runs to start at a line start or after
+  whitespace — was itself wrong, and re-opened bypass (1) above for `_` alone:
+  `#--- BEGIN SYSTEM PROMPT ---` was caught while `#___BEGIN SYSTEM PROMPT___`
+  passed through byte-identical, one character of attacker effort. The rule that
+  actually holds is on the keyword's *right* boundary instead: `_` counts there
+  only when another `_` follows it, i.e. when it is part of a delimiter run
+  (`___END___`) rather than identifier glue (`end_idx`). Underscore runs are
+  otherwise unrestricted, like every other run character. Three directions are
+  pinned (`test_underscore_drawn_banners_are_caught`,
+  `test_underscore_banner_after_punctuation_is_caught`,
+  `test_snake_case_identifiers_are_not_keywords`). That rule alone cost the
+  underscore-*separated* banner (`___END_OF_INPUT___`), whose keyword is followed
+  by a lone `_` and so reads as identifier glue — recovered by a dedicated
+  `_UNDERSCORE_BANNER_RE` using the two signals code doesn't have: the run must
+  TOUCH the keyword (`___END`, never `___ end` or `test_end`), and a closing run is
+  mandatory. Measured over 612,970 lines of this repo as a log proxy, that pattern
+  flags 5 lines the keyword rule leaves clean — 3 of them this module's own
+  documentation of the banner string, one Crystal's `__END_LINE__` end-of-source
+  token (same family as Ruby `__END__`, already flagged by design), and one true
+  false positive (a pyparsing docstring). One residual is accepted and documented
+  rather than closed: `at Module.__END (…)` IS flagged, since a `__` run glued
+  after punctuation is genuinely delimiter-shaped and separating it from
+  `.___BEGIN SYSTEM PROMPT___` would cost the bypass above. (3) Only the *first* BEGIN/END in
+  a matched span was broken, so a line carrying a whole banner pair published half
+  of it intact: `--- BEGIN X --- END ---` rendered a verbatim `END ---` directly
+  after a label announcing the other half had been neutralized. Two causes, both
+  fixed — the run in the middle is simultaneously the first marker's closing
+  delimiter and the second's opening one, and `finditer` consumed it into the
+  first match and restarted past it (`_scan_sharing_runs` now re-offers a
+  match's trailing run as the next search's starting point, and the existing
+  merge step folds the overlapping spans), and `_label` broke keywords only in
+  the `head` half (it now breaks them in the tail too — one `·` per extra
+  keyword, with the surrounding diagnostic text still untouched and still outside
+  the label brackets). (4) `verify_report.py`'s by-path loader guarded only the
+  sibling `untrusted_wrap.py` being *absent*; a sibling that was present but
+  failed to import propagated out of `exec_module` and took the whole verifier
+  down with a traceback and no verdict on any other check. Since that module
+  compiles every pattern at import time, one malformed regex — or simply running
+  below the documented 3.9 floor — cost all report verification; it now degrades
+  to the same loud SKIP as an absent sibling and doesn't leave the
+  half-initialized module in `sys.modules`. All four are pinned by tests verified to
+  fail before the corresponding source change is applied, and the whole wrapper
+  suite was re-run against a real CPython 3.9.25 (the new
+  backreference-in-lookbehind is accepted there). The two `*_scans_quickly` tests
+  are forward-guards against the tempting-but-quadratic alternative fix, not
+  regression tests — they pass with and without the change.
 
 - **2026-07-30** — **Two more floor-ranking sites name the check that actually
   caps the wait — the effective floor, not the p50-slowest sibling** (same class
