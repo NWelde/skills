@@ -355,37 +355,87 @@ def discover_workflow_files(root: Path, globs: list[str]) -> list[Path]:
     otherwise be interpreted as a character class and match nothing — every
     workflow silently invisible, the scan "clean".
 
-    A glob hit that is a symlink is trusted only if it resolves to somewhere
-    inside ``.github/workflows/``. A symlink escaping that directory would
-    otherwise have its target read, quoted in evidence, and its path shown in
-    the report — disclosing filesystem content the scan was never scoped to
-    touch. Escaping and dangling symlinks are both excluded here and recorded
-    as coverage gaps (never silently dropped) via `_record_dropped_match`,
-    keyed on the symlink's own in-repo path — never the resolved target — so
-    nothing the fix exists to hide leaks back in through the report.
+    A match is trusted only if its FULLY RESOLVED path lands inside a
+    genuinely real (non-symlinked) ``.github/workflows/`` directory. This has
+    to be checked for every match, not only ones where the glob hit itself is
+    a symlink: `glob.glob` follows a symlinked ancestor directory (e.g.
+    `.github/workflows/` or `.github/` itself is a symlink to somewhere else)
+    transparently, so the entries it returns for that case are
+    already-dereferenced regular files that never test True for
+    `.is_symlink()` — gating the check on the leaf's own symlink-ness would
+    silently let that whole class through.
+
+    The boundary used for containment must NOT itself be produced by
+    resolving through the same symlink being guarded against — comparing a
+    resolved match against a boundary that is *also* `.github/workflows/`
+    resolved makes the check self-referential and trivially true no matter
+    where the symlink points. So the boundary is built by joining
+    `root.resolve()` with the literal ``.github/workflows`` components
+    (never resolving them), then compared against what `.github/workflows/`
+    actually resolves to on disk: if they differ, some symlink in `.github/`
+    or `.github/workflows/` redirected the whole directory elsewhere, and
+    every match reached through it is out of scope regardless of its own
+    name. Only once that boundary is confirmed real does a per-file check
+    catch an individual escaping or dangling symlink *inside* it, exactly as
+    before. Excluded matches are recorded as coverage gaps (never silently
+    dropped) via `_record_dropped_match`, keyed on the match's own in-repo
+    path — never the resolved target — so nothing this check exists to hide
+    leaks back in through the report.
+
+    A committed symlink LOOP (`a.yml -> b.yml -> a.yml`, or `.github/workflows`
+    itself looping) makes `.resolve()` raise `RuntimeError` ("Symlink loop
+    from ...") rather than return a path — `OSError` is also guarded against,
+    since other unresolvable-path failures (permission, `ELOOP` from the
+    platform) surface that way. Unguarded, this is an attacker-committed
+    crash: one cyclic symlink takes the whole scan down instead of being
+    excluded like any other untrustworthy entry. Both resolve points below
+    are guarded and route into the same skip-and-record path as an escaping
+    or dangling symlink, so a loop degrades coverage instead of aborting the
+    scan.
     """
     seen: set[Path] = set()
-    wf_dir = (root / ".github" / "workflows").resolve()
+    wf_dir_on_disk = root / ".github" / "workflows"
+    wf_dir_expected = root.resolve() / ".github" / "workflows"
+    try:
+        wf_dir = wf_dir_on_disk.resolve()
+        wf_dir_is_trustworthy = (wf_dir == wf_dir_expected)
+    except (OSError, RuntimeError):
+        # `.github/workflows/` (or `.github/`) is itself an unresolvable
+        # symlink (e.g. a cycle) — nothing reached through it can be trusted.
+        wf_dir = None
+        wf_dir_is_trustworthy = False
     root_pattern = glob.escape(str(root))
     for pattern in globs:
         for match in glob.glob(os.path.join(root_pattern, pattern), recursive=True):
             match_path = Path(match)
-            if match_path.is_symlink():
-                target = match_path.resolve()
-                if not target.exists():
-                    _record_dropped_match(
-                        match_path, "symlink target does not exist",
-                        kind=_KIND_NOT_SCANNED)
-                    continue
-                try:
-                    target.relative_to(wf_dir)
-                except ValueError:
-                    _record_dropped_match(
-                        match_path,
-                        "symlink target outside .github/workflows/",
-                        kind=_KIND_NOT_SCANNED)
-                    continue
-            p = match_path.resolve()
+            if not wf_dir_is_trustworthy:
+                _record_dropped_match(
+                    match_path,
+                    "resolves outside .github/workflows/ (.github/ or "
+                    ".github/workflows/ itself is a symlink, or is part of "
+                    "a symlink loop)",
+                    kind=_KIND_NOT_SCANNED)
+                continue
+            try:
+                p = match_path.resolve()
+            except (OSError, RuntimeError):
+                _record_dropped_match(
+                    match_path, "symlink loop — could not be resolved",
+                    kind=_KIND_NOT_SCANNED)
+                continue
+            if not p.exists():
+                _record_dropped_match(
+                    match_path, "symlink target does not exist",
+                    kind=_KIND_NOT_SCANNED)
+                continue
+            try:
+                p.relative_to(wf_dir)
+            except ValueError:
+                _record_dropped_match(
+                    match_path,
+                    "symlink target outside .github/workflows/",
+                    kind=_KIND_NOT_SCANNED)
+                continue
             if p.is_file():
                 seen.add(p)
     return sorted(seen)
