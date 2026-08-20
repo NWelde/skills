@@ -371,6 +371,28 @@ entries are dated (UTC). Format loosely follows
 
 ### Fixed
 
+- **2026-08-20** — **A symlinked workflow entry can no longer make the
+  scanner read outside `.github/workflows/`.** `discover_workflow_files`
+  resolved every glob hit before reading it but never checked the resolved
+  path stayed inside the workflows directory, so a committed symlink such as
+  `.github/workflows/build.yml -> ../../../../etc/passwd` was followed like
+  any ordinary file — its content scanned and, on a HIGH finding, its path
+  and text quoted straight into the report (issue #37). Discovery now checks
+  containment before trusting a symlink: one that resolves outside
+  `.github/workflows/`, or that dangles (points at nothing), is excluded and
+  logged as a `coverage_notes` gap instead of read — named by the symlink's
+  own in-repo path, never by the target it pointed at, so the report can say
+  a file was skipped without disclosing what it would have disclosed.
+  `_undiscovered_workflows` was taught to recognize that skip so it doesn't
+  also flag the same file as a broken scan and force a `CoverageError`. A
+  latent bug in `_repo_relative` rode along: it re-resolved a path's leaf
+  component when formatting it for the report, which for a dangling symlink
+  displayed the nonexistent target's name instead of the symlink's own —
+  the same class of disclosure this fix exists to close. It now resolves
+  only the parent directory, leaving the leaf name untouched. A same-scope
+  symlink (target still inside `.github/workflows/`) is unaffected and reads
+  normally.
+
 - **2026-08-19** — **The `Coverage:` line is copied, not recomputed, and a
   section link that stops resolving now fails the build.** Phase 3 defined
   `complete` as "every workflow file was scanned", which is one of the three gap

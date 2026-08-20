@@ -2134,3 +2134,140 @@ def test_evidence_gutter_check_tolerates_a_blank_source_line(
         assert re.match(r"\s*\d+:(?: |$)", line), (
             f"non-source line inside verbatim evidence: {line!r}"
         )
+
+
+# -----------------------------------------------------------------------------
+# symlinked workflow entries (issue #37)
+# -----------------------------------------------------------------------------
+
+
+def test_symlinked_workflow_escaping_the_directory_is_skipped_not_followed(
+    tmp_path: Path,
+) -> None:
+    """A `.github/workflows/*.yml` entry that is a symlink pointing outside
+    `.github/workflows/` must never be read: following it would surface the
+    target file's path and contents in evidence or coverage output,
+    disclosing filesystem content the scan was never scoped to touch."""
+    secret = tmp_path.parent / "outside-secret.yml"
+    secret.write_text("on: push\njobs:\n  b:\n    runs-on: x\n", encoding="utf-8")
+    _write_workflow(
+        tmp_path, "legit.yml",
+        "on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: echo hi\n",
+    )
+    wf_dir = tmp_path / ".github" / "workflows"
+    (wf_dir / "evil.yml").symlink_to(secret)
+
+    data = _scan_dir(tmp_path)
+
+    assert data["scanned_workflows"] == 1, "the escaping symlink was followed"
+    assert not any(
+        f.get("workflow_file", "").endswith("evil.yml") for f in data["findings"]
+    ), "the escaping symlink produced findings — it was read"
+    notes = data["coverage_notes"]
+    assert any(n["workflow_file"].endswith("evil.yml") for n in notes), (
+        "the skipped symlink must be named in coverage_notes"
+    )
+    assert not any("outside-secret" in n["reason"] for n in notes), (
+        "the coverage note must name the symlink, not disclose its target"
+    )
+
+
+def test_symlinked_workflow_inside_the_directory_is_read_normally(
+    tmp_path: Path,
+) -> None:
+    """A symlink whose target is still inside `.github/workflows/` is a
+    same-scope alias, not an escape — it must be discovered and scanned like
+    any other workflow file, not treated as suspicious merely for being a
+    symlink.
+
+    `real.yml` and `alias.yml` resolve to the same on-disk file, so they
+    collapse to one entry in `discover_workflow_files`'s de-duplicating
+    set — a pre-existing property of that dedup, not of the symlink-scope
+    check under test here. `affected_files` glob matching (each catalog
+    pattern's `.yml`/`.yaml` scope) runs against the RESOLVED path, so the
+    target also needs a `.yml` name for the detector to fire on it at all —
+    hence two `.yml` files rather than a same-scope symlink to an
+    arbitrarily-named body.
+    """
+    _write_workflow(
+        tmp_path, "real.yml",
+        "on:\n  issues:\n    types: [opened]\n"
+        "jobs:\n  b:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo '${{ github.event.issue.title }}'\n",
+    )
+    wf_dir = tmp_path / ".github" / "workflows"
+    (wf_dir / "alias.yml").symlink_to(wf_dir / "real.yml")
+
+    data = _scan_dir(tmp_path)
+
+    assert data["scanned_workflows"] == 1
+    assert not data["coverage_notes"]
+    assert any(
+        f["pattern"] == "P14.10" and f["workflow_file"].endswith("real.yml")
+        for f in data["findings"]
+    ), "the in-scope symlink's target was not read"
+
+
+def test_dangling_symlinked_workflow_is_skipped_with_a_coverage_note(
+    tmp_path: Path,
+) -> None:
+    """A symlink whose target does not exist must not vanish silently from
+    the scan the way it silently vanishes from a plain directory listing —
+    it is recorded as a coverage gap like any other unreadable workflow."""
+    _write_workflow(
+        tmp_path, "legit.yml",
+        "on: push\njobs:\n  b:\n    runs-on: ubuntu-latest\n"
+        "    steps:\n      - run: echo hi\n",
+    )
+    wf_dir = tmp_path / ".github" / "workflows"
+    (wf_dir / "broken.yml").symlink_to(wf_dir / "does-not-exist.yml")
+
+    data = _scan_dir(tmp_path)
+
+    assert data["scanned_workflows"] == 1
+    notes = data["coverage_notes"]
+    assert any(n["workflow_file"].endswith("broken.yml") for n in notes)
+    assert any("does not exist" in n["reason"] for n in notes)
+
+
+def test_undiscovered_workflows_excludes_recorded_symlink_skips(
+    tmp_path: Path,
+) -> None:
+    """A name `discover_workflow_files` already logged as a dropped,
+    out-of-scope symlink must not also be reported as undiscovered — that
+    would force a `CoverageError` (scan refuses to run) on the exact repo
+    this fix is meant to let scan cleanly, with a note instead of a crash."""
+    scan._DROPPED_MATCHES.clear()
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "legit.yml").write_text(
+        "on: push\njobs:\n  b:\n    runs-on: x\n", encoding="utf-8")
+    secret = tmp_path.parent / "outside.yml"
+    secret.write_text("on: push\n", encoding="utf-8")
+    (wf_dir / "evil.yml").symlink_to(secret)
+
+    discovered = scan.discover_workflow_files(
+        tmp_path, [".github/workflows/*.yml"])
+    missed = scan._undiscovered_workflows(tmp_path, discovered)
+
+    assert missed == [], f"symlink skip re-flagged as undiscovered: {missed}"
+    scan._DROPPED_MATCHES.clear()
+
+
+def test_undiscovered_workflows_still_catches_a_genuine_miss(
+    tmp_path: Path,
+) -> None:
+    """The exclusion added for recorded symlink skips must not blunt the
+    tripwire for an actual broken-discovery bug: a real file that discovery
+    silently dropped, with nothing recorded for it, must still be reported."""
+    scan._DROPPED_MATCHES.clear()
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    (wf_dir / "missed.yml").write_text(
+        "on: push\njobs:\n  b:\n    runs-on: x\n", encoding="utf-8")
+
+    missed = scan._undiscovered_workflows(tmp_path, discovered=[])
+
+    assert missed == ["missed.yml"]
