@@ -2,7 +2,8 @@
 
 ci-secure deliberately detects **ten** attack vectors, not the 25 patterns
 its catalog once held — the ten kept, and the 15 the rejection record below
-names and accounts for. This document is the reasoning, shipped with the skill
+names and accounts for, plus one adjacent practice recorded there as
+considered and excluded. This document is the reasoning, shipped with the skill
 so every finding can answer "why is this one of only ten?" — and so every
 future "shouldn't we add pattern X?" is tested against a written criterion
 instead of instinct. A census test binds the list below to the scanner's
@@ -151,6 +152,40 @@ while it remains a critical finding by membership).
 
 The removed patterns are not shipped with the skill; re-admitting any entry
 means passing this document's three tests and updating the census.
+
+### Build provenance and artifact attestation, evaluated against the three tests
+
+**Build provenance / artifact attestation** —
+`actions/attest-build-provenance`, cosign / sigstore signing, SLSA levels —
+was never a catalog pattern. Its evaluation is stated here so the absence is a
+decision on the record:
+
+1. **Outsider-chain test — fails.** Attestation does not sit between an
+   outsider and a compromise of *this* pipeline. It changes nothing an attacker
+   can do to the workflows in this repo: the fork PR still runs, the poisoned
+   cache is still restored, the interpolated title still reaches the shell.
+   What it adds is a signed statement that the **consumers** of what CI emits
+   can verify downstream — a different party, defending a different chain (a
+   substituted or forged artifact somewhere between this repo and them). The
+   one direction that does touch this pipeline is verifying what a workflow
+   *consumes* — `gh attestation verify` on a downloaded installer before
+   running it — and that is a second mitigation for a chain already in the ten
+   (P14.24), whose same-day fix is pinning. It adds no chain the catalog lacks.
+2. **Incident test — passes, and is not decisive.** Build-system compromise
+   and artifact substitution have happened in public; that is not in dispute.
+   The incidents the practice answers are consumer-side substitutions,
+   downstream of the pipeline this skill scans, so a pass here admits nothing
+   once test 1 has failed.
+3. **Same-day-fix test — fails.** "Attest your builds" is a program, not an
+   edit: it needs a decision about which artifacts count as releases, an
+   identity to attest to, and — the load-bearing half — a verifier on the
+   consuming side. That value is realized by the consumer, who is usually not
+   the maintainer reading the finding.
+
+The exclusion stands. A maintainer whose repo is clean against the ten is not
+"attestation-deficient", and saying so would be a finding a maintainer reads
+and cannot act on. It is not a catalog pattern, carries no pattern id, and does
+not change the counts the census checks.
 
 ## What "critical" means here
 

@@ -11,6 +11,21 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Changed
+
+- **2026-08-20** — **Build provenance and artifact attestation now have a
+  recorded verdict.** The rejection record in `references/why-these-ten.md`
+  accounted for the patterns the descope removed, and attestation —
+  `actions/attest-build-provenance`, cosign / sigstore, SLSA — appeared
+  nowhere, so a reader could only guess whether it had been weighed or
+  forgotten. It is now evaluated against the document's own three tests and
+  excluded on the record: attestation defends the consumers of what CI emits,
+  downstream of the pipeline this skill scans, and adopting it is a program
+  rather than a same-day edit. Because the entry carries no pattern id, the
+  census equality that pins every other rejection cannot see it, so a guard now
+  holds the verdict and its three adjudications in place. Documentation only —
+  no detector, catalog entry, pattern id or count changes.
+
 ### Fixed
 
 - **2026-08-19** — **A deferred file that cannot be read is now a stop, not an

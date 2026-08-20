@@ -130,6 +130,17 @@ unversioned and updates by reinstall from `main`.
 
 ### Changed
 
+- **2026-08-20** — **The storage boundary is stated instead of implied.**
+  `references/savings-methodology.md` sizes every finding on two axes — runner
+  minutes and wall clock — and said nothing about artifact and cache storage,
+  which is a separate line on the GitHub bill governed by `retention-days` and
+  cache eviction. The silence read as an oversight; it is a decision, and the
+  methodology now says so: nothing in it is sized in gigabytes, no saving it
+  claims reduces a storage charge, and storage that a fix adds is not netted
+  against the minutes it saves. A scope-claim guard holds the boundary in
+  place, since the file carries no substance floor of its own. Documentation
+  only — no behavior change.
+
 - **2026-07-30** — **Two gating poles ⇒ both get their own menu slot.** The
   ≤4-option fold used to collapse the second pole into "Fix all," leaving no
   way to pick pole 2 alone — a live user who had just fixed pole 1 had no
