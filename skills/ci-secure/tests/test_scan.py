@@ -2243,3 +2243,24 @@ def test_dedupe_applies_to_every_gap_bucket(
     ])
     assert [e["reason"] for e in result["coverage_notes"]] == [note]
     assert [e["reason"] for e in result["suppressed_findings"]] == [supp]
+
+
+def test_dedupe_is_scoped_per_bucket_not_across_buckets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teeth check: the same (file, reason) can legitimately land in TWO
+    buckets when it arrives under two different `kind`s — that is not a
+    duplicate, since `kind` is not part of the dedupe key `entry`. A dedupe
+    that (wrongly) checked membership across all three buckets combined,
+    instead of within each bucket, would drop the second occurrence here and
+    still pass every other test in this file, because none of them queue the
+    identical reason under two different kinds.
+    """
+    wf = tmp_path / ".github" / "workflows" / "ok.yml"
+    reason = "P14.24: jobs.build could not be located in the raw file"
+    result = _bucket_gaps(tmp_path, monkeypatch, [
+        _gap(wf, reason, scan._KIND_UNANCHORED),
+        _gap(wf, reason, scan._KIND_NOT_SCANNED),
+    ])
+    assert [e["reason"] for e in result["dropped_matches"]] == [reason]
+    assert [e["reason"] for e in result["coverage_notes"]] == [reason]
