@@ -2156,7 +2156,6 @@ def test_evidence_gutter_check_tolerates_a_blank_source_line(
 
 class _NoClearList(list):
     """A list whose ``clear()`` is inert.
-#NOTE: This just makes sure the Dropped matches are empty to make sure the if not logic works
 
     ``scan()`` opens by clearing ``_DROPPED_MATCHES``, so entries seeded before
     the call would be wiped before the bucketing loop that is under test ever
@@ -2167,7 +2166,6 @@ class _NoClearList(list):
     def clear(self) -> None:  # noqa: D102 - deliberately does nothing
         return
 
-#NOTE: Creating a benign repo to test the feature 
 
 def _bucket_gaps(tmp_path: Path, monkeypatch, queue: list[dict]) -> dict:
     """Scan a benign repo with `queue` standing in for `_DROPPED_MATCHES`."""
