@@ -142,6 +142,12 @@ _OPAQUE = frozenset({"source", ".", "eval", "exec", "trap", "bash", "sh", "zsh",
 _HEREDOC = re.compile(r"<<-?(?!<)\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
 _ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 
+# Fallback for a post-boundary line the tokenizer cannot handle: any `NAME=` or
+# `export NAME`. Only ever intersected with the watched GIT_* names, so its
+# looseness costs at most a false alarm on a line the guard already cannot read.
+_ASSIGN_LOOSE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)=")
+_EXPORT_LOOSE = re.compile(r"\bexport\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -234,8 +240,8 @@ def _assigned_vars(stmt: _Stmt) -> set[str]:
     return names
 
 
-def _walk(tokens: list[str], stack: list[str],
-          problems: list[str], lineno: int) -> list[_Stmt]:
+def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
+          state: dict | None = None) -> list[_Stmt]:
     """Split one line's tokens into statements, maintaining the block ``stack``.
 
     ``stack`` is carried ACROSS lines by the caller, which is the whole point:
@@ -243,7 +249,17 @@ def _walk(tokens: list[str], stack: list[str],
     seen as body, not as top level. Each statement records the depth at its own
     command word, so ``( unset GIT_DIR )`` — where the subshell opens inside the
     statement — is depth 1, not depth 0.
+
+    ``state`` carries the one piece of parser context that is neither a block
+    nor a statement: a ``function`` keyword still waiting for its ``{``. bash
+    accepts three spellings of a definition — ``f() {``, ``f () {`` and
+    ``function f {`` — and only the first two leave a ``()`` token for the brace
+    to see. Without the flag, ``function f {`` reads as a plain ``{ … }`` group,
+    which is env-transparent, so an ``unset`` inside a function that is never
+    called would be credited as unconditional top-level code.
     """
+    if state is None:
+        state = {}
     stmts: list[_Stmt] = []
     cur: list[str] = []
     cur_depth: int | None = None
@@ -261,10 +277,17 @@ def _walk(tokens: list[str], stack: list[str],
         if tok in _SEPS:
             close(tok)
             continue
+        if tok == "function" and not cur:
+            # `function name [()] {` — remember the keyword; the `{` may be on
+            # this line or the next one.
+            state["func_pending"] = True
+            cur.append(tok)
+            continue
         if tok in _BLOCK_OPEN:
             kind = _BLOCK_OPEN[tok]
-            if tok == "{" and "()" in cur:
-                kind = "function"      # `name() {` — a definition, not a call
+            if tok == "{" and ("()" in cur or state.get("func_pending")):
+                kind = "function"      # a definition, not a call
+                state["func_pending"] = False
             cur.append(tok)
             stack.append(kind)
             continue
@@ -298,6 +321,60 @@ def _walk(tokens: list[str], stack: list[str],
     return stmts
 
 
+def _reintroduced_after(lines: list[str], start: int,
+                        watched: set[str]) -> dict[str, int]:
+    """``{name: line}`` for every watched variable the hook puts BACK after the
+    boundary — an assignment, an ``export``, anywhere past the first git/pytest
+    statement.
+
+    The main walk stops at the boundary on purpose: an ``unset`` that late is
+    worthless, and counting it would erase the ordering half of the invariant.
+    But an *assignment* that late is the opposite — it is worth everything,
+    because it hands the addressing straight back to the pytest dispatch a few
+    lines below. ``unset GIT_DIR`` above the ``cd`` followed by
+    ``export GIT_DIR=…`` above ``pytest`` is a fully defeated scrub, and without
+    this pass the guard would call it compliant.
+
+    Deliberately blind to block depth and to ``&&``/``||`` gating, exactly like
+    ``_assigned_vars``: a re-export that only *might* run is still a re-export.
+    Lines the tokenizer cannot read fall back to a loose regex rather than being
+    skipped — this pass must not go quiet on shell it cannot model.
+    """
+    found: dict[str, int] = {}
+    heredoc: str | None = None
+
+    for i in range(start, len(lines)):
+        raw = lines[i]
+        if heredoc is not None:                 # inert text, not code
+            if raw.strip() == heredoc:
+                heredoc = None
+            continue
+
+        line = _strip(raw)
+        if not line:
+            continue
+
+        tokens = _tokenize(line)
+        if tokens is None:
+            names = set(_ASSIGN_LOOSE.findall(line)) | set(_EXPORT_LOOSE.findall(line))
+        else:
+            names = set()
+            # Fresh stack and a throwaway problem list: this pass judges names
+            # only, never structure, so block bookkeeping here cannot fail the
+            # hook for anything the pre-boundary walk already accepted.
+            for stmt in _walk(tokens, [], [], i, {}):
+                names |= _assigned_vars(stmt)
+
+        for name in sorted(names & watched):
+            found.setdefault(name, i)
+
+        m = _HEREDOC.search(line)
+        if m:
+            heredoc = m.group(1)
+
+    return found
+
+
 def _scan(hook_text: str) -> tuple[set[str], int | None, list[str]]:
     """Walk the hook once, stopping at the first git/pytest statement.
 
@@ -306,17 +383,23 @@ def _scan(hook_text: str) -> tuple[set[str], int | None, list[str]]:
     block depth 0, not gated behind ``&&``/``||``, not run in a subshell via
     ``&`` or a pipeline, and not re-assigned again before the boundary.
 
-    The walk STOPS at the boundary rather than reading on. An earlier version
-    kept scanning, so an ``unset`` sitting after the first git call still landed
-    in the returned set and the ordering half of the invariant never fired.
+    The walk STOPS crediting unsets at the boundary rather than reading on. An
+    earlier version kept scanning, so an ``unset`` sitting after the first git
+    call still landed in the returned set and the ordering half of the invariant
+    never fired. What the walk does keep reading past the boundary is
+    RE-INTRODUCTIONS: ``_reintroduced_after`` reports any assignment or export of
+    a scrubbed name below the boundary, since those defeat the scrub for the
+    pytest dispatch further down the hook.
     """
     unset_before: set[str] = set()
     boundary: int | None = None
     problems: list[str] = []
     stack: list[str] = []
     heredoc: str | None = None
+    state: dict = {}                 # cross-line parser context (see _walk)
+    lines = hook_text.splitlines()
 
-    for i, raw in enumerate(hook_text.splitlines()):
+    for i, raw in enumerate(lines):
         if heredoc is not None:
             # Here-doc body: inert text, never executed code. The delimiter may
             # be indented when the operator was `<<-`.
@@ -344,7 +427,7 @@ def _scan(hook_text: str) -> tuple[set[str], int | None, list[str]]:
                 f"line {i}: one-line `if …; then …; fi` — the guard models "
                 f"multi-line conditionals only; write it out: {line}")
 
-        for stmt in _walk(tokens, stack, problems, i):
+        for stmt in _walk(tokens, stack, problems, i, state):
             # Revocation first: `export GIT_DIR=…/.git` both puts the variable
             # back AND trips the boundary regex on its own path, so judging the
             # boundary first would drop the revocation on the floor.
@@ -490,6 +573,16 @@ def _violations(hook_text: str, required: set[str]) -> list[str]:
             "as absolute paths and they outrank both `cwd` and `git -C`, so every "
             "fixture test's git subprocess — and the hook's own "
             "`rev-parse --show-toplevel` — is aimed at the real repository.")
+
+    # The scrub also has to still be in force when pytest is finally launched:
+    # everything below the boundary runs ahead of, or is, the dispatch.
+    for name, line in sorted(_reintroduced_after(hook_text.splitlines(),
+                                                 boundary, required).items()):
+        problems.append(
+            f"line {line}: `{name}` is put back into the environment at or after "
+            f"the first git/pytest statement (line {boundary}), so the scrub above "
+            "is not in force when the suite is launched. Nothing below the "
+            "boundary may assign or export a scrubbed name.")
     return problems
 
 
@@ -605,6 +698,36 @@ python3 -m pytest -v
 # A function that defines the scrub and is never called.
 _UNSET_IN_UNCALLED_FUNCTION = f"""#!/bin/bash
 scrub() {{
+    unset {_ALL}
+}}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
+# The same dead scrub in bash's two other definition spellings. Only `name() {`
+# leaves a `()` token for the parser to notice, so these are where a "function
+# bodies are not top level" rule quietly stops applying if it keys on `()`.
+_UNSET_IN_KEYWORD_FUNCTION = f"""#!/bin/bash
+function scrub {{
+    unset {_ALL}
+}}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
+_UNSET_IN_SPACED_FUNCTION = f"""#!/bin/bash
+scrub () {{
+    unset {_ALL}
+}}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
+# The `function` keyword and its brace on separate lines — the flag has to
+# survive to the next line or the body reads as a plain `{{ … }}` group.
+_UNSET_IN_KEYWORD_FUNCTION_SPLIT_BRACE = f"""#!/bin/bash
+function scrub
+{{
     unset {_ALL}
 }}
 cd "$(git rev-parse --show-toplevel)" || exit 1
@@ -730,6 +853,29 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 python3 -m pytest -v
 """
 
+# The scrub is correct and correctly placed — and then the addressing is handed
+# straight back before the suite is launched. Everything below the boundary is
+# still upstream of pytest, so a re-export there is a defeated scrub, not a
+# late-but-harmless edit.
+_REEXPORTED_AFTER_BOUNDARY = f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+export GIT_DIR="$HOME/repo/.git"
+python3 -m pytest -v
+"""
+
+# Same defect, hidden in one dispatch arm — the shape a well-meaning "make the
+# uvx arm see the real repo" patch would actually take.
+_REEXPORTED_IN_A_DISPATCH_ARM = f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+if command -v uvx &> /dev/null; then
+    GIT_INDEX_FILE=/tmp/idx uvx --with pyyaml pytest -v
+else
+    python3 -m pytest -v
+fi
+"""
+
 
 @pytest.mark.parametrize("label,text", [
     ("a hook with no unset at all (the issue-14 state)", _NO_UNSET),
@@ -740,6 +886,10 @@ python3 -m pytest -v
     ("an unset inside a for-loop body", _UNSET_IN_FOR),
     ("an unset inside a case arm", _UNSET_IN_CASE),
     ("an unset inside a function that is never called", _UNSET_IN_UNCALLED_FUNCTION),
+    ("the same, declared with the `function` keyword", _UNSET_IN_KEYWORD_FUNCTION),
+    ("the same, declared as `scrub () {`", _UNSET_IN_SPACED_FUNCTION),
+    ("the same, with `function` and `{` on separate lines",
+     _UNSET_IN_KEYWORD_FUNCTION_SPLIT_BRACE),
     ("an unset gated behind &&", _UNSET_BEHIND_AND),
     ("an unset gated behind ||", _UNSET_BEHIND_OR),
     ("a backgrounded unset (subshell)", _UNSET_BACKGROUNDED),
@@ -757,6 +907,8 @@ python3 -m pytest -v
     ("a line continuation", _CONTINUATION),
     ("`echo unset …` sharing a line with a real command", _SMUGGLED_ON_ONE_LINE),
     ("an unbalanced block that desyncs depth tracking", _UNBALANCED_BLOCK),
+    ("GIT_DIR re-exported below the boundary, above pytest", _REEXPORTED_AFTER_BOUNDARY),
+    ("GIT_INDEX_FILE re-introduced inside a dispatch arm", _REEXPORTED_IN_A_DISPATCH_ARM),
 ])
 def test_checker_rejects_known_bad_hooks(label, text):
     assert _violations(text, set(_CANON)), f"checker failed to reject {label}"
