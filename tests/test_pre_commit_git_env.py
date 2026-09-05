@@ -41,6 +41,9 @@ leaking the whole environment:
 * ``scrub() { unset GIT_…; }`` that is never called
 * ``[ -n "$NOPE" ] && unset GIT_…`` / ``true || unset GIT_…``
 * ``unset GIT_… &`` and ``unset GIT_… | cat`` — subshells; the parent keeps them
+* ``{ unset GIT_…; } &`` and ``{ unset GIT_…; } | cat`` — a backgrounded or
+  piped GROUP; the group's own braces run in the current shell, but
+  backgrounding or piping the group as a whole still forks it
 * ``unset GIT_…`` followed by ``export GIT_DIR=…``
 * a here-doc whose body merely contains the text
 
@@ -240,6 +243,32 @@ def _assigned_vars(stmt: _Stmt) -> set[str]:
     return names
 
 
+def _find_async_group_starts(tokens: list[str]) -> set[int]:
+    """Indices of a `{` token whose matching `}` is immediately followed (same
+    line) by an async separator (`&`, `|`, `|&`).
+
+    An ordinary `{ …; }` group runs in the current shell, so its body counts
+    toward the same depth as the code around it — that's what
+    `_ENV_TRANSPARENT` encodes. But `{ unset GIT_DIR; } &` and
+    `{ unset GIT_DIR; } | cat` fork the group as a whole into a background job
+    or one side of a pipe, exactly like `unset GIT_DIR &` forks a bare
+    command — the parent shell never sees the unset. This pre-scan finds those
+    specific `{` occurrences so `_walk` can treat that one group as
+    NOT env-transparent, the same way it already treats `( … )`.
+    """
+    starts: set[int] = set()
+    opens: list[int] = []
+    for i, tok in enumerate(tokens):
+        if tok == "{":
+            opens.append(i)
+        elif tok == "}":
+            if opens:
+                open_idx = opens.pop()
+                if i + 1 < len(tokens) and tokens[i + 1] in _ASYNC_SEPS:
+                    starts.add(open_idx)
+    return starts
+
+
 def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
           state: dict | None = None) -> list[_Stmt]:
     """Split one line's tokens into statements, maintaining the block ``stack``.
@@ -250,20 +279,29 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
     command word, so ``( unset GIT_DIR )`` — where the subshell opens inside the
     statement — is depth 1, not depth 0.
 
-    ``state`` carries the one piece of parser context that is neither a block
-    nor a statement: a ``function`` keyword still waiting for its ``{``. bash
-    accepts three spellings of a definition — ``f() {``, ``f () {`` and
-    ``function f {`` — and only the first two leave a ``()`` token for the brace
-    to see. Without the flag, ``function f {`` reads as a plain ``{ … }`` group,
-    which is env-transparent, so an ``unset`` inside a function that is never
-    called would be credited as unconditional top-level code.
+    ``state`` carries the parser context that is neither a block nor a
+    statement, across BOTH lines:
+
+    * a ``function`` keyword still waiting for its ``{``. bash accepts three
+      spellings of a definition — ``f() {``, ``f () {`` and ``function f {`` —
+      and only the first two leave a ``()`` token for the brace to see. Without
+      the flag, ``function f {`` reads as a plain ``{ … }`` group, which is
+      env-transparent, so an ``unset`` inside a function that is never called
+      would be credited as unconditional top-level code.
+    * the trailing separator a line ends on. Bash treats a line ending in
+      ``&&``, ``||`` or ``|`` as a continuation with no backslash needed, so
+      ``[ -n "$SCRUB" ] &&`` on one line and ``unset GIT_DIR`` on the next is
+      one gated statement. Without carrying it, the next call starts fresh at
+      ``prev_sep=None`` and the gated ``unset`` reads as unconditional.
     """
     if state is None:
         state = {}
     stmts: list[_Stmt] = []
     cur: list[str] = []
     cur_depth: int | None = None
-    prev_sep: str | None = None
+    prev_sep: str | None = state.get("carry_sep")
+    trailing_sep = False
+    async_starts = _find_async_group_starts(tokens)
 
     def close(sep: str | None) -> None:
         nonlocal cur, cur_depth, prev_sep
@@ -273,10 +311,12 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
         cur, cur_depth = [], None
         prev_sep = sep
 
-    for tok in tokens:
+    for i, tok in enumerate(tokens):
         if tok in _SEPS:
             close(tok)
+            trailing_sep = True
             continue
+        trailing_sep = False
         if tok == "function" and not cur:
             # `function name [()] {` — remember the keyword; the `{` may be on
             # this line or the next one.
@@ -288,6 +328,8 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
             if tok == "{" and ("()" in cur or state.get("func_pending")):
                 kind = "function"      # a definition, not a call
                 state["func_pending"] = False
+            elif tok == "{" and i in async_starts:
+                kind = "async_group"   # backgrounded/piped as a whole — forks
             cur.append(tok)
             stack.append(kind)
             continue
@@ -295,6 +337,8 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
             kind = _BLOCK_CLOSE[tok]
             if tok == "}" and stack and stack[-1] == "function":
                 kind = "function"
+            elif tok == "}" and stack and stack[-1] == "async_group":
+                kind = "async_group"
             # Inside a `case`, a bare `)` terminates an arm PATTERN — it is not
             # a subshell close. Without this the arm would drive depth negative
             # and every later statement would read as top level.
@@ -317,7 +361,9 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
         if cur_depth is None and tok not in _LEADING_NOISE:
             cur_depth = _depth(stack)
         cur.append(tok)
-    close(None)
+    if not trailing_sep:
+        close(None)
+    state["carry_sep"] = prev_sep if trailing_sep else None
     return stmts
 
 
@@ -367,6 +413,50 @@ def _reintroduced_after(lines: list[str], start: int,
 
         for name in sorted(names & watched):
             found.setdefault(name, i)
+
+        m = _HEREDOC.search(line)
+        if m:
+            heredoc = m.group(1)
+
+    return found
+
+
+def _opaque_after(lines: list[str], start: int) -> dict[int, str]:
+    """``{line: command}`` for every ``_OPAQUE`` command (``source``, ``eval``,
+    ``trap``, …) at or after the boundary.
+
+    ``_scan`` already reports these ABOVE the boundary, because ``source``/
+    ``eval`` can re-introduce exactly the variables the unset just dropped, and
+    a membership test can't see into what they run. That hazard doesn't stop
+    existing at the boundary — everything from the boundary line down to the
+    pytest dispatch is still upstream of it, same as the assignments
+    ``_reintroduced_after`` already watches for. An opaque command there
+    defeats the scrub just as completely as a literal ``export GIT_DIR=…``,
+    it's just invisible to a check that only looks for assignments.
+    """
+    found: dict[int, str] = {}
+    heredoc: str | None = None
+
+    for i in range(start, len(lines)):
+        raw = lines[i]
+        if heredoc is not None:                 # inert text, not code
+            if raw.strip() == heredoc:
+                heredoc = None
+            continue
+
+        line = _strip(raw)
+        if not line:
+            continue
+
+        tokens = _tokenize(line)
+        if tokens is not None:
+            # Fresh stack/state: this pass judges command words only, never
+            # structure, so it cannot fail the hook for anything the
+            # pre-boundary walk already accepted or rejected.
+            for stmt in _walk(tokens, [], [], i, {}):
+                words = _words(stmt.tokens)
+                if words and words[0] in _OPAQUE:
+                    found.setdefault(i, words[0])
 
         m = _HEREDOC.search(line)
         if m:
@@ -576,13 +666,22 @@ def _violations(hook_text: str, required: set[str]) -> list[str]:
 
     # The scrub also has to still be in force when pytest is finally launched:
     # everything below the boundary runs ahead of, or is, the dispatch.
-    for name, line in sorted(_reintroduced_after(hook_text.splitlines(),
-                                                 boundary, required).items()):
+    lines = hook_text.splitlines()
+    for name, line in sorted(_reintroduced_after(lines, boundary, required).items()):
         problems.append(
             f"line {line}: `{name}` is put back into the environment at or after "
             f"the first git/pytest statement (line {boundary}), so the scrub above "
             "is not in force when the suite is launched. Nothing below the "
             "boundary may assign or export a scrubbed name.")
+
+    # And an opaque command down there is just as capable of re-introducing a
+    # scrubbed name as a literal assignment is — the guard can't read into it,
+    # so it can't rule that out.
+    for line, name in sorted(_opaque_after(lines, boundary).items()):
+        problems.append(
+            f"line {line}: `{name}` runs code the guard cannot inspect at or "
+            f"after the first git/pytest statement (line {boundary}); it may "
+            "re-introduce a scrubbed variable before the suite is launched.")
     return problems
 
 
@@ -741,6 +840,17 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 python3 -m pytest -v
 """
 
+# The same gate, but the `&&` sits at the end of the line with the `unset` on
+# the next one — no backslash needed, bash treats a trailing `&&`/`||`/`|` as
+# a continuation. This is the defect `_UNSET_BEHIND_AND` names, wrapped across
+# a newline instead of written on one line.
+_UNSET_BEHIND_MULTILINE_AND = f"""#!/bin/bash
+[ -n "$SCRUB" ] &&
+    unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
 # `||` — runs only when the left side fails.
 _UNSET_BEHIND_OR = f"""#!/bin/bash
 [ -z "$SCRUB" ] || unset {_ALL}
@@ -758,6 +868,23 @@ python3 -m pytest -v
 # In a pipeline — same subshell problem.
 _UNSET_IN_PIPELINE = f"""#!/bin/bash
 unset {_ALL} | cat
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
+# A `{ …; }` group is ordinarily env-transparent (it runs in the current
+# shell) — but backgrounding the GROUP AS A WHOLE still forks it, so the
+# unset inside never reaches the parent. Same defect as _UNSET_BACKGROUNDED,
+# one layer of braces removed.
+_UNSET_IN_BACKGROUNDED_GROUP = f"""#!/bin/bash
+{{ unset {_ALL}; }} &
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""
+
+# Same, piped instead of backgrounded.
+_UNSET_IN_PIPED_GROUP = f"""#!/bin/bash
+{{ unset {_ALL}; }} | cat
 cd "$(git rev-parse --show-toplevel)" || exit 1
 python3 -m pytest -v
 """
@@ -876,6 +1003,16 @@ else
 fi
 """
 
+# The scrub is correct, but something sourced below the boundary can re-export
+# a scrubbed name just as completely as a literal `export GIT_DIR=…` can —
+# `_reintroduced_after` only looks for assignments, so this used to pass.
+_SOURCED_AFTER_BOUNDARY = f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+source ./scripts/env.sh
+python3 -m pytest -v
+"""
+
 
 @pytest.mark.parametrize("label,text", [
     ("a hook with no unset at all (the issue-14 state)", _NO_UNSET),
@@ -891,10 +1028,15 @@ fi
     ("the same, with `function` and `{` on separate lines",
      _UNSET_IN_KEYWORD_FUNCTION_SPLIT_BRACE),
     ("an unset gated behind &&", _UNSET_BEHIND_AND),
+    ("the same gate, with && trailing the line and unset on the next",
+     _UNSET_BEHIND_MULTILINE_AND),
     ("an unset gated behind ||", _UNSET_BEHIND_OR),
     ("a backgrounded unset (subshell)", _UNSET_BACKGROUNDED),
     ("an unset inside a pipeline (subshell)", _UNSET_IN_PIPELINE),
     ("an unset inside an explicit ( ) subshell", _UNSET_IN_SUBSHELL),
+    ("an unset inside a { } group that is itself backgrounded",
+     _UNSET_IN_BACKGROUNDED_GROUP),
+    ("an unset inside a { } group that is itself piped", _UNSET_IN_PIPED_GROUP),
     ("GIT_DIR re-exported after the unset", _REEXPORTED_AFTER_UNSET),
     ("GIT_INDEX_FILE re-assigned after the unset", _REASSIGNED_AFTER_UNSET),
     ("the unset present only inside a here-doc body", _UNSET_IN_HEREDOC),
@@ -909,6 +1051,7 @@ fi
     ("an unbalanced block that desyncs depth tracking", _UNBALANCED_BLOCK),
     ("GIT_DIR re-exported below the boundary, above pytest", _REEXPORTED_AFTER_BOUNDARY),
     ("GIT_INDEX_FILE re-introduced inside a dispatch arm", _REEXPORTED_IN_A_DISPATCH_ARM),
+    ("a sourced file below the boundary, above pytest", _SOURCED_AFTER_BOUNDARY),
 ])
 def test_checker_rejects_known_bad_hooks(label, text):
     assert _violations(text, set(_CANON)), f"checker failed to reject {label}"
