@@ -44,7 +44,13 @@ leaking the whole environment:
 * ``{ unset GIT_…; } &`` and ``{ unset GIT_…; } | cat`` — a backgrounded or
   piped GROUP; the group's own braces run in the current shell, but
   backgrounding or piping the group as a whole still forks it
+* ``[ -n "$SCRUB" ] &&`` trailing a line, ``unset GIT_…`` on the next — the
+  same ``&&`` gate as above, just wrapped at a newline instead of written on
+  one line; bash needs no backslash for it to still be one statement
 * ``unset GIT_…`` followed by ``export GIT_DIR=…``
+* ``unset GIT_…`` above the boundary, ``source ./scrub-undo.sh`` below it —
+  the source can re-export a scrubbed name just as completely as a literal
+  ``export`` can, and the guard has to watch for it there too
 * a here-doc whose body merely contains the text
 
 So the scan now models real block structure with a stack (``if``/``fi``,
@@ -116,6 +122,11 @@ _COND_SEPS = frozenset({"&&", "||"})          # the next statement may not run
 _ASYNC_SEPS = frozenset({"&", "|", "|&"})     # subshell: env changes don't stick
 _SEPS = _SEQ_SEPS | _COND_SEPS | _ASYNC_SEPS
 
+# Of the separators above, only these actually CONTINUE a statement onto the
+# next line without a backslash — `;`/`;;`/`;;&`/`&` all END one, so a line
+# ending in `&` (backgrounded) or `;` says nothing about what follows it.
+_CONTINUES_LINE = _COND_SEPS | frozenset({"|", "|&"})
+
 # Words peeled off before identifying a statement's command word. These affect
 # identification ONLY — block depth is tracked separately by _walk, so listing
 # `if` here can no longer blind the depth counter (the original bug).
@@ -141,6 +152,18 @@ _ENV_TRANSPARENT = frozenset({"group"})
 # every statement this guard is ordering things against.
 _OPAQUE = frozenset({"source", ".", "eval", "exec", "trap", "bash", "sh", "zsh",
                      "dash", "env", "xargs", "nohup", "timeout"})
+
+# The subset of _OPAQUE that can hand a variable back to the CURRENT shell —
+# the only kind of leftover that matters below the boundary, where nothing is
+# executing "ahead of" the unset any more, only "ahead of pytest, in the same
+# shell". `source`/`.` run in this shell by definition; `eval` can export into
+# it; `trap` schedules code that runs in it later. `bash`/`sh`/`env`/`xargs`/
+# `nohup`/`timeout`/`exec` all fork or replace the process — none of them can
+# leave a variable behind for a LATER statement in this shell to inherit, and
+# several of those spellings (`timeout … pytest`, `env FOO=bar pytest`,
+# `exec pytest`) are exactly how a legitimate dispatch line looks.
+_OPAQUE_AFTER_BOUNDARY = frozenset({"source", ".", "eval", "trap"})
+_OPAQUE_AFTER_LOOSE = re.compile(r"\b(source|eval|trap)\b")
 
 _HEREDOC = re.compile(r"<<-?(?!<)\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?")
 _ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
@@ -255,6 +278,17 @@ def _find_async_group_starts(tokens: list[str]) -> set[int]:
     command — the parent shell never sees the unset. This pre-scan finds those
     specific `{` occurrences so `_walk` can treat that one group as
     NOT env-transparent, the same way it already treats `( … )`.
+
+    KNOWN LIMITATION: only catches the `{`, its `}`, and the trailing
+    separator all on ONE line. A group whose `}` sits on its own line, with
+    `&` following on that same line or a later one, is not detected and is
+    still credited as transparent. Closing that fully needs the async/not
+    decision made where `_walk` pops the block, informed by a separator that
+    may only be visible on a LATER call — the same kind of forward reference
+    `state["carry_sep"]` solves for `&&`/`||` gating, applied to block kind
+    instead. Left open here: retroactively revoking credit `_scan` already
+    folded into `unset_before` on an earlier line needs restructuring beyond
+    this fix's scope.
     """
     starts: set[int] = set()
     opens: list[int] = []
@@ -363,7 +397,11 @@ def _walk(tokens: list[str], stack: list[str], problems: list[str], lineno: int,
         cur.append(tok)
     if not trailing_sep:
         close(None)
-    state["carry_sep"] = prev_sep if trailing_sep else None
+    # Only `&&`/`||`/`|`/`|&` actually continue a statement onto the next
+    # line — `;` and `&` END one. Carrying either of those would misread an
+    # unrelated, unconditional next line as gated or backgrounded just
+    # because the PREVIOUS statement happened to end in `&` or `;`.
+    state["carry_sep"] = prev_sep if trailing_sep and prev_sep in _CONTINUES_LINE else None
     return stmts
 
 
@@ -422,17 +460,24 @@ def _reintroduced_after(lines: list[str], start: int,
 
 
 def _opaque_after(lines: list[str], start: int) -> dict[int, str]:
-    """``{line: command}`` for every ``_OPAQUE`` command (``source``, ``eval``,
-    ``trap``, …) at or after the boundary.
+    """``{line: command}`` for every ``_OPAQUE_AFTER_BOUNDARY`` command
+    (``source``, ``.``, ``eval``, ``trap``) at or after the boundary.
 
-    ``_scan`` already reports these ABOVE the boundary, because ``source``/
-    ``eval`` can re-introduce exactly the variables the unset just dropped, and
-    a membership test can't see into what they run. That hazard doesn't stop
-    existing at the boundary — everything from the boundary line down to the
-    pytest dispatch is still upstream of it, same as the assignments
-    ``_reintroduced_after`` already watches for. An opaque command there
-    defeats the scrub just as completely as a literal ``export GIT_DIR=…``,
-    it's just invisible to a check that only looks for assignments.
+    ``_scan`` already reports the full ``_OPAQUE`` set ABOVE the boundary,
+    because there anything the guard can't see into might run before the
+    scrub even happens. Below the boundary the question is narrower — not
+    "could this run before the unset" but "could this leave a variable behind
+    for pytest, launched later IN THIS SAME SHELL, to inherit" — so only the
+    commands that mutate the current shell's environment count:
+    ``source``/``.`` run in it directly, ``eval`` can export into it, and
+    ``trap`` schedules code that runs in it later. Reusing the full set here
+    would flag ``timeout … pytest``, ``env FOO=bar pytest`` and
+    ``exec pytest`` — all fork-or-replace, so none can hand anything back to a
+    later statement in this shell — and those are exactly how a legitimate
+    pytest dispatch reads. An opaque command that DOES qualify defeats the
+    scrub just as completely as a literal ``export GIT_DIR=…``; it's just
+    invisible to a check that only looks for assignments, which is why
+    ``_reintroduced_after`` alone isn't enough.
     """
     found: dict[int, str] = {}
     heredoc: str | None = None
@@ -449,13 +494,18 @@ def _opaque_after(lines: list[str], start: int) -> dict[int, str]:
             continue
 
         tokens = _tokenize(line)
-        if tokens is not None:
+        if tokens is None:
+            # Unmodellable shell must not go quiet here either — same
+            # convention as `_reintroduced_after`'s loose-regex fallback.
+            for name in set(_OPAQUE_AFTER_LOOSE.findall(line)):
+                found.setdefault(i, name)
+        else:
             # Fresh stack/state: this pass judges command words only, never
             # structure, so it cannot fail the hook for anything the
             # pre-boundary walk already accepted or rejected.
             for stmt in _walk(tokens, [], [], i, {}):
                 words = _words(stmt.tokens)
-                if words and words[0] in _OPAQUE:
+                if words and words[0] in _OPAQUE_AFTER_BOUNDARY:
                     found.setdefault(i, words[0])
 
         m = _HEREDOC.search(line)
@@ -1129,6 +1179,43 @@ BANNER
 unset {_ALL}
 cd "$(git rev-parse --show-toplevel)" || exit 1
 python3 -m pytest -v
+"""),
+    # A line ending in `&` or `;` TERMINATES a statement, it does not continue
+    # one — unlike `&&`/`||`/`|`, which do. A prior version of the multi-line
+    # `&&` fix carried every trailing separator, so a backgrounded command
+    # above the scrub, unrelated to it, made the guard read the unset below
+    # as gated too. It is not: the two statements are independent.
+    ("an unrelated backgrounded command directly above the scrub", f"""#!/bin/bash
+warm_cache &
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""),
+    ("an unrelated subshell command, `;`-terminated, directly above the scrub", f"""#!/bin/bash
+( echo warming ) ;
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+python3 -m pytest -v
+"""),
+    # `timeout`/`env`/`exec` all fork or replace the process — none can hand a
+    # variable back to a later statement in this shell — and each is exactly
+    # how a real dispatch line looks below the boundary. Only `source`/`.`/
+    # `eval`/`trap` count there; a prior version of the below-boundary opaque
+    # check used the full `_OPAQUE` set and rejected all three of these.
+    ("the dispatch wrapped in timeout, below the boundary", f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+timeout 600 python3 -m pytest -v
+"""),
+    ("the dispatch given an inline env var via `env`, below the boundary", f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+env PYTHONHASHSEED=0 python3 -m pytest -v
+"""),
+    ("the dispatch run via exec, below the boundary", f"""#!/bin/bash
+unset {_ALL}
+cd "$(git rev-parse --show-toplevel)" || exit 1
+exec python3 -m pytest -v
 """),
 ])
 def test_checker_accepts_valid_variations(label, text):
