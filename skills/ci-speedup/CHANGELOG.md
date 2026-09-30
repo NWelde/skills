@@ -13,6 +13,107 @@ unversioned and updates by reinstall from `main`.
 
 ### Added
 
+- **2026-09-30** — **The report now says, in plain English, which caches it held
+  back and why.** When the cache check (OPT79) could not reach a verdict on a
+  candidate cache, the Data sources table used to print an internal gate name as
+  the reason and did not name the jobs, and caches held back before any log was
+  read (a job that restores more than one cache, an unreadable `package.json`, a
+  cache that does not serve the install, a first step after the cache that is not a
+  recognised install, a separate save step) appeared only in the findings file's
+  tally. The `cache hit/miss verdicts` row now reads `N candidate cache(s) held
+  back (<job>, <job>, ...): <reason>.` and counts every candidate held back, before
+  or after its logs were read, naming the jobs (workflow-qualified where two
+  workflows share a job name, at most five and then "and K more", with anything a
+  repository controls escaped for the table). Every reason is a short phrase a
+  non-engineer can follow; a cache measured and judged fine is not listed. The
+  report's own self-check re-derives the count, the job list and the reason, and
+  fails if a held-back cache has no plain-English phrase rather than printing a
+  code.
+
+- **2026-09-25** — **The audit can now say a cache is costing you time, not just
+  that one is missing.** Every caching pattern in the catalog until now said "add a
+  cache"; none could see the case where restoring a cache takes longer than the
+  install it was meant to shorten, so a repo paying for a slow restore on every hit
+  got told its caching was fine. New catalog pattern OPT79 measures both sides from
+  the repo's own runs: for a job whose workflow file declares a cache-restore step
+  followed by a dependency install, the sampled runs are split into cache HITs and
+  cache MISSes by the verbatim cache line in each run's log, and the same three
+  steps — restore, install, and the cache's post save — are timed on both. When the
+  hit path is measurably slower, the finding says so, quotes the log line behind
+  every run's verdict, names the runner class the comparison was made on, and
+  credits the excess in runner-minutes. The fix it hands over is re-key or narrow
+  the cache first and re-measure; removing the cache is the second option, and the
+  prompt states plainly that removing it makes the miss-path numbers what every run
+  pays. It never says "just delete it", and it never buys the saving by installing
+  less. It withholds — visibly, with a per-gate tally on every run — unless the job
+  declares exactly one cache followed by an install, at least three hit runs and
+  three miss runs are classified from their logs, every credited run is on the same
+  runner label, the hit path is slower by at least the larger of 5 seconds and
+  20% of the miss path, the cache hits
+  on at least a quarter of classified runs, and the job sits below the workflow's
+  slowest-but-one job. The cache line is read only inside the restore step's own
+  section of the log, so a monorepo's build tool printing "cache miss" while it
+  runs the tests can never be mistaken for this cache; a run whose log shows both
+  a hit and a miss in that section, in either order, is excluded, never
+  guessed. It credits no
+  wall-clock time. A cache on a job the audit cannot prove is safe to shrink is
+  measured on exactly the same evidence and reported with no number attached: one
+  line saying the cache was measured to cost more than it saves, how much per
+  cache hit, how many runs that came from, and why it is not credited — and that
+  line says the saving is on the merge wait only for the job that actually sets
+  it, on a workflow that can gate a pull request at all. It adds nothing to any
+  total, and the report's own self-check re-derives it from the same per-run
+  measurements it re-derives the credited findings from. Reading the logs is the
+  main new cost, and it is capped at eight runs of one job, two jobs per workflow
+  and twenty-four fetches across the whole repository, spent on the
+  longest-running cached jobs in the repository first; the report states both how
+  many log reads were planned and how many were made. The install step is
+  recognised by the command it runs rather than by the name the author gave it, so
+  the near-universal "Install dependencies" spelling is not missed while a step
+  merely *named* after an install is not priced as one, and a step that installs
+  and then does something else is left alone rather than charging the something
+  else to the cache. A cache miss is read in the `setup-` actions' own wording and
+  in `setup-uv`'s as well as the cache action's, so a job that caches through
+  `setup-node`, `setup-python` or `uv` can report. The cache's post-save step is
+  never assumed to have taken no time: a save that did not finish, or whose step
+  the audit cannot find in the run at all, withholds instead of quietly inflating
+  the number, and a restore-only cache — which has no save — says so. A sampled
+  run whose log was never fetched is counted as unread rather than as a run with
+  nothing to say, so a thin result never gets blamed on the repository, and a
+  probe wave that mostly failed says that instead of "this cache rarely misses".
+  A workflow none of whose probed logs came back is named as unevaluated rather
+  than letting an absent finding read as a clean one. A repo that acts on this finding will still be marked down by
+  ci-score's dependency-caching check, which reads configuration only; reconciling
+  the two is an open decision, not a behaviour either skill implements today.
+  (#106)
+  **What it holds back on, and how it counts caches** (2026-09-30): a job is held
+  back, and counted under its reason, when its input is ambiguous. That covers a
+  cache saved in a separate `actions/cache/save` step; a `${{ … }}` cache input;
+  an unrecognised command (`cd web && npm ci`) between the cache and the install;
+  an install of a different package manager than the cache; a cache whose path
+  names no known package store (a browser or build-output cache pays off in a
+  later step, outside what is measured); a second cache anywhere in the job,
+  including the ones `setup-go` (v4+) and `setup-uv` (v5+) turn on by default and
+  caching actions such as `Swatinem/rust-cache` and `setup-gradle`; a step whose
+  times cannot be read; and a run that did not succeed. `setup-node` v5+ turns on
+  a package-manager cache by itself when `package.json` names the package
+  manager, so the audit reads `package.json` the way each `setup-node` version
+  does (v5: `packageManager` naming npm, yarn or pnpm; v6+: `devEngines` or
+  `packageManager` naming npm; off when `package-manager-cache` is not `true`; an
+  empty `cache:` input behaves like no input) and counts that cache only when it
+  is on. `package.json` is read once per repository, and only when a job needs it
+  — the one gh call the pattern adds besides the logs. An action pinned to a
+  commit SHA is treated as an unknown version, never as a version number read
+  from the SHA's leading digits. A restore from a fallback key (`Cache hit for
+  restore-key:`, a restored key that differs from the step's own, or a new cache
+  saved after the restore) is neither path of the comparison: it is excluded from
+  both, but still counts in the hit share, so the minutes are priced on the share
+  of runs that took the exact-hit path. When runs the audit read had to be set
+  aside and too few were left to compare, the reason given is the set-aside runs,
+  not a thin sample. When the audit read a cache's logs and still could not
+  decide, the data-sources table says how many caches that happened to and the
+  most common reason, even on a report with nothing else to show. (#106)
+
 - **2026-09-25** — **A checkout that occasionally hangs is now reported as a
   stalled fetch, with the two log lines that prove it — and with the retry that
   caps it.** Some repositories check out in seconds on most runs and in minutes

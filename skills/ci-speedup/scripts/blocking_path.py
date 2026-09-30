@@ -5191,6 +5191,44 @@ def _data_sources_footer(doc: dict[str, Any], repo: str,
     else:
         rows.append(("job logs", "not run",
                      "Sampled only for a slow pole worth log-level inspection"))
+    # The cache-cost comparison (OPT79) reads job logs during COLLECTION, not in
+    # the pole drill and not behind `--with-logs`, so the row above can honestly
+    # say "not run" while that comparison quotes real log lines. A separate row,
+    # deliberately: `logs_fetched` counts the pole logs the data bundle persists
+    # and `verify_report` re-derives that cell from the bundle, so folding a
+    # second kind of fetch into it would swap a false statement for a broken
+    # invariant. No probe planned → no row; a probe the reader never paid for is
+    # not a disclosure, it is noise.
+    _probe = ds.get("cache_probe_logs")
+    if isinstance(_probe, dict) and isinstance(_probe.get("probed"), int) \
+            and _probe["probed"] > 0:
+        _pn = _probe["probed"]
+        _rn = _probe.get("returned")
+        _rn = _rn if isinstance(_rn, int) else 0
+        # Probed-but-empty is its own fact: expired retention reads as "0 of 8",
+        # never as a comparison that had eight logs to work from.
+        cov = (f"{_pn} job log(s) read" if _rn == _pn
+               else f"{_rn} of {_pn} job log(s) returned content")
+        # The budget did not just cap the cost, it removed candidates. Saying
+        # only what was read hides that the comparison saw less of the repository
+        # than the selector asked for.
+        _pl = _probe.get("planned")
+        if isinstance(_pl, int) and _pl > _pn:
+            cov += f" ({_pn} of {_pl} planned)"
+        _bud = _probe.get("budget")
+        if isinstance(_bud, int) and _bud > 0:
+            cov += f" (capped at {_bud} for the repository)"
+        rows.append(("cache hit/miss log probe", cov,
+                     "Splitting a cached job's runs into cache hits and misses"))
+    # Candidates the probe read and then WITHHELD (too few misses, logs that
+    # never came back, a runner change…). Without this row the report reads
+    # "measured, nothing found" where the audit could not tell. `verify_report`
+    # re-derives both numbers from `opt79_withheld_candidates`.
+    _wn, _wtop = _opt79_withheld_summary(doc)
+    if _wn:
+        rows.append(("cache hit/miss verdicts",
+                     _opt79_held_back_cell(doc),
+                     "Why a candidate cache produced no finding and no uncredited line"))
     # WHICH workflow YAML fed the detectors. `collect_runs` stamps this, and until now
     # nothing rendered it — so the reader could not tell whether the `on:`/matrix/timeout
     # signals came off the audited checkout or off the default branch's HEAD (the two
@@ -5424,6 +5462,229 @@ def _pr_floor_fallback_banner(doc: dict[str, Any], cp: dict[str, Any]) -> list[s
             "the figures as the PR-floor accordingly.", ""]
 
 
+# The findings-doc keys the collector writes OPT79's uncredited rows and its
+# withheld candidates under. STRING CONTRACTS between files: renaming one in the
+# collector would stop its line rendering with nothing going red, so every side
+# names the constant and a coupling test pins them equal.
+_OPT79_UNCREDITED_DOC_KEY = "opt79_uncredited_pole_caches"
+_OPT79_WITHHELD_DOC_KEY = "opt79_withheld_candidates"
+
+
+def _opt79_uncredited_row_is_renderable(r: Any) -> bool:
+    """A row the uncredited block can state: a job name, a numeric excess and
+    integer hit/miss populations. Anything else would render as "by ?s" or
+    "None hit" — a measurement line with no measurement in it — so it is not
+    rendered, and `verify_report` fails on the count it no longer matches."""
+    if not isinstance(r, dict) or not str(r.get("job") or "").strip():
+        return False
+    waste = r.get("waste_s")
+    if isinstance(waste, bool) or not isinstance(waste, (int, float)):
+        return False
+    return all(isinstance(r.get(k), int) and not isinstance(r.get(k), bool)
+               for k in ("hits", "misses"))
+
+
+def _opt79_withheld_summary(doc: dict[str, Any] | None) -> tuple[int, str]:
+    """`(candidates withheld, the commonest gate)` from the collector's
+    withheld-candidate list; ties go to the alphabetically first gate. `(0, "")`
+    when nothing was withheld. `verify_report` re-derives the same pair."""
+    rows = [r for r in ((doc or {}).get(_OPT79_WITHHELD_DOC_KEY) or [])
+            if isinstance(r, dict)]
+    if not rows:
+        return 0, ""
+    counts: dict[str, int] = {}
+    for r in rows:
+        g = str(r.get("gate") or "unknown")
+        counts[g] = counts.get(g, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+    return len(rows), top
+
+
+# One plain-English phrase per gate that can land in `opt79_withheld_candidates`
+# (`collect_runs._OPT79_HELD_BACK_GATES`). The reader is a person who has never
+# seen a gate name, so each phrase says what was not established and why that
+# stops a verdict. `verify_report` carries an identical copy (it is a standalone
+# checker) and a test pins the two equal and complete. An unmapped gate renders
+# the fallback below and FAILS `verify_report`: a code is never printed.
+_OPT79_HELD_BACK_REASONS: dict[str, str] = {
+    # held back before any log was read
+    "cache_is_saved_by_a_separate_step":
+        "the cache is saved by its own separate step, so one restore-and-save "
+        "measurement can't cover it",
+    "setup_cache_input_is_an_unevaluated_expression":
+        "whether a setup step turns its cache on depends on a value that is "
+        "only known while the job runs",
+    "job_declares_more_than_one_cache_restore_step":
+        "the job restores more than one cache, so one hit/miss verdict can't "
+        "price it",
+    "setup_action_cache_default_depends_on_repository_files":
+        "whether a setup step's built-in cache is on depends on package.json, "
+        "which could not be read reliably",
+    "cache_action_is_not_one_this_pattern_measures":
+        "the job's only cache belongs to a tool that manages its own cache, "
+        "which this check does not measure",
+    "cache_step_has_no_renderable_name":
+        "the cache step has no name to look its time up by",
+    "install_step_also_runs_non_install_commands":
+        "the install step also runs other commands, so its time is not just "
+        "the install",
+    "no_install_step_after_the_cache_step":
+        "no dependency install follows the cache, so the cache is not shown to "
+        "speed anything up",
+    "first_step_after_cache_is_not_a_recognised_install":
+        "the first step after the cache is not a recognised dependency install, "
+        "so the cache may be feeding a different step",
+    "cache_path_names_no_known_package_store":
+        "the cache does not clearly hold a package manager's downloads, so it "
+        "is not shown to serve the install",
+    "install_package_manager_does_not_match_cache":
+        "the install uses a different package manager than the one the cache "
+        "holds, so the cache does not serve it",
+    "step_display_name_is_ambiguous_within_the_job":
+        "two steps in the job share the cache or install step's name, so their "
+        "times can't be told apart",
+    "runner_label_not_one_known_billed_label":
+        "the job's machine type is not one this report can price",
+    "beyond_the_per_workflow_candidate_log_budget":
+        "the workflow has more candidate caches than the per-workflow log "
+        "budget covers, and this one was not reached",
+    # held back after the logs were read
+    "restore_step_never_measured_in_any_occurrence":
+        "the cache's restore step never showed a time in any sampled run, so "
+        "its cost could not be measured",
+    "post_step_never_measured_in_any_occurrence":
+        "the cache's save step never showed a time in any sampled run, so the "
+        "cost of saving could not be measured",
+    "population_truncated_by_unread_logs":
+        "too many of the sampled runs' logs could not be read to tell how often "
+        "the cache hits",
+    "population_truncated_by_excluded_runs":
+        "too many of the sampled runs had logs that could not tell a cache hit "
+        "from a miss",
+    "fewer_than_min_hit_runs_classified":
+        "too few sampled runs hit the cache to compare a hit against a miss",
+    "fewer_than_min_miss_runs_classified":
+        "too few sampled runs missed the cache to compare a miss against a hit",
+    "no_monthly_volume":
+        "the job's monthly run count was unknown, so its saving could not be "
+        "sized",
+    "credited_runner_minutes_round_to_zero":
+        "the measured saving rounds down to zero runner-minutes a month",
+    "neutrality_margin_not_positive":
+        "the job is about as slow as its workflow's slowest jobs, so removing "
+        "the cache could not be shown to leave the pull-request wait unchanged",
+}
+_OPT79_HELD_BACK_UNMAPPED = "a reason this report has no plain-English wording for"
+_OPT79_HELD_BACK_MAX_JOBS = 5
+
+
+def _opt79_held_back_job_cell(text: object) -> str:
+    """A repo-controlled job or workflow name made safe for one table cell: no
+    newline, no unescaped pipe, no backtick or emphasis marker that a markdown
+    renderer (or the verifier's decoration strip) would treat as syntax."""
+    t = re.sub(r"\s+", " ", str(text)).strip()
+    t = t.replace("`", "'").replace("*", "'")
+    return t.replace("|", "\\|")
+
+
+def _opt79_held_back_labels(rows: list[dict[str, Any]]) -> list[str]:
+    """Distinct, sorted job labels. A job name that two workflows share is
+    qualified with its workflow file's base name, so the two stay tellable."""
+    def wf_of(r: dict[str, Any]) -> str:
+        return str(r.get("workflow_file") or "").rsplit("/", 1)[-1]
+    by_name: dict[str, set[str]] = {}
+    for r in rows:
+        by_name.setdefault(str(r.get("job") or "").strip(), set()).add(wf_of(r))
+    labels: set[str] = set()
+    for r in rows:
+        name = str(r.get("job") or "").strip() or "(unnamed job)"
+        shared = len(by_name.get(str(r.get("job") or "").strip(), ())) > 1
+        labels.add(f"{wf_of(r)} / {name}" if shared and wf_of(r) else name)
+    return sorted(labels)
+
+
+def _opt79_held_back_cell(doc: dict[str, Any] | None) -> str:
+    """`N candidate cache(s) held back (<jobs>): <plain-English reason>.` for the
+    Data sources row. The count and the most common gate (ties to the
+    alphabetically first) are `_opt79_withheld_summary`'s; `verify_report`
+    re-derives the whole sentence from the findings file."""
+    n, top = _opt79_withheld_summary(doc)
+    rows = [r for r in ((doc or {}).get(_OPT79_WITHHELD_DOC_KEY) or [])
+            if isinstance(r, dict)]
+    labels = [_opt79_held_back_job_cell(x) for x in _opt79_held_back_labels(rows)]
+    shown = labels[:_OPT79_HELD_BACK_MAX_JOBS]
+    jobs = ", ".join(shown)
+    if len(labels) > len(shown):
+        jobs += f", and {len(labels) - len(shown)} more"
+    reason = _OPT79_HELD_BACK_REASONS.get(top, _OPT79_HELD_BACK_UNMAPPED)
+    return f"{n} candidate cache(s) held back ({jobs}): {reason}."
+
+
+def _opt79_uncredited_block(doc: dict[str, Any] | None) -> list[str]:
+    """Caches MEASURED to cost more than they save on a job that is not below its
+    workflow's cluster floor — stated, with no number attached.
+
+    These are not findings and never enter a total: no runner-minutes, no
+    wall-clock claim, no neutrality certificate, no Tier-2 row. The measurement
+    is as real as a credited one; what is missing is the sizing.
+
+    WHY it is missing differs by job. `not below the cluster floor` spans
+    everything from the SECOND-ranked job upwards. Only the workflow's long
+    pole, on a workflow that can gate a PR, actually carries the merge wait
+    (`on_critical_path`). On a workflow no pull request runs
+    (`workflow_gates_pull_requests` false) there is no merge gate at all and the
+    saving is pure runner-minutes. For every other job at or above the floor the
+    saving is runner-minutes too, uncredited because this version cannot prove
+    shrinking it leaves the gate unchanged. The block says only what those
+    stamps support — never a merge wait or a merge gate on a workflow that has
+    none, and never "this workflow's slowest job" about a job that is not.
+
+    Rendered beside `_dropped_unprovable_banner`, its nearest precedent: a
+    measured fact deliberately kept out of the numbers and shown anyway. [] when
+    there is nothing to say."""
+    # A row with no job, no numeric excess or no integer populations cannot be
+    # stated. It is left out HERE and caught by `verify_report`, which fails when
+    # the rendered count differs from the rows the run measured — a malformed
+    # row reddens the report instead of vanishing from it.
+    rows = [r for r in ((doc or {}).get(_OPT79_UNCREDITED_DOC_KEY) or [])
+            if _opt79_uncredited_row_is_renderable(r)]
+    if not rows:
+        return []
+    lines = ["> [!NOTE]",
+             f"> **{len(rows)} cache(s) measured net-negative on a job this audit "
+             "cannot price.** Measured the same way as the credited ones, and "
+             "listed with no number because this version cannot size what "
+             "shrinking them is worth:", ">"]
+    for r in rows:
+        job = str(r.get("job") or "")
+        wf = str(r.get("workflow_file") or "")
+        waste = r.get("waste_s")
+        hits, misses = r.get("hits"), r.get("misses")
+        waste_txt = f"{float(waste):.0f}s"
+        where = f" in `{wf}`" if wf else ""
+        if r.get("on_critical_path"):
+            why = (f"`{job}` is this workflow's slowest job, so the saving is on "
+                   "the merge wait and is **not credited** in this version.")
+        elif r.get("workflow_gates_pull_requests") is False:
+            why = (f"`{job}` runs in a workflow that does not run on pull "
+                   "requests, so no pull request waits on it; the saving is "
+                   "runner-minutes only and is **not credited** in this version.")
+        else:
+            floor = r.get("floor_p50_s")
+            floor_txt = (f" ({float(floor):.0f}s)"
+                         if isinstance(floor, (int, float)) else "")
+            why = (f"`{job}` is at or above this workflow's second-slowest job"
+                   f"{floor_txt}, so this audit cannot prove that shrinking it "
+                   "leaves the merge gate unchanged; **not credited** in this "
+                   "version.")
+        lines.append(
+            f"> - a cache on `{job}`{where} measured net-negative by {waste_txt} "
+            f"per cache hit ({hits} hit / {misses} miss run(s) sampled); {why}")
+    lines += [">", "> Re-keying or narrowing such a cache is the same fix as the "
+              "credited ones; only the size of the win is unstated here.", ""]
+    return lines
+
+
 def _dropped_unprovable_banner(dropped: list[dict[str, Any]] | None) -> list[str]:
     """A note naming cache findings the `--with-logs` admission gate removed (the
     logs couldn't prove the cacheable work runs). Kept VISIBLE so the drop is
@@ -5494,8 +5755,8 @@ def _group_by_pattern_ranked(
     (12), which holds today — is never the row suppressed by the cap. The rest are ranked by
     cloud-bill saving desc (then severity, then pattern id). Used by the off-path appendix.
 
-    Grouping is by pattern id EXCEPT for OPT73 and OPT77, each of which is keyed by its
-    own identity (pattern + workflow + jobs).
+    Grouping is by pattern id EXCEPT for OPT73, OPT77 and OPT79, each of which is keyed
+    by its own identity (pattern + workflow + jobs).
 
     OPT73 (the cross-cluster shared-substep floor lever): each finding is a DISTINCT
     lever — its own shared step, its own cluster of jobs in its own workflow, its own
@@ -5512,6 +5773,11 @@ def _group_by_pattern_ranked(
     combined saving advertised beside a partial job list, which is exactly the failure
     the OPT73 case was added for.
 
+    OPT79 (a cache that costs more than it saves) is per JOB: one workflow can carry two
+    net-negative caches, each with its own measured hit/miss comparison, its own runner
+    class and its own re-key-or-remove edit. Folded by pattern, one job's evidence would
+    be advertised beside both jobs' minutes.
+
     Distinct levers therefore render as their own rows; identical ones (same workflow +
     same jobs) still fold. The displayed `pat` stays the bare pattern id."""
     groups: dict[Any, list[dict[str, Any]]] = {}
@@ -5519,10 +5785,10 @@ def _group_by_pattern_ranked(
     order: list[Any] = []
     for f in findings:
         pat = str(f.get("pattern", "") or "?")
-        # OPT73 and OPT77 levers are distinct per cluster / per consolidated group,
-        # not fungible occurrences of one recipe — see docstring.
+        # OPT73, OPT77 and OPT79 levers are distinct per cluster / per consolidated
+        # group / per job, not fungible occurrences of one recipe — see docstring.
         key: Any = pat
-        if pat in ("OPT73", "OPT77"):
+        if pat in ("OPT73", "OPT77", "OPT79"):
             key = (pat, str(f.get("workflow_file", "")),
                    tuple(f.get("affected_jobs") or ()))
         if key not in groups:
@@ -5652,9 +5918,10 @@ def _tier2_cert_summary(f: dict[str, Any]) -> str:
     if proof == "below_cluster_floor" and margin is not None:
         # HISTORICAL TOKEN for OPT77: its margin is measured against the tallest
         # job that REMAINS after the consolidation, not the workflow's cluster
-        # floor. The token is shared with OPT65, whose cluster-floor comparison is
-        # genuine, so it stays as the dispatch key; the certificate's own `ref`
-        # (appended below) names what each one was actually compared against.
+        # floor. The token is shared with OPT65 and OPT79, whose cluster-floor
+        # comparisons are genuine, so it stays as the dispatch key; the
+        # certificate's own `ref` (appended below) names what each one was
+        # actually compared against.
         msg = f"`below_cluster_floor` with {_clock(margin)} margin"
     elif proof == "post_completion_waste":
         msg = "`post_completion_waste` - compute burned after the run signal is already decided"
@@ -7681,8 +7948,19 @@ def _render_static_only(doc: dict[str, Any], captured_at: str = "",
     # findings JSON._" — no banner, no coverage note, no data-sources footer: the
     # loudest failure in the collector, rendered as a shrug.
     broken = _measurement_is_broken(ds)
+    # A measured net-negative cache is a fact worth a report on its own. On a
+    # schedule-only repo with no poles and no other findings, every other input
+    # here is empty and the uncredited line was dropped with them — the whole
+    # report collapsed to the one-line no-critical-path note, which is exactly
+    # the silence this block exists to break.
+    uncredited_lines = _opt79_uncredited_block(doc)
+    # A cache that was probed and then withheld is disclosed in the Data sources
+    # footer; collapsing to the one-line note would drop the footer with it and
+    # let "probed, could not tell" read as "nothing found".
+    withheld_n, _top = _opt79_withheld_summary(doc)
     if (not tier2_lines and not also_lines and not queue_lines
-            and not incomplete and not broken):
+            and not incomplete and not broken and not uncredited_lines
+            and not withheld_n):
         return ""  # nothing static to say — caller keeps the one-line note
 
     sampled = cp.get("sampled_pr_count")
@@ -7843,6 +8121,10 @@ def _render_static_only(doc: dict[str, Any], captured_at: str = "",
         out += ["---", "", *tier2_lines]
     if also_lines:
         out += ["---", "", *also_lines]
+    # Measured net-negative caches that could not be PRICED (their job is not
+    # below the cluster floor). Beside the dropped-unprovable banner, its nearest
+    # precedent: a measured fact kept out of the numbers and shown anyway.
+    out += uncredited_lines
     out += _dropped_unprovable_banner(cp.get("dropped_unprovable")
                                       or doc.get("dropped_unprovable"))
     # Issue #12: a static-only report (no measured pole to crown) can still carry a stamped
@@ -7916,6 +8198,9 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
         # a straddle is never silently dropped just because a shorter render path won the
         # short-circuit — else a post_only sample looks full / a disclosed_pre sample looks current.
         _deg_era_lines = _config_era_disclosure_lines(cp, captured_at)
+        # A measured net-negative cache never reaches this arm:
+        # `_render_static_only` above returns a full report whenever
+        # `_opt79_uncredited_block(doc)` has anything to say.
         if _deg_fileless_lines or _deg_era_lines:
             # `_strip_emdashes` at this early-return boundary mirrors the main render exit:
             # this path bypasses that terminal scrub, so without it the typographic dashes in the
@@ -9646,6 +9931,10 @@ def render(doc: dict[str, Any], logs: dict[str, str] | None = None,
         # (§5.5/G15; `check_cost_spine_shallow_disclosed` re-derives it from
         # `data_sources`, so dropping this line is a verify FAIL, not a style choice).
         out += ["---", "", f"> ⚠️ _{shallow_note}_", ""]
+    # Measured net-negative caches that could not be PRICED (their job is not
+    # below the cluster floor). Beside the dropped-unprovable banner, its nearest
+    # precedent: a measured fact kept out of the numbers and shown anyway.
+    out += _opt79_uncredited_block(doc)
     out += _dropped_unprovable_banner(cp.get("dropped_unprovable")
                                       or doc.get("dropped_unprovable"))
     # The prose provenance block leads the Data sources section (owner UX edit

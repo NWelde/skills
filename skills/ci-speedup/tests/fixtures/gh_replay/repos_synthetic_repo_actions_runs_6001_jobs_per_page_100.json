@@ -1,5 +1,5 @@
 {
- "total_count": 9,
+ "total_count": 10,
  "jobs": [
   {
    "id": 60010,
@@ -147,9 +147,41 @@
      "conclusion": "success"
     },
     {
-     "name": "Integration suite",
+     "name": "Run actions/checkout@v4",
      "number": 2,
      "started_at": "2026-06-24T01:00:15Z",
+     "completed_at": "2026-06-24T01:00:17Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run actions/cache@v4",
+     "number": 3,
+     "started_at": "2026-06-24T01:00:17Z",
+     "completed_at": "2026-06-24T01:00:47Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run npm ci",
+     "number": 4,
+     "started_at": "2026-06-24T01:00:47Z",
+     "completed_at": "2026-06-24T01:00:50Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Integration suite",
+     "number": 5,
+     "started_at": "2026-06-24T01:00:50Z",
+     "completed_at": "2026-06-24T01:03:15Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Post Run actions/cache@v4",
+     "number": 6,
+     "started_at": "2026-06-24T01:03:15Z",
      "completed_at": "2026-06-24T01:03:15Z",
      "status": "completed",
      "conclusion": "success"
@@ -331,6 +363,69 @@
      "number": 3,
      "started_at": "2026-06-24T01:00:13Z",
      "completed_at": "2026-06-24T01:00:18Z",
+     "status": "completed",
+     "conclusion": "success"
+    }
+   ]
+  },
+  {
+   "id": 60019,
+   "run_id": 6001,
+   "name": "deps",
+   "status": "completed",
+   "conclusion": "success",
+   "started_at": "2026-06-24T01:00:40Z",
+   "completed_at": "2026-06-24T01:01:20Z",
+   "labels": [
+    "ubuntu-latest"
+   ],
+   "html_url": "https://github.com/synthetic/repo/actions/runs/6001/job/60019",
+   "steps": [
+    {
+     "name": "Set up job",
+     "number": 1,
+     "started_at": "2026-06-24T01:00:40Z",
+     "completed_at": "2026-06-24T01:00:41Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run actions/checkout@v4",
+     "number": 2,
+     "started_at": "2026-06-24T01:00:41Z",
+     "completed_at": "2026-06-24T01:00:43Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run actions/cache@v4",
+     "number": 3,
+     "started_at": "2026-06-24T01:00:43Z",
+     "completed_at": "2026-06-24T01:01:11Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run npm ci",
+     "number": 4,
+     "started_at": "2026-06-24T01:01:11Z",
+     "completed_at": "2026-06-24T01:01:14Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Run npm run typecheck",
+     "number": 5,
+     "started_at": "2026-06-24T01:01:14Z",
+     "completed_at": "2026-06-24T01:01:20Z",
+     "status": "completed",
+     "conclusion": "success"
+    },
+    {
+     "name": "Post Run actions/cache@v4",
+     "number": 6,
+     "started_at": "2026-06-24T01:01:20Z",
+     "completed_at": "2026-06-24T01:01:20Z",
      "status": "completed",
      "conclusion": "success"
     }

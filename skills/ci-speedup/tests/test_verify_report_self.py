@@ -8670,6 +8670,205 @@ def test_opt77_neutrality_refuses_the_generic_below_floor_margin(tmp_path: Path)
     chk = vr.check_tier2_neutrality_derived(report, findings_path, report_path)
     assert not chk.ok and "below-floor margin" in chk.detail, chk
 
+
+def _cache_probe_doc(tmp_path, probed, returned, budget=24, planned=None):
+    import json as _json
+    p = tmp_path / "findings.json"
+    probe = {"probed": probed, "returned": returned, "budget": budget}
+    if planned is not None:
+        probe["planned"] = planned
+    p.write_text(_json.dumps({"data_sources": {"cache_probe_logs": probe}}),
+                 encoding="utf-8")
+    return p
+
+
+def test_cache_probe_row_must_state_the_logs_actually_read(tmp_path):
+    """The cache-cost comparison reads job logs during collection, so the
+    pole-drill `job logs` row can honestly say "not run" in a report that quotes
+    them. Its own row therefore has to be re-derived, or the report can claim a
+    number of reads the run never made."""
+    vr = _load_verify_report()
+    row = "| cache hit/miss log probe | {} | Splitting a cached job's runs |"
+    honest = row.format("8 job log(s) read (capped at 24 for the repository)")
+    bad, note = vr._cache_probe_count_violation(
+        honest, _cache_probe_doc(tmp_path, 8, 8))
+    assert bad is None, bad
+    assert "8/8" in note
+
+    # claims eight reads when only three came back
+    bad, _ = vr._cache_probe_count_violation(
+        honest, _cache_probe_doc(tmp_path, 8, 3))
+    assert bad and "3 of 8" in bad
+
+    # states the shortfall honestly
+    partial = row.format("3 of 8 job log(s) returned content")
+    bad, _ = vr._cache_probe_count_violation(
+        partial, _cache_probe_doc(tmp_path, 8, 3))
+    assert bad is None, bad
+
+
+def test_cache_probe_row_is_absent_exactly_when_nothing_was_probed(tmp_path):
+    """Both silences are failures. A report that read eight logs and shows no row
+    is the bug this row was added for — the provenance table denying a read it
+    made. A report that shows the row having probed nothing bills the reader for
+    a cost they never paid."""
+    vr = _load_verify_report()
+    row = "| cache hit/miss log probe | 8 job log(s) read | Splitting runs |"
+    bad, _ = vr._cache_probe_count_violation(
+        "## Data sources\n| job logs | not run |\n",
+        _cache_probe_doc(tmp_path, 8, 8))
+    assert bad and "no row" in bad
+
+    bad, _ = vr._cache_probe_count_violation(
+        row, _cache_probe_doc(tmp_path, 0, 0))
+    assert bad and "recorded none" in bad
+
+    # nothing probed and no row: correct, and silent
+    bad, note = vr._cache_probe_count_violation(
+        "## Data sources\n| job logs | not run |\n",
+        _cache_probe_doc(tmp_path, 0, 0))
+    assert bad is None and note == ""
+
+
+def test_coverage_check_fails_on_a_dishonest_cache_probe_row(tmp_path):
+    """The cache-probe re-derivation was unit-tested and its WIRING was not:
+    replacing the two lines that call it inside `check_coverage_disclosed` with a
+    no-op left every test green, so the check could stop running without anything
+    going red."""
+    vr = _load_verify_report()
+    head = ("## Where this data comes from\n\n"
+            "| Source | Coverage | Used for |\n|---|---|---|\n")
+    row = "| cache hit/miss log probe | {} | Splitting a cached job's runs |\n"
+
+    dishonest = head + row.format("8 job log(s) read")
+    chk = vr.check_coverage_disclosed(dishonest, _cache_probe_doc(tmp_path, 8, 3))
+    assert not chk.ok, chk
+    assert "3 of 8" in chk.detail, chk
+
+    honest = head + row.format("3 of 8 job log(s) returned content")
+    chk = vr.check_coverage_disclosed(honest, _cache_probe_doc(tmp_path, 8, 3))
+    assert chk.ok, chk
+    assert "cache-probe count honest" in chk.detail, chk
+
+
+def test_cache_probe_row_states_the_candidates_the_budget_dropped(tmp_path):
+    """The repo-wide budget does not only cap the cost, it removes candidates.
+    A row reporting only what was READ hides that the comparison saw less of the
+    repository than its own selector asked for."""
+    vr = _load_verify_report()
+    row = "| cache hit/miss log probe | {} | Splitting a cached job's runs |"
+    silent = row.format("24 job log(s) read (capped at 24 for the repository)")
+    bad, _ = vr._cache_probe_count_violation(
+        silent, _cache_probe_doc(tmp_path, 24, 24, planned=32))
+    assert bad and "planned 32" in bad, bad
+
+    honest = row.format(
+        "24 job log(s) read (24 of 32 planned) (capped at 24 for the repository)")
+    bad, _ = vr._cache_probe_count_violation(
+        honest, _cache_probe_doc(tmp_path, 24, 24, planned=32))
+    assert bad is None, bad
+
+
+def test_cache_probe_check_says_so_when_it_cannot_read_the_findings(tmp_path):
+    """An unreadable findings bundle is not a clean bill of health. Swallowing
+    the error made a corrupt file indistinguishable from a re-derivation that
+    passed — the one outcome a self-check must never produce silently."""
+    vr = _load_verify_report()
+    broken = tmp_path / "findings.json"
+    broken.write_text("{not json", encoding="utf-8")
+    bad, note = vr._cache_probe_count_violation("## Data sources\n", broken)
+    assert bad and "unreadable" in bad, (bad, note)
+
+
+def test_cache_probe_row_must_state_the_right_count_when_all_returned(tmp_path):
+    """Every probed log returned, but the cell names another number."""
+    vr = _load_verify_report()
+    row = "| cache hit/miss log probe | {} | Splitting a cached job's runs |"
+    bad, _ = vr._cache_probe_count_violation(
+        row.format("7 job log(s) read"), _cache_probe_doc(tmp_path, 8, 8))
+    assert bad and "8 log(s) actually read" in bad, bad
+    bad, _ = vr._cache_probe_count_violation(
+        row.format("8 job log(s) read"), _cache_probe_doc(tmp_path, 8, 8))
+    assert bad is None, bad
+
+
+def test_cache_probe_check_fails_closed_on_malformed_counts(tmp_path):
+    """A probe count that is not an integer is not zero. Reading `"8"` (or a
+    missing `returned`) as 0 let a report with no probe row pass a run that
+    recorded eight reads — the count that says the probe happened was malformed,
+    and the check treated malformed as "nothing happened"."""
+    import json as _json
+    vr = _load_verify_report()
+    p = tmp_path / "findings.json"
+    for probe in ({"probed": "8", "returned": 8, "budget": 24},
+                  {"probed": 8, "budget": 24},
+                  {"probed": True, "returned": True, "budget": 24},
+                  {"probed": 8, "returned": 8, "planned": "9", "budget": 24}):
+        p.write_text(_json.dumps({"data_sources": {"cache_probe_logs": probe}}),
+                     encoding="utf-8")
+        bad, _ = vr._cache_probe_count_violation("## Data sources\n", p)
+        assert bad and "malformed" in bad, (probe, bad)
+    # …a well-formed zero is still a clean "nothing probed", and a doc with no
+    # probe block at all (a run from before the probe existed) is not malformed.
+    p.write_text(_json.dumps({"data_sources": {"cache_probe_logs": {
+        "probed": 0, "returned": 0, "planned": 0, "budget": 24}}}), encoding="utf-8")
+    assert vr._cache_probe_count_violation("## Data sources\n", p)[0] is None
+    p.write_text(_json.dumps({"data_sources": {}}), encoding="utf-8")
+    assert vr._cache_probe_count_violation("## Data sources\n", p)[0] is None
+
+
+def _withheld_doc(tmp_path, rows):
+    import json as _json
+    p = tmp_path / "findings.json"
+    p.write_text(_json.dumps({"data_sources": {},
+                              "opt79_withheld_candidates": rows}), encoding="utf-8")
+    return p
+
+
+def test_withheld_cache_candidates_must_be_disclosed(tmp_path):
+    """The cache hit/miss probe read a candidate's logs and then withheld it. A
+    report that says nothing about that reads exactly like "measured, nothing
+    found" — the reader is told the cache is fine when the audit could not tell.
+    The tally has to reach the page, and the self-check has to pair the two."""
+    vr = _load_verify_report()
+    rows = [{"workflow_file": "ci.yml", "job": "unit",
+             "gate": "fewer_than_min_miss_runs_classified"},
+            {"workflow_file": "ci.yml", "job": "e2e",
+             "gate": "fewer_than_min_miss_runs_classified"},
+            {"workflow_file": "nightly.yml", "job": "build",
+             "gate": "population_truncated_by_unread_logs"}]
+    path = _withheld_doc(tmp_path, rows)
+    silent = "## 🗄️ Data sources\n\n| Source | Coverage | Feeds |\n"
+    chk = vr.check_coverage_disclosed(silent, path)
+    assert not chk.ok and "held back" in chk.detail, chk
+    row = ("| cache hit/miss verdicts | {} | Why a probed cache produced "
+           "no finding |\n")
+    honest = silent + row.format(
+        "3 candidate cache(s) held back (build, e2e, unit): too few sampled "
+        "runs missed the cache to compare a miss against a hit.")
+    chk = vr.check_coverage_disclosed(honest, path)
+    assert chk.ok, chk
+    # wrong count, wrong reason, wrong job list, a leaked gate name: none is a disclosure
+    wrong = (
+        "2 candidate cache(s) held back (build, e2e): too few "
+        "sampled runs missed the cache to compare a miss against a hit.",
+        "3 candidate cache(s) held back (build, e2e, unit): too "
+        "many of the sampled runs' logs could not be read to tell how often the "
+        "cache hits.",
+        "3 candidate cache(s) held back (build, e2e, other): too "
+        "few sampled runs missed the cache to compare a miss against a hit.",
+        "3 candidate cache(s) held back (build, e2e, unit): "
+        "`fewer_than_min_miss_runs_classified`.",
+        "3 candidate cache(s) probed but withheld; top reason: "
+        "`fewer_than_min_miss_runs_classified`")
+    for cell in wrong:
+        chk = vr.check_coverage_disclosed(silent + row.format(cell), path)
+        assert not chk.ok, (cell, chk)
+    # …and a row with nothing behind it is a claim the run never made.
+    chk = vr.check_coverage_disclosed(honest, _withheld_doc(tmp_path, []))
+    assert not chk.ok, chk
+
+
 # ── OPT80: the verifier re-derives the checkout tail, never trusts it ──
 # The pattern is admissible only because it PROVES the stall instead of
 # inferring it from a duration (the reason OPT49 was cut). So the arm has to
@@ -9085,3 +9284,50 @@ def test_tier2_still_rejects_a_non_zero_wall_clock_on_that_same_finding(tmp_path
     chk = vr.check_tier2_neutrality_derived(report, findings_path, report_path)
     assert not chk.ok, chk
     assert "wall_clock_p50_s" in str(chk.detail), chk
+
+
+def test_held_back_verifier_fails_closed_on_an_unmapped_gate(tmp_path):
+    vr = _load_verify_report()
+    rows = [{"workflow_file": "ci.yml", "job": "unit", "gate": "a_gate_nobody_mapped"}]
+    path = _withheld_doc(tmp_path, rows)
+    report = ("## 🗄️ Data sources\n\n| Source | Coverage | Feeds |\n"
+              "| cache hit/miss verdicts | 1 candidate cache(s) held back (unit): "
+              "a reason the report has no plain-English wording for. | x |\n")
+    chk = vr.check_coverage_disclosed(report, path)
+    assert not chk.ok and "plain-English" in chk.detail, chk
+
+
+def test_held_back_verifier_rederives_escaped_job_names(tmp_path):
+    vr = _load_verify_report()
+    rows = [{"workflow_file": "ci.yml", "job": "a|b `x`\nc", "gate": "no_monthly_volume"}]
+    path = _withheld_doc(tmp_path, rows)
+    cell = ("1 candidate cache(s) held back (a\\|b 'x' c): the job's monthly run "
+            "count was unknown, so its saving could not be sized.")
+    report = ("## 🗄️ Data sources\n\n| Source | Coverage | Feeds |\n"
+              f"| cache hit/miss verdicts | {cell} | x |\n")
+    chk = vr.check_coverage_disclosed(report, path)
+    assert chk.ok, chk
+
+
+def test_held_back_verifier_rederives_the_five_job_cap_and_shared_names(tmp_path):
+    vr = _load_verify_report()
+    rows = [{"workflow_file": f".github/workflows/{w}", "job": j,
+             "gate": "no_monthly_volume"}
+            for w, j in [("ci.yml", "build"), ("nightly.yml", "build"),
+                         ("ci.yml", "a"), ("ci.yml", "b"), ("ci.yml", "c"),
+                         ("ci.yml", "d"), ("ci.yml", "e")]]
+    path = _withheld_doc(tmp_path, rows)
+    tail = ("the job's monthly run count was unknown, so its saving could not "
+            "be sized.")
+    head = "## 🗄️ Data sources\n\n| Source | Coverage | Feeds |\n"
+
+    def cell(jobs):
+        return (head + f"| cache hit/miss verdicts | 7 candidate cache(s) held "
+                f"back ({jobs}): {tail} | x |\n")
+    honest = "a, b, c, ci.yml / build, d, and 2 more"
+    assert vr.check_coverage_disclosed(cell(honest), path).ok
+    for wrong in ("a, b, c, ci.yml / build, and 3 more",
+                  "a, b, c, ci.yml / build, d, and 1 more",
+                  "a, b, c, build, d, and 2 more",
+                  "a, b, c, ci.yml / build, d, e, nightly.yml / build"):
+        assert not vr.check_coverage_disclosed(cell(wrong), path).ok, wrong
