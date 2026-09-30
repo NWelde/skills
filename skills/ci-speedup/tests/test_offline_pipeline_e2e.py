@@ -87,7 +87,33 @@ _JOB_ID = 9001
 #            (per_page=2 also returns the PRIOR boundary, still a single call).
 #            The runs API exposes no workflow-content hash, so per-run content diffing
 #            would cost one `/contents/` fetch per run, N >> K; this is O(1) per workflow.)
-_GOLDEN_GH_QUERY_COUNT = 38
+#   40       (+2 OPT80 tail-run job logs. `build-matrix.yml`'s `smoke` job checks out in 8s on
+#            ten sampled runs and 120s on two; OPT80 fetches the log of each TAIL run —
+#            and only of a tail run — to prove the stall from the fetch's own progress
+#            lines. A job with no tail costs nothing, so this is +1 call per tail run on
+#            a firing job, bounded by `_OPT80_LOG_PROBE_MAX`, and 0 on every other repo
+#            shape.)
+#   48  now  (+8 OPT79: the net-negative-cache lever reads the run LOG's own cache
+#            hit/miss line, which nothing else in the plain path fetches. The probe is
+#            capped at _OPT79_LOG_PROBE_MAX (8) occurrences of one candidate job and
+#            _OPT79_MAX_CANDIDATE_JOBS (2) candidate jobs per workflow; `build-matrix.yml`'s
+#            `deps` is the corpus's only job declaring a cache followed by an install,
+#            so it costs exactly the per-job cap once. Every other OPT79 gate is
+#            answered from data already in hand, so no log is fetched for a job that
+#            could not produce a finding.)
+#   56  now  (+8 OPT79: `build-matrix.yml`'s `integration` job — that workflow's slowest —
+#            now also restores a cache before its install, so the uncredited path
+#            runs end to end: its second candidate job costs the per-job cap once
+#            more.)
+#   56  still (OPT79 now reads the repo-root `package.json` to decide whether
+#            setup-node v5+'s AUTOMATIC cache is on. At most ONE read per repo, and
+#            only when a sampled job runs setup-node v5+ with no `cache:` input;
+#            it comes off the `--root` checkout first and costs one `contents/
+#            package.json` call only when the checkout cannot serve it. This corpus
+#            pins `setup-node@v4`, so the read never happens here (asserted via
+#            `data_sources.setup_node_package_json.needed`), and on a repo that
+#            needs it the cost is +0 with a checkout, +1 without.)
+_GOLDEN_GH_QUERY_COUNT = 56
 # PR-H1: `push` is UNSCOPED (no `branches:`) so the same-head_sha push+PR run
 # pair in the corpus satisfies OPT47's structural precondition (a push scoped
 # only to the default branch is excluded by design).
@@ -141,8 +167,68 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: integration-deps-${{ hashFiles('**/package-lock.json') }}
+      - run: npm ci
       - name: Integration suite
         run: npm run integration
+  lint-eslint:
+    name: lint (eslint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint:eslint
+  lint-biome:
+    name: lint (biome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint:biome
+  lint-stylelint:
+    name: lint (stylelint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run lint:stylelint
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run smoke
+        run: npm run smoke
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ hashFiles('**/package-lock.json') }}
+      - run: npm ci
+      - run: npm run typecheck
+  docs-spell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r docs/requirements.txt
+      - run: make docs-spell
+  docs-links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r docs/requirements.txt
+      - run: make docs-links
+  docs-format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -r docs/requirements.txt
+      - run: make docs-format
 """
 
 
@@ -196,7 +282,7 @@ def _init_repo(root: Path, origin: str | None = _REPO) -> None:
     build that unverifiable checkout on purpose."""
     (root / ".github" / "workflows").mkdir(parents=True)
     (root / ".github" / "workflows" / "ci.yml").write_text(_WF_YAML, encoding="utf-8")
-    (root / ".github" / "workflows" / "matrix.yml").write_text(_WF2_YAML, encoding="utf-8")
+    (root / ".github" / "workflows" / "build-matrix.yml").write_text(_WF2_YAML, encoding="utf-8")
     (root / ".github" / "workflows" / "chained.yml").write_text(_WF3_YAML, encoding="utf-8")
     env = {**os.environ,
            "GIT_AUTHOR_NAME": "ci-speedup-test", "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -332,6 +418,183 @@ def test_offline_pipeline_scan_collect_render_verify(tmp_path):
         f"{sorted(f for f in consumed if '_status_success' in f)}")
 
     data = json.loads(findings_path.read_text(encoding="utf-8"))
+
+    # OPT77 end to end. `build-matrix.yml` carries three plain same-runner lint checks
+    # that each re-pay one 14s setup prefix before 6s of work, beside a 180s
+    # `integration` job that survives the consolidation. Both the detector's
+    # DISPATCH and the supersede step that follows it were pinned only by reading
+    # collect()'s source: `new = [] if True else _detect_opt77(...)` and deleting
+    # the supersede line each left the whole suite green. This executes them.
+    o77 = [f for f in data["findings"] if f.get("pattern") == "OPT77"]
+    assert len(o77) == 1, (
+        "the three plain same-runner lint checks in build-matrix.yml must promote one "
+        f"OPT77 consolidation (got {[f.get('affected_jobs') for f in o77]!r})")
+    sc = o77[0].get("setup_consolidation") or {}
+    assert sc.get("kind") == "opt77_repeated_setup", sc
+    assert sorted(sc.get("credited_jobs") or []) == [
+        "lint (biome)", "lint (eslint)", "lint (stylelint)"], sc.get("credited_jobs")
+    assert o77[0].get("wall_clock_p50_s") in (0, 0.0)
+    assert float(sc.get("setup_p50_s") or 0.0) > 0.0
+    assert sc.get("remaining_tallest_job") == "integration", sc
+    # ...and the round-up lever must not ALSO claim those three jobs: they are named
+    # like matrix legs, so OPT65 groups them too, and one edit rendering as two
+    # levers is exactly what the supersede step exists to stop.
+    o65_over_lints = [f for f in data["findings"]
+                      if f.get("pattern") == "OPT65"
+                      and {str(j) for j in (f.get("affected_jobs") or [])}
+                      & set(sc["credited_jobs"])]
+    assert not o65_over_lints, (
+        "an OPT65 finding survived over the same jobs as the OPT77 consolidation: "
+        f"{[f.get('affected_jobs') for f in o65_over_lints]!r}")
+    # Every gate that withheld a consolidation is counted, so a zero firing rate
+    # would be visible rather than silent.
+    assert isinstance(data.get("opt77_withheld_by_gate"), dict), (
+        "the per-gate withhold tally must be stamped on every collected run")
+    # …and so is the list of candidate groups it measured but could not decide,
+    # which the report states as a Data sources row and the self-check re-derives.
+    # A group OPT77 formed and could NOT decide, end to end. build-matrix.yml's three
+    # path-gated docs jobs each re-pay one 14s pip-install setup, but they ran on
+    # disjoint sampled runs (docs-spell on 6001-6004, docs-links on 6005-6008,
+    # docs-format on 6009-6012), so no run ever showed all three together and the
+    # saving cannot be measured. It must be LISTED on the findings document, and
+    # the report must say so. Workflows are processed in path order and this one
+    # is deliberately named `build-matrix.yml` so it sorts FIRST (before chained
+    # and ci), so a list reset per workflow loses it; the detached-list and
+    # cleared-after-the-detector mutants must redden this too. No new gh call.
+    assert data.get("opt77_withheld_candidates") == [
+        {"workflow_file": ".github/workflows/build-matrix.yml",
+         "group": "ubuntu-latest/docs-format+docs-links+docs-spell",
+         "jobs": ["docs-format", "docs-links", "docs-spell"],
+         "gate": "group_never_ran_complete_in_one_sampled_run"}], (
+        "the held-back docs group must be listed on the findings document: "
+        f"{data.get('opt77_withheld_candidates')!r}")
+
+    # OPT79 end to end, including the LOG fetch nothing else in the plain path
+    # makes. `build-matrix.yml`'s `deps` job restores a cache and then installs; the
+    # corpus alternates cache-hit and cache-miss runs, and the hit path's block
+    # (restore + install + post) measures 31s against the miss path's 12s. Both
+    # the detector's DISPATCH and the capped log probe that feeds it are only
+    # reachable through collect(): short-circuiting the detector call, or
+    # discarding its result, leaves every unit test green.
+    o79 = [f for f in data["findings"] if f.get("pattern") == "OPT79"]
+    assert len(o79) == 1, (
+        "the `deps` job in build-matrix.yml must promote one OPT79 net-negative cache "
+        f"(got {[f.get('affected_jobs') for f in o79]!r})")
+    cn = o79[0].get("cache_net_negative") or {}
+    assert cn.get("kind") == "opt79_net_negative_cache", cn
+    assert cn.get("job") == "deps" and o79[0].get("affected_jobs") == ["deps"], cn
+    assert cn.get("hits") == 4 and cn.get("misses") == 4, cn
+    assert cn.get("hit_path_p50_s") == 31.0 and cn.get("miss_path_p50_s") == 12.0, cn
+    assert cn.get("waste_s") == 19.0, cn
+    assert o79[0].get("wall_clock_p50_s") in (0, 0.0)
+    assert o79[0].get("sizing_basis") == "measured"
+    assert (o79[0].get("runner_min_saving") or 0) > 0, o79[0]
+    # The verbatim cache line each verdict came from must reach the findings JSON —
+    # it is the only thing a human can check the classification against.
+    assert all(r.get("log_line") for r in (cn.get("per_run") or [])), cn
+    assert any("Cache restored from key" in str(r.get("log_line"))
+               for r in cn["per_run"]), cn
+    assert any("Cache not found for" in str(r.get("log_line"))
+               for r in cn["per_run"]), cn
+    # …every verdict names the log group it was read in, so a build tool's own
+    # `cache miss` line in the test step can never be mistaken for this cache's.
+    assert all(r.get("log_line_group") == "Run actions/cache@v4"
+               for r in cn["per_run"]), cn
+    # …and the probe stayed inside its budget. Counted ONCE, in the provenance
+    # row the report renders and `verify_report` re-derives — a second copy on
+    # the findings doc was a number nothing checked and nothing rendered.
+    _o79_gates = data.get("opt79_withheld_by_gate")
+    assert isinstance(_o79_gates, dict), (
+        "the per-gate withhold tally must be stamped on every collected run")
+    # …and it is FED: the corpus has jobs with no cache at all, and each is
+    # counted. An empty tally is what a collect() that stopped passing the
+    # accumulator to the detector produces.
+    assert (_o79_gates.get("job_declares_no_cache_restore_step") or 0) > 0, _o79_gates
+    # The uncredited path end to end. `build-matrix.yml`'s `integration` job is that
+    # workflow's slowest job and also restores a cache before `npm ci`: 33s on
+    # its hit runs against 12s on its miss runs. It cannot be priced (it is not
+    # below the cluster floor), so it is reported with no number — and since the
+    # workflow runs only on push, never as a merge wait.
+    _unc = data.get("opt79_uncredited_pole_caches")
+    assert isinstance(_unc, list) and len(_unc) == 1, _unc
+    assert _unc[0].get("job") == "integration", _unc[0]
+    assert _unc[0].get("waste_s") == 21.0, _unc[0]
+    assert _unc[0].get("hits") == 4 and _unc[0].get("misses") == 4, _unc[0]
+    assert _unc[0].get("runner_min_saving") is None, _unc[0]
+    assert _unc[0].get("on_critical_path") is False, _unc[0]
+    assert _unc[0].get("workflow_gates_pull_requests") is False, _unc[0]
+    # Nothing was probed and withheld on this corpus: both candidates decided.
+    assert data.get("opt79_withheld_candidates") == [], data.get(
+        "opt79_withheld_candidates")
+    # …and the run DECLARES those reads in its provenance, as its own row. The
+    # pole-drill `logs_fetched` field counts a different thing and the report's
+    # self-check re-derives that cell from the persisted bundle, so a report that
+    # quotes eight cache log lines while its Data sources table says no job logs
+    # were read is the failure this separate row exists to prevent.
+    _probe = (data.get("data_sources") or {}).get("cache_probe_logs")
+    assert isinstance(_probe, dict), data.get("data_sources")
+    assert _probe.get("probed") == 16 and _probe.get("returned") == 16, _probe
+    # PLANNED is stamped beside them: when the repo-wide budget cuts the plan the
+    # comparison saw less of the repository than its selector asked for, and the
+    # row has to say so. Here nothing was cut, so the two agree.
+    assert _probe.get("planned") == 16, _probe
+    # setup-node's automatic cache: no job in this corpus runs setup-node v5+
+    # without a `cache:` input (`ci.yml` pins v4), so no cache count depends on
+    # package.json and it is NOT read — no gh call, no disk read. The stamp says
+    # so, which is also why the golden call count did not move for it.
+    _pkg = (data.get("data_sources") or {}).get("setup_node_package_json")
+    assert _pkg == {"needed": False, "source": None, "readable": False}, _pkg
+    # OPT80 end to end. `build-matrix.yml`'s `smoke` job checks out in 8s on ten of the
+    # twelve sampled runs and 120s on two, and each of those two runs ships a
+    # recorded checkout log whose git progress stops for 85s. This executes the
+    # detector's DISPATCH, its bounded tail-run log fetch, and the renderer +
+    # verifier arms for its certificate token — none of which any unit test can
+    # reach. Two mutants must redden it: short-circuiting the call
+    # (`new = [] if True else _detect_opt80_…`) and discarding its result
+    # (dropping the `findings.extend(new)`).
+    o80 = [f for f in data["findings"] if f.get("pattern") == "OPT80"]
+    assert len(o80) == 1, (
+        "build-matrix.yml's `smoke` job must promote exactly one OPT80 finding "
+        f"(got {[f.get('affected_jobs') for f in o80]!r})")
+    cs = o80[0].get("checkout_stall") or {}
+    assert cs.get("kind") == "opt80_checkout_tail_stall", cs
+    assert cs.get("job") == "smoke" and o80[0]["affected_jobs"] == ["smoke"]
+    assert cs.get("checkout_step_source") == "actions/checkout", cs
+    assert o80[0].get("wall_clock_p50_s") in (0, 0.0), (
+        "capping a tail cannot move the p50 merge gate, so no wall-clock is credited")
+    assert float(cs.get("tail_excess_s") or 0.0) > 0.0
+    assert float(cs.get("p95_s") or 0.0) >= float(cs.get("tail_threshold_s") or 0.0)
+    # The proof, not an inference from the duration: two tail runs, each with the
+    # two verbatim git progress lines that bracket the pause.
+    proven = cs.get("proven_tail_runs") or []
+    assert len(proven) == 2, proven
+    for p in proven:
+        assert float(p.get("gap_s") or 0.0) >= 20.0, p
+        assert "Receiving objects" in str((p.get("before") or {}).get("line") or ""), p
+    # The log fetch is bounded AND targeted: one call per tail run, none for the
+    # ten typical runs.
+    assert cs.get("logs_fetched") == 2, cs
+    assert cs.get("logs_fetched") <= cs.get("log_probe_max")
+    assert o80[0].get("tier2_neutrality", {}).get("proof") == "checkout_tail_excess"
+    assert isinstance(data.get("opt80_withheld_by_gate"), dict), (
+        "the per-gate withhold tally must be stamped on every collected run")
+    # A candidate OPT80 measured and could NOT decide, end to end. build-matrix.yml's
+    # `build` job checks out in 8s on eleven sampled runs and 80s on one. That is
+    # a measured tail (p95 clears the bar) but a single run, and the pattern needs
+    # two before it will ask for a standing configuration change, so the audit
+    # cannot tell a stall from a one-off. It must be LISTED on the findings
+    # document, and the report must say so. `build` sits in build-matrix.yml (wf
+    # 1002), which sorts FIRST in path order (before chained and ci), so a list
+    # reset per workflow loses it. Three wiring mutants each leave every unit test green and must
+    # redden this: the list detached from the findings doc, cleared after the
+    # detector runs, and reset per workflow. No new gh call: the gate fires before
+    # any tail-run log is fetched, which is why the golden count did not move.
+    assert data.get("opt80_withheld_candidates") == [
+        {"workflow_file": ".github/workflows/build-matrix.yml", "job": "build",
+         "gate": "fewer_than_the_minimum_tail_runs"}], (
+        "the held-back `build` checkout must be listed on the findings document: "
+        f"{data.get('opt80_withheld_candidates')!r}")
+
     # The static-scan findings come from scan.py parsing the YAML — they exist
     # regardless of gh replay, so they do NOT prove the replay wired up. Assert
     # them, but they are not the backstop.
@@ -478,6 +741,84 @@ def test_offline_pipeline_scan_collect_render_verify(tmp_path):
         "verify_report rejected the offline-replayed report:\n"
         f"{verify.stdout}\n{verify.stderr}")
 
+    # The held-back candidate reaches the reader too, in plain English: the count,
+    # the job, and a reason a product manager can read - never the gate name. The
+    # verifier already passed above, so it re-derived exactly this line.
+    held = [ln for ln in report.splitlines()
+            if ln.startswith("| checkout stall: held back |")]
+    assert len(held) == 1, held
+    assert ("1 candidate checkout(s) held back (build): "
+            + "too few slow checkouts in the sampled runs to tell a stall from a "
+            + "one-off.") in held[0], held[0]
+    assert "fewer_than_the_minimum_tail_runs" not in report
+    assert "checkout stall verdicts" not in report
+    held77 = [ln for ln in report.splitlines()
+              if ln.startswith("| repeated-setup: held back |")]
+    assert len(held77) == 1, held77
+    assert ("1 candidate job group(s) held back (docs-format + docs-links + "
+            + "docs-spell in build-matrix.yml): the sampled runs never had every job in "
+            + "the group run together, so the saving could not be measured."
+            ) in held77[0], held77[0]
+    assert "group_never_ran_complete_in_one_sampled_run" not in report
+    assert "repeated-setup verdicts" not in report
+
+    # OPT80 reaches the READER, not just the findings document. The block above
+    # proves the detector fired and the verifier accepted it; a renderer that
+    # dropped the row would leave both green and ship a report with the stall
+    # missing. The certificate token's rendered sentence is asserted with it,
+    # because that is the one place the reader is told why a credited saving on
+    # this job does not move the merge gate.
+    o80_rendered = [f for f in data["findings"] if f.get("pattern") == "OPT80"]
+    assert "Checkout Stalls on the Tail" in report, (
+        "the OPT80 finding is in the findings document but not in the rendered "
+        "report — the renderer dropped it")
+    assert "checkout_tail_excess" in report, (
+        "OPT80's neutrality certificate must be described to the reader")
+    assert str(o80_rendered[0]["id"]) in report, o80_rendered[0]["id"]
+
+    # OPT79 reaches the READER too — the credited finding with the numbers it
+    # was measured on, and the uncredited line with its own.
+    o79_rendered = [f for f in data["findings"] if f.get("pattern") == "OPT79"]
+    assert "A Cache That Costs More Than It Saves" in report, (
+        "the OPT79 finding is in the findings document but not in the rendered "
+        "report — the renderer dropped it")
+    assert str(o79_rendered[0]["id"]) in report, o79_rendered[0]["id"]
+    _o79_ev = o79_rendered[0]["evidence"]
+    assert ("measured a p50 of 31s across 4 sampled run(s)" in _o79_ev
+            and "against 12s across 4 run(s)" in _o79_ev
+            and "the hit path is 19s SLOWER" in _o79_ev), _o79_ev
+    assert (f"~{o79_rendered[0]['runner_min_saving']:.0f} runner-min/mo"
+            in _o79_ev), _o79_ev
+    assert "1 cache(s) measured net-negative on a job this audit cannot price" \
+        in report, "the uncredited OPT79 line did not reach the report"
+    assert ("a cache on `integration` in `.github/workflows/build-matrix.yml` "
+            "measured net-negative by 21s per cache hit (4 hit / 4 miss run(s) "
+            "sampled)") in report
+    assert "does not run on pull requests" in report
+
+    # The self-check RE-DERIVES the OPT79 numbers, it does not read them back.
+    # A findings file with the credited finding's excess tampered must fail
+    # the report's own verification, and so must a tampered uncredited row.
+    for _tamper, _check in (
+            (lambda d: [f for f in d["findings"] if f.get("pattern") == "OPT79"
+                        ][0]["cache_net_negative"].__setitem__("waste_s", 900.0),
+             "Tier-2"),
+            (lambda d: d["opt79_uncredited_pole_caches"][0].__setitem__(
+                "waste_s", 900.0),
+             "uncredited net-negative caches")):
+        _bad = json.loads(findings_path.read_text(encoding="utf-8"))
+        _tamper(_bad)
+        _bad_path = tmp_path / "findings_tampered.json"
+        _bad_path.write_text(json.dumps(_bad), encoding="utf-8")
+        _v = subprocess.run(
+            [sys.executable, str(_SKILL_DIR / "tests" / "verify_report.py"),
+             "--report", str(report_path), "--findings", str(_bad_path)],
+            capture_output=True, text=True, env=env, timeout=60)
+        assert _v.returncode != 0, (
+            f"verify_report accepted a tampered OPT79 waste_s ({_check}):\n"
+            f"{_v.stdout}")
+        assert "waste_s" in _v.stdout, _v.stdout
+
     # ---- PR-H1 (G5): the promoted-path backstop — UNCONDITIONAL. -------------
     # Before this, the replay corpus promoted nothing, so the Tier-2 render
     # guard only ever exercised its weakest (modeled-fallback) branch and a
@@ -570,7 +911,7 @@ def test_workflow_yaml_reads_the_checkout_not_the_api(tmp_path, monkeypatch):
     The `_pinned` case below is that skew, made visible."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    wf_paths = {".github/workflows/ci.yml", ".github/workflows/matrix.yml",
+    wf_paths = {".github/workflows/ci.yml", ".github/workflows/build-matrix.yml",
                 ".github/workflows/chained.yml"}
     monkeypatch.setenv("CI_SPEEDUP_GH_FIXTURES", str(_FIXTURES_DIR))
     monkeypatch.delenv("CI_SPEEDUP_GH_RECORD", raising=False)
@@ -598,21 +939,21 @@ def test_workflow_yaml_reads_the_checkout_not_the_api(tmp_path, monkeypatch):
     # (d) the correctness skew the local read closes: a checkout whose workflow differs
     # from the default-branch HEAD the API serves. The local content is what the report
     # stamps as audited, so the local content is what must be parsed.
-    (repo_root / ".github" / "workflows" / "matrix.yml").write_text(
+    (repo_root / ".github" / "workflows" / "build-matrix.yml").write_text(
         "name: Unit matrix\non:\n  pull_request:\n\njobs:\n  build:\n"
         "    runs-on: ubuntu-latest\n    steps:\n      - run: npm run build\n",
         encoding="utf-8")
     pinned = cr._fetch_workflow_docs(cr.GhClient(), _REPO, wf_paths, root=repo_root)
     # (PyYAML parses the bare key `on:` as boolean True — hence the `[True]` lookup,
     # the same shape `_declared_pr_workflows` reads.)
-    assert pinned[".github/workflows/matrix.yml"][True] == {"pull_request": None}
-    assert api_docs[".github/workflows/matrix.yml"][True] == {"push": None}
+    assert pinned[".github/workflows/build-matrix.yml"][True] == {"pull_request": None}
+    assert api_docs[".github/workflows/build-matrix.yml"][True] == {"push": None}
     # ...so the declared-trigger guard now sees the CHECKOUT's PR trigger, not the
     # default branch's push-only one: the local read changes the ANSWER, not just the
     # call count.
-    assert ".github/workflows/matrix.yml" in cr._declared_pr_workflows(
+    assert ".github/workflows/build-matrix.yml" in cr._declared_pr_workflows(
         cr.GhClient(), _REPO, wf_paths, wf_docs=pinned)
-    assert ".github/workflows/matrix.yml" not in cr._declared_pr_workflows(
+    assert ".github/workflows/build-matrix.yml" not in cr._declared_pr_workflows(
         cr.GhClient(), _REPO, wf_paths, wf_docs=api_docs)
 
 
@@ -1352,6 +1693,55 @@ def test_skipped_detectors_are_NAMED_in_the_rendered_report(tmp_path):
     assert "not name them" in (bad.stdout + bad.stderr)
 
 
+def test_a_cache_probe_whose_logs_all_fail_is_named_and_disclosed(tmp_path):
+    """Every OPT79 cache-probe log for `build-matrix.yml` comes back empty (expired
+    retention, a 404 wave). The workflow was not evaluated, and the two candidate
+    caches whose logs were probed were withheld — neither may read as clean.
+    Driven end to end: the workflow is NAMED as not evaluated, the Data sources
+    table states the withheld candidates and why, the honest report verifies,
+    and one with the withheld line stripped does not."""
+    root = tmp_path / "repo"
+    _init_repo(root)
+    fixtures = _replay_dir(tmp_path)
+    for i in range(1, 9):
+        for leg in (4, 9):                      # `integration` and `deps`
+            (fixtures / f"repos_synthetic_repo_actions_jobs_600{i}{leg}_logs.txt"
+             ).unlink()
+    env = _replay_env(fixtures)
+    findings_path = tmp_path / "findings.json"
+    report_path = tmp_path / "report.md"
+    r = subprocess.run(
+        [sys.executable, str(_SCRIPTS / "run.py"),
+         "--root", str(root), "--out", str(findings_path), "--repo", _REPO],
+        capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 0, r.stderr
+    data = json.loads(findings_path.read_text(encoding="utf-8"))
+    skipped = data["data_sources"].get("detectors_skipped") or []
+    entry = next((e for e in skipped
+                  if e["workflow"] == ".github/workflows/build-matrix.yml"), None)
+    assert entry and "OPT79" in entry["detectors"], skipped
+    assert "0 of 16 cache-probe job log(s)" in entry["reason"], entry
+    assert not [f for f in data["findings"] if f.get("pattern") == "OPT79"]
+    withheld = data.get("opt79_withheld_candidates")
+    assert sorted(w["job"] for w in withheld) == ["deps", "integration"], withheld
+    assert {w["gate"] for w in withheld} == {"population_truncated_by_unread_logs"}
+
+    report = _render(_SCRIPTS, findings_path, report_path, env)
+    assert "OPT79" in report and "build-matrix.yml" in report
+    assert ("| cache hit/miss verdicts | 2 candidate cache(s) held back "
+            "(deps, integration): too many of the sampled runs' logs could not "
+            "be read to tell how often the cache hits.") in report, report
+    assert "population_truncated" not in report.split("cache hit/miss verdicts")[1].split("\n")[0]
+    ok = _verify(report_path, findings_path, env)
+    assert ok.returncode == 0, f"verify rejected an honest report:\n{ok.stdout}"
+    silent = "\n".join(line for line in report.splitlines()
+                       if "cache hit/miss verdicts" not in line)
+    silent_path = tmp_path / "silent.md"
+    silent_path.write_text(silent, encoding="utf-8")
+    bad = _verify(silent_path, findings_path, env)
+    assert bad.returncode != 0 and "held back" in bad.stdout, bad.stdout
+
+
 def test_a_feature_branch_checkout_discloses_the_yaml_branch_skew(tmp_path):
     """`--root` is unconditional now, so EVERY run parses the working tree's YAML. Being
     the right REPO (`_root_is_clone_of`) is only half the question; the other half is
@@ -1426,14 +1816,14 @@ def test_an_empty_workflow_file_is_OMITTED_not_recorded_as_empty(tmp_path, monke
         def json(self, endpoint, allow_missing=False):
             return None                          # the API has nothing either
 
-    wf_paths = {".github/workflows/matrix.yml"}
+    wf_paths = {".github/workflows/build-matrix.yml"}
     # Sanity: it parses to a real doc first.
     assert cr._fetch_workflow_docs(cr.GhClient(), _REPO, wf_paths, root=root)
 
     for empty in ("", "\n\n", "# just a comment\n"):
-        (root / ".github" / "workflows" / "matrix.yml").write_text(empty, encoding="utf-8")
+        (root / ".github" / "workflows" / "build-matrix.yml").write_text(empty, encoding="utf-8")
         docs = cr._fetch_workflow_docs(_NoContents(), _REPO, wf_paths, root=root)
-        assert ".github/workflows/matrix.yml" not in docs, (
+        assert ".github/workflows/build-matrix.yml" not in docs, (
             f"an empty workflow file ({empty!r}) was recorded as a parsed doc — the "
             "callers cannot tell that apart from a workflow that really declares nothing")
 
@@ -1456,11 +1846,11 @@ def test_an_unparseable_local_workflow_falls_back_to_the_api(tmp_path, monkeypat
     _init_repo(root)
     monkeypatch.setenv("CI_SPEEDUP_GH_FIXTURES", str(_FIXTURES_DIR))
     monkeypatch.delenv("CI_SPEEDUP_GH_RECORD", raising=False)
-    wf_paths = {".github/workflows/matrix.yml"}
-    wf_file = root / ".github" / "workflows" / "matrix.yml"
+    wf_paths = {".github/workflows/build-matrix.yml"}
+    wf_file = root / ".github" / "workflows" / "build-matrix.yml"
 
     api_docs = cr._fetch_workflow_docs(cr.GhClient(), _REPO, wf_paths)
-    assert api_docs[".github/workflows/matrix.yml"]["jobs"], "fixture sanity"
+    assert api_docs[".github/workflows/build-matrix.yml"]["jobs"], "fixture sanity"
 
     broken = {
         "empty": "",
@@ -1489,7 +1879,7 @@ def test_workflow_yaml_source_counts_are_reported(tmp_path, monkeypatch):
     _init_repo(root)
     monkeypatch.setenv("CI_SPEEDUP_GH_FIXTURES", str(_FIXTURES_DIR))
     monkeypatch.delenv("CI_SPEEDUP_GH_RECORD", raising=False)
-    wf_paths = {".github/workflows/ci.yml", ".github/workflows/matrix.yml",
+    wf_paths = {".github/workflows/ci.yml", ".github/workflows/build-matrix.yml",
                 ".github/workflows/chained.yml"}
 
     counts: dict = {}

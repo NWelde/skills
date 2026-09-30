@@ -9,8 +9,37 @@ name: Registry scan
 # rule catalog and no CLI, and whose verdicts are LLM-generated and not reproducible — or about
 # Socket. A green check here means "Snyk Agent Scan finds nothing we have not accepted". It does
 # not mean every registry scanner will pass.
+#
+# WHAT A RUN COSTS. Every scanner invocation is one analysis request against the scanner's
+# public tier, which SNYK_TOKEN authenticates against and which has a daily usage allowance
+# that is undocumented and shared by every run of this workflow that day. A run spends TWO:
+# the red-proof control (its own one-skill fixture — the only proof the scanner can see)
+# and the one unfiltered scan of `skills/`, whose JSON the gate reads offline. It used to
+# spend three; on 2026-09-14 the third call of the first run of the day was refused, and
+# every PR run after it went red saying DID NOT COMPLETE over a tree nobody had looked at.
+# The allowance has been observed to shrink without notice, so even the reduced run can
+# hit it on a busy day. When it does, the job must fail — a scan that did not run is not
+# a clean scan — but it must say "quota", never "finding" and never "blind": that is the
+# `quota` class in .github/scripts/registry_scan_gate.py and the control's own quota
+# outcome, and both name the reset. The unlock is enabling Agent Scan on the Snyk tenant
+# and running the scanner with a tenant push key, not a different token.
+#
+# WHICH PULL REQUESTS ARE SCANNED. Only those that touch something the scan reads: a skill
+# tree, this workflow, the scripts it runs, or the test that pins its shape. A PR changing
+# nothing under those paths gets no scan and no `registry scan` check at all — not a green
+# one, none. That is a deliberate trade against the daily allowance above: a docs-only PR
+# used to spend the same calls as a skill change. The push to main is NOT filtered, so every
+# merge is still scanned; the schedule is not filtered either, because it is what notices a
+# rule-catalog change that needed no commit of ours. `tests/test_registry_scan_workflow.py`
+# derives the list of files the scan depends on from this file's own `run:` lines and fails
+# if the filter below misses one, so a new script cannot be forgotten here.
 on:
   pull_request:
+    paths:
+      - "skills/**"
+      - ".github/workflows/registry-scan.yml"
+      - ".github/scripts/registry_scan_*.py"
+      - "tests/test_registry_scan_workflow.py"
   push:
     branches: [main]
   # The scanner's rule catalog changes without any commit of ours: a renamed, retired, or newly
@@ -33,32 +62,31 @@ permissions:
   contents: read
 
 env:
-  # THE GATING RULE (owner ruling, 2026-08-10): this build fails on Snyk Agent Scan's critical
-  # class only — the E-codes. Warning-class findings (W-codes) never fail CI.
+  # THE GATING RULE, restated for scanner 0.6.0 (owner ruling 2026-08-10, re-ruled
+  # 2026-08-26). 0.6.0 has no E/W classes — it reports named risks with 0-1000 scores —
+  # so "criticals block, warnings do not" is now a list of risk NAMES that do not block.
   #
-  # They are not hidden, though; "does not block" must not decay into "does not appear". Every
-  # W finding is surfaced three ways on every run: a `::warning::` annotation on the checks tab
-  # (queryable through the checks API, which is what a review agent reads), a table in the job
-  # summary, and the raw finding set uploaded as the `registry-scan-findings` artifact. A human
-  # or a review agent judges them; CI does not block on them.
+  # The list and the reasoning live in .github/scripts/registry_scan_contract.py, which
+  # is the single place this workflow's three readers get the vocabulary from. The
+  # gate applies it OFFLINE, to the JSON the one scan below writes — it is no longer
+  # passed to the scanner as `--ignore-risks` on a second call. Only the red-proof
+  # control still hands it to the scanner, because the control's job is to prove the
+  # gate's real policy can go red.
   #
-  # The scanner has no severity threshold — `--ignore-issues-codes` is its only gating knob — so
-  # the rule is expressed by enumerating the W class. This is every W-code published in
-  # https://github.com/snyk/agent-scan/blob/main/docs/issue-codes.md. It is a class rule, not
-  # fifteen individual judgements, so it carries no per-code justification. W011 "exposure to
-  # untrusted third-party content", the one that fires on these skills today, is an accurate
-  # description of what they do: they read a repository's own CI configuration, workflow files,
-  # and job logs, none of which the skill authored.
-  #
-  # NO E-CODE MAY EVER APPEAR HERE — that would silently disarm the gate, and
-  # tests/test_registry_scan_workflow.py fails if one does. When the scanner publishes a new
-  # W-code it will fail this build once; adding it here is the conscious update that follows.
-  IGNORED_ISSUE_CODES: W001,W007,W008,W009,W011,W012,W013,W014,W015,W016,W017,W018,W019,W020,W021
-
-  # The scanner reads skills out of a directory of `<name>/SKILL.md` subdirectories. This is the
-  # installable tree: exactly what the `skills` CLI copies onto a user's machine and what a
-  # registry publishes.
+  # History, so nobody reintroduces it: the list was once passed to
+  # `--ignore-failure-codes`, which is a DIFFERENT flag, not the renamed one — it
+  # accepts only the scanner's X001-X009 runtime codes. The scanner printed `unknown
+  # failure code: W001` fifteen times a run and left every risk of every score
+  # blocking — the gating policy off, on a green build.
   SCAN_PATH: skills
+
+  # Read from the contract so the pin is named in one place. Every coverage-gap message
+  # below ends with it.
+  STALE_PIN_HINT: >-
+    If this is not obviously a problem with the skills themselves, suspect the scanner
+    pin first: this gate runs snyk-agent-scan==0.6.0, and a newer release can rename a
+    flag, a risk, or the JSON shape out from under it. Compare against the current
+    release before assuming the tree is at fault.
 
 jobs:
   scan:
@@ -146,7 +174,7 @@ jobs:
       # step goes red and we find out from our own CI instead of from a public audit page.
       # The offending string is assembled at runtime — committing one is the thing we're guarding
       # against — so nothing in this repository contains it. It runs the gate's real flags,
-      # IGNORED_ISSUE_CODES included, so an ignore list that grew to swallow the anchor rule
+      # the non-blocking risk list included, so an exemption that grew to swallow the anchor
       # would fail here rather than quietly neutering the gate.
       #
       # `continue-on-error` here does NOT make the control advisory — the
@@ -163,21 +191,41 @@ jobs:
         continue-on-error: true
         run: python .github/scripts/registry_scan_redprove.py
 
-      # Two passes, on purpose, and exactly two — the scanner is a network service, so every
-      # invocation costs. `--ignore-issues-codes` filters findings out of the printed report as
-      # well as out of the exit status, so the gating pass below is structurally incapable of
-      # showing a warning: it runs with the very flags that hide them. This pass carries no
-      # ignore list and is the only one that sees everything.
+      # ONE pass over SCAN_PATH, on purpose, and exactly one — the scanner is a network
+      # service against a public tier with a daily allowance, so every invocation costs.
+      # This used to be two: this unfiltered pass, and a second `--ci --ignore-risks` call
+      # over the same tree for the exit code. The second call added nothing this document
+      # does not already contain — the scanner's `--ci` verdict is "any risk left after
+      # the exemptions, or any error flagged is_failure", a few lines over the same JSON —
+      # and on 2026-09-14 it was the call that pushed the day over the cap. The gate step
+      # below applies that rule offline to this file instead.
       #
-      # It emits `--json` rather than the rich report because the JSON is what the next step
-      # turns into annotations, a summary table, and an artifact — and because the scanner's own
-      # printer silently drops the codes W003-W006 from the result, mutating it in place as it
-      # prints. JSON skips the printer entirely, so it is strictly the more complete output.
+      # No exemption list here, ever. `--ignore-risks` nulls the exempt risks out of the
+      # response BEFORE it is printed, not just before the exit status is computed, so a
+      # pass carrying it is structurally incapable of showing an exempt finding. This
+      # pass sees everything; the gate decides what blocks.
+      #
+      # `--json` rather than the rich report because the JSON is what the report step
+      # turns into annotations, a summary table, and an artifact; what the gate reads;
+      # and because it carries the per-entry `error` objects (with their category —
+      # the gate keys the daily cap on that) and the 0-1000 scores.
+      #
+      # The exit code is captured under `set +e` and published, because the gate needs
+      # it: without `--ci` the scanner exits non-zero only when it could not run at all
+      # (a usage error from a renamed flag, an unparseable argument), and a clean-looking
+      # document from a scanner that did not exit 0 must not be read as clean. The step
+      # still exits with that code so the log shows the failure where it happened.
       - name: Scan (all findings, unfiltered)
+        id: scan
         continue-on-error: true
         run: |
           echo "Scanning '${SCAN_PATH}' with no ignore list — every finding the scanner has."
-          uvx snyk-agent-scan@latest scan "${SCAN_PATH}" --json > registry-scan-findings.json
+          set +e
+          uvx snyk-agent-scan==0.6.0 scan "${SCAN_PATH}" --json > registry-scan-findings.json
+          code=$?
+          set -e
+          echo "scan_exit=${code}" >> "${GITHUB_OUTPUT}"
+          exit "${code}"
 
       # Warnings never fail this build, so they must be impossible to miss instead. This writes
       # each one to the checks tab as an annotation (where a review agent can query it), to the
@@ -196,25 +244,32 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      # The authoritative gate, and the only step that fails on a finding. `--ci` turns any
-      # remaining finding into exit 1; with the W class ignored, "remaining" means the critical
-      # E-class, plus the scanner's own X-class runtime failures, which are deliberately NOT
-      # ignored — a scan that broke is not a scan that passed.
-      # `--dangerously-run-mcp-servers` is required by `--ci`; it only affects MCP server configs,
-      # and this path contains skill directories only, so nothing is executed.
+      # The authoritative gate, and the only step that fails on a finding. It is OFFLINE:
+      # it reads the JSON the scan above wrote and applies the scanner's own `--ci` rule
+      # to it — any risk not in the contract's exemption list blocks, and so does any
+      # error the scanner flagged `is_failure`, which is deliberately not ignored: a scan
+      # that broke is not a scan that passed. No second network call.
       #
       # The `id` is what lets the step below tell "we could not look" apart from
       # "we looked and found something". Without it that step reads only the
       # control's outcome, and a run where the control failed AND a critical was
       # reported goes red annotated NOT A FINDING.
+      #
+      # The script classifies on the document's STRUCTURE — risk keys and error
+      # objects — never on printed prose. Every earlier version of this gate grepped
+      # the scanner's log, and each grep found a way to be wrong: E-codes 0.6.0 never
+      # emits (every real finding announced as NOT A FINDING, 2026-08-20 → 08-25), then
+      # `risks found`, which the scanned skills' own text says as a matter of course.
+      # The classes it writes (`scan_class`), and what each means, are in the script's
+      # docstring; the titled `::error` annotations are the ones this step always
+      # printed, plus one: REGISTRY SCAN QUOTA EXHAUSTED — NOT A FINDING, for the day
+      # the public tier's cap is hit. That run verified nothing and fails like any
+      # other coverage gap; it just says why, and that it resets daily.
       - name: Gate on critical findings
         id: gate
-        run: |
-          uvx snyk-agent-scan@latest scan "${SCAN_PATH}" \
-            --ci \
-            --verbose \
-            --dangerously-run-mcp-servers \
-            --ignore-issues-codes "${IGNORED_ISSUE_CODES}"
+        env:
+          SCANNER_EXIT: ${{ steps.scan.outputs.scan_exit }}
+        run: python .github/scripts/registry_scan_gate.py registry-scan-findings.json
 
       # Two red checks that mean opposite things must not look the same. A gate
       # failure above means "a critical finding is in this tree". This step means
@@ -231,12 +286,22 @@ jobs:
       - name: Report the coverage gap
         if: ${{ !cancelled() }}
         run: |
+          # A SKIPPED gate is not a clean gate, and a passing control does not make a run
+          # whose gate never executed meaningful. The steps between the control and the
+          # gate are not all continue-on-error — `Surface findings` fails on unreadable
+          # scan output — so this is a reachable state, and it must be read BEFORE the
+          # control's verdict rather than after it, which is what made the branch at the
+          # end of this step unreachable in exactly the case it was written for.
+          if [ "${{ steps.gate.outcome }}" != "success" ] && [ "${{ steps.gate.outcome }}" != "failure" ]; then
+            echo "::error title=REGISTRY SCAN GATE DID NOT RUN::The gating scan did not run (outcome: ${{ steps.gate.outcome }}), so nothing was checked for critical findings. Read the failing step above. This is a coverage gap, not a clean result. ${STALE_PIN_HINT}"
+            exit 1
+          fi
           if [ "${{ steps.red_proof.outcome }}" = "success" ]; then
             echo "Control passed: the scanner reported the anchor finding, so this run's result is meaningful."
             exit 0
           fi
           if [ "${{ steps.red_proof.outcome }}" != "failure" ]; then
-            echo "::error title=REGISTRY SCAN CONTROL DID NOT RUN::The control step did not run (outcome: ${{ steps.red_proof.outcome }}), so nothing here established whether the scanner can see. Read the failing step above."
+            echo "::error title=REGISTRY SCAN CONTROL DID NOT RUN::The control step did not run (outcome: ${{ steps.red_proof.outcome }}), so nothing here established whether the scanner can see. Read the failing step above. ${STALE_PIN_HINT}"
             exit 1
           fi
           # The two failures are not exclusive, and this ordering matters: a blind
@@ -244,26 +309,49 @@ jobs:
           # in the tree, and the unfiltered pass behind the control can still
           # surface one. Announcing the coverage gap over that run would put
           # "NOT A FINDING" on the one result a human most needs to read.
+          #
+          # The daily cap comes before the generic gap and before the blind-scanner
+          # narrative. The control is the first call of the run and the scan the
+          # second, so the cap can fall on either; whichever it hit, the run verified
+          # nothing for a reason that is neither a finding nor a blind scanner, and
+          # the text below must not claim otherwise.
+          if [ "${{ steps.gate.outputs.scan_class }}" != "finding" ] && { [ "${{ steps.gate.outputs.scan_class }}" = "quota" ] || [ "${{ steps.red_proof.outputs.control_class }}" = "quota" ]; }; then
+            echo "::error title=REGISTRY SCAN QUOTA EXHAUSTED — NOT A FINDING::The scanner's public tier hit its daily usage cap on this run (scan class ${{ steps.gate.outputs.scan_class }}, control class ${{ steps.red_proof.outputs.control_class }}), so nothing under ${SCAN_PATH} was verified. The cap resets daily; re-run this check after the reset. This is a coverage gap, not a security finding, and not a broken or blind scanner."
+            {
+              echo "## Registry scan: daily cap hit — nothing verified"
+              echo ""
+              echo "**Nothing was verified on this run, and this is not a finding.** The"
+              echo "scanner's public tier allows a limited, undocumented number of analysis"
+              echo "calls per day, shared by every run of this workflow, and this run hit it"
+              echo "(scan class \`${{ steps.gate.outputs.scan_class }}\`, control class"
+              echo "\`${{ steps.red_proof.outputs.control_class }}\`)."
+              echo ""
+              echo "It resets daily: re-run this check after the reset, or push again then."
+              echo "The cap is a property of the public tier that \`SNYK_TOKEN\` authenticates"
+              echo "against; the unlock is enabling Agent Scan on the Snyk tenant and running"
+              echo "the scanner with a tenant push key, not a different token."
+              echo ""
+              echo "**Compensating control:** the offline shape guard in"
+              echo "\`tests/test_no_ioc_shaped_literals.py\` runs in \`test\`, which is required."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+          if [ "${{ steps.gate.outcome }}" = "failure" ] && [ "${{ steps.gate.outputs.scan_class }}" != "finding" ]; then
+            echo "::error title=REGISTRY SCAN DID NOT RUN — NOT A FINDING::The scan did not produce a finding (exit ${{ steps.gate.outputs.scan_exit }}, class ${{ steps.gate.outputs.scan_class }}), so nothing under ${SCAN_PATH} was verified clean. This is a coverage gap. Do NOT read it as a security finding. ${STALE_PIN_HINT}"
+            exit 1
+          fi
           if [ "${{ steps.gate.outcome }}" = "failure" ]; then
-            echo "::error title=REGISTRY SCAN FINDING — AND THE CONTROL WAS BLIND::The gate reported a critical finding in ${SCAN_PATH}. Treat it as a real finding and read the gate step above for its issue code. Separately, the control also failed, so the scan's SILENCE elsewhere carries no information — this run is a floor on what is present, not a ceiling."
+            echo "::error title=REGISTRY SCAN FINDING — AND THE CONTROL WAS BLIND::The gate reported a critical finding in ${SCAN_PATH}. Treat it as a real finding and read the gate step above for its risk name and score. Separately, the control also failed, so the scan's SILENCE elsewhere carries no information — this run is a floor on what is present, not a ceiling."
             {
               echo "## Registry scan: a finding, on a run that also verified nothing else"
               echo ""
               echo "The gating step reported a critical finding under \`${SCAN_PATH}\`."
-              echo "**This IS a security finding** — its issue code is in the gate step's log."
+              echo "**This IS a security finding** — its risk name and score are in the gate step's log."
               echo ""
               echo "The control skill ALSO came back clean on this run, so everything the"
               echo "scan did NOT report is unverified. Treat the finding above as a floor,"
               echo "not as the complete set."
             } >> "${GITHUB_STEP_SUMMARY}"
-            exit 1
-          fi
-          # A SKIPPED gate is not a clean gate. The steps between the control and
-          # the gate are not all continue-on-error, so one of them failing leaves
-          # the gate unrun — and the coverage-gap text below asserts a verified
-          # cause that such a run never established.
-          if [ "${{ steps.gate.outcome }}" != "success" ]; then
-            echo "::error title=REGISTRY SCAN GATE DID NOT RUN::The gating scan did not run (outcome: ${{ steps.gate.outcome }}), so nothing was checked for critical findings. Read the failing step above. This is a coverage gap, not a clean result."
             exit 1
           fi
           echo "::error title=REGISTRY SCAN COVERAGE GAP — NOT A FINDING::The scanner reported nothing on a deliberately malicious control skill, so this run verified NOTHING about ${SCAN_PATH}. This is a coverage gap, not a clean result and not a security finding."
@@ -276,13 +364,14 @@ jobs:
             echo "means nothing either."
             echo ""
             echo "**This is not a security finding.** A finding fails the gate step above and"
-            echo "names its issue code."
+            echo "names its risk."
             echo ""
-            echo "Known cause, verified against the live API on 2026-08-19: the analysis"
-            echo "endpoint answers HTTP 200 with an empty finding set on both API versions it"
-            echo "supports, on fixtures including credential exfiltration. It is not the token"
-            echo "(\`/self\` and \`/orgs\` answer 200), not the free-tier daily cap (no 429, quota"
-            echo "remaining), and not the deprecated version pin (the newer one is empty too)."
+            echo "This is the blind-scanner case, not the daily cap: the scanner did NOT report"
+            echo "its usage limit on this run (that is classified \`quota\` and says so), it"
+            echo "answered — and said nothing. The last time this happened (2026-08-19) the"
+            echo "analysis endpoint answered HTTP 200 with an empty finding set on both API"
+            echo "versions it supported, on fixtures including credential exfiltration, and it"
+            echo "was not the token or the version pin. Check the scanner pin first."
             echo ""
             echo "**Compensating control:** the offline shape guard in"
             echo "\`tests/test_no_ioc_shaped_literals.py\` covers the mechanical half of the"

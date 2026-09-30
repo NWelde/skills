@@ -249,6 +249,56 @@ def _line_of_in_job(raw: str, job_name: str, needle: str) -> int:
     return 0
 
 
+def _line_of_nth_in_job(raw: str, job_name: str, needle: str, occurrence: int) -> int:
+    """1-based line of the Nth occurrence of `needle` within the `job_name:` block.
+    Used when multiple steps in a job contain the same needle (e.g., multiple
+    `fetch-depth: 0` lines). occurrence is 1-based. Returns 0 if not enough
+    occurrences are found."""
+    lines = raw.splitlines()
+    jobs_at = next(
+        (i for i, ln in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", ln)), None)
+    if jobs_at is None:
+        return 0
+    indent = None
+    for i in range(jobs_at + 1, len(lines)):
+        ln = lines[i]
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^(\s+)\S", ln)
+        indent = len(m.group(1)) if m else None
+        break
+    if not indent:
+        return 0
+    header = re.compile(rf"^\s{{{indent}}}([A-Za-z0-9_.-]+):\s*(#.*)?$")
+    start = None
+    for i in range(jobs_at + 1, len(lines)):
+        m = header.match(lines[i])
+        if m and m.group(1) == job_name:
+            start = i
+            break
+    if start is None:
+        return 0
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if header.match(lines[j]):
+            end = j
+            break
+    count = 0
+    for k in range(start, end):
+        # A comment that quotes the needle ("TODO: drop fetch-depth: 0") is
+        # prose, not a configuration key. Counting it shifts every later
+        # occurrence's line by one and leaves the LAST one unreachable — the
+        # caller then loses that finding entirely. Full-line comments only:
+        # a trailing comment sits on a real key line, which does count.
+        if lines[k].lstrip().startswith("#"):
+            continue
+        if needle in lines[k]:
+            count += 1
+            if count == occurrence:
+                return k + 1
+    return 0  # Not enough occurrences
+
+
 def _jobs_from_doc(doc: dict) -> dict[str, dict]:
     jobs = doc.get("jobs") or {}
     return jobs if isinstance(jobs, dict) else {}
@@ -275,6 +325,31 @@ _GIT_HISTORY_RE = re.compile(
     # full history just like a `...` merge-base diff — but it has neither `...`
     # nor `origin/`. Match a `git diff` line that references a `.sha` expression.
     r"git\s+diff\b[^\n|]*\.sha\b|"
+    # Diff against a base ref held in a shell variable: `git diff --name-only
+    # "$base" HEAD` or as a positional parameter like `git diff "$1" HEAD`. The
+    # base commit is just as absent from a shallow clone as a literal
+    # `<sha>...HEAD` is — it simply carries no `...`, no `origin/` and no
+    # `.sha` for the clauses above to see.
+    #
+    # The variable only counts where a REF operand can stand. Two positions on
+    # the command line can never hold a ref, and a `$` reached through either
+    # one says nothing about history:
+    #   * past a redirection arrow — `git diff --stat >> $GITHUB_STEP_SUMMARY`
+    #     and `git diff > $OUT` name the FILE the diff is written to;
+    #   * past a bare `--` separator — everything after it is a pathspec, so
+    #     `git diff --exit-code -- "$FILE"` names a path, not a base commit.
+    # Option flags such as `--name-only` are not the separator (no trailing
+    # space), so `git diff --no-renames --name-only "$base" HEAD` still counts.
+    r"git\s+diff\b(?:(?!\s--\s|>)[^\n|])*\$[({]?[A-Za-z_0-9]|"
+    # Object-reachability probe: `git cat-file -e "${base}^{commit}"` succeeds
+    # only when the object is present in the clone, which is exactly what full
+    # history buys. A cat-file whose operand is anchored at HEAD is the
+    # opposite case — `git cat-file -p HEAD:package.json` reads a blob at the
+    # checked-out commit, which every clone depth already has — so a HEAD
+    # operand (but not `HEAD~1` / `HEAD^`, which do reach back) disqualifies
+    # the clause. The lookahead stops at a command separator so a later,
+    # unrelated HEAD read cannot cancel a genuine probe.
+    r"git\s+cat-file\b(?![^\n|;&]*\bHEAD(?![~^]))|"
     r"fetch-tags|--tags|"
     # Change-detection actions that diff the head against a BASE ref need base
     # history: `dorny/paths-filter` with `base:` set, and `tj-actions/changed-files`
@@ -297,6 +372,20 @@ _HISTORY_JOB_NAME_RE = re.compile(
 # once per scan() from the referenced action files; consulted by
 # `_job_needs_git_history` so OPT28 never recommends shallowing such a job.
 _GIT_HISTORY_LOCAL_ACTIONS: set[str] = set()
+
+
+# A `run:` block routinely breaks ONE shell command across several lines with a
+# trailing backslash, and every clause of `_GIT_HISTORY_RE` is line-scoped. Join
+# the continuations back together before matching, so a git command whose
+# history-revealing operand sits on the next line is still seen as one command.
+_LINE_CONTINUATION_RE = re.compile(r"\\\n[ \t]*")
+
+
+def _has_git_history_op(text: str) -> bool:
+    """True when `text` runs a git operation that needs full history. Applied to
+    every surface `_GIT_HISTORY_RE` is matched against, so line continuations are
+    joined in exactly one place."""
+    return bool(_GIT_HISTORY_RE.search(_LINE_CONTINUATION_RE.sub(" ", text)))
 
 
 def _index_local_git_actions(root: Path, parsed: list[tuple[str, dict, str]]) -> set[str]:
@@ -322,7 +411,7 @@ def _index_local_git_actions(root: Path, parsed: list[tuple[str, dict, str]]) ->
                 text = cand.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if _GIT_HISTORY_RE.search(text):
+            if _has_git_history_op(text):
                 out.add(ref)
             break
         else:
@@ -338,7 +427,7 @@ def _index_local_git_actions(root: Path, parsed: list[tuple[str, dict, str]]) ->
 def _job_needs_git_history(job: dict, job_name: str = "") -> bool:
     blob = _job_run_blob(job)
     uses_blob = "\n".join(_uses(s) for s in _steps(job))
-    if _GIT_HISTORY_RE.search(blob) or _GIT_HISTORY_RE.search(uses_blob):
+    if _has_git_history_op(blob) or _has_git_history_op(uses_blob):
         return True
     # A local composite action the job invokes may run the git op internally
     # (the workflow yaml shows only `uses: ./…`). Consult the per-scan index.
@@ -350,6 +439,90 @@ def _job_needs_git_history(job: dict, job_name: str = "") -> bool:
     # history even when the op lives in an invoked script. Conservative on
     # purpose — never recommend shallowing one of these.
     return bool(_HISTORY_JOB_NAME_RE.search(job_name))
+
+
+# When `fetch-depth: 0` is load-bearing, maintainers routinely say so in a YAML
+# comment right above it — and comments are dropped at parse time, so the one
+# artifact that settles the question is invisible to the detector. Read it back
+# out of the raw text and treat it as a carve-out: a nearby comment that names a
+# history operation means "do not recommend shallowing this step".
+#
+# The bound is six lines above the matched `fetch-depth: 0`, and a blank line
+# ends the region. Six is what it takes to reach a comment written above the
+# step itself — `- uses:` and `with:` sit between — with room for a two- or
+# three-line comment block; beyond that the comment belongs to an earlier step
+# and is not a justification for this one.
+_OPT28_JUSTIFY_LOOKBACK = 6
+
+# Deliberately tight. `depth` is NOT in the vocabulary: "fetch-depth: 0 is
+# unnecessary here" must not read as a justification — hence also the
+# `fetch(?!-depth)` guard, so the key's own name never counts as `git fetch`.
+_OPT28_JUSTIFY_RE = re.compile(
+    r"\b(?:rev-list|rev-parse|merge-base|describe|blame|history|ancestors?|"
+    r"changelog|tags?|log)\b|"
+    r"\bfetch(?!-depth)\b|"
+    r"\bshallow\s+clone\b",
+    re.I)
+
+
+def _opt28_history_justification(raw: str, line: int | None) -> str | None:
+    """The nearby comment that documents why this `fetch-depth: 0` is needed, or
+    None. Suppressor only: it can remove an OPT28 finding, never create one.
+
+    The region is the `_OPT28_JUSTIFY_LOOKBACK` lines directly above the key,
+    closed early by a blank line. Within it, a comment counts only when it
+    belongs to THIS step: the step's own body qualifies, and so does a comment
+    written above the step marker at the step's own indentation. A comment
+    above the marker but indented deeper is inside the preceding step (the tail
+    of its `run: |` block), and ordinary YAML above the marker ends the region —
+    neither is a justification for this checkout."""
+    if not line:
+        return None
+    lines = raw.splitlines()
+    idx = line - 1  # 0-based index of the matched `fetch-depth: 0` line
+    if idx < 0 or idx >= len(lines):
+        return None
+    # The step this key belongs to — the nearest `- ` marker at or above it.
+    step_marker_idx = None
+    for i in range(idx, -1, -1):
+        text = lines[i]
+        if not text.strip():
+            continue
+        if re.match(r"^\s*-\s", text):
+            step_marker_idx = i
+            break
+    if step_marker_idx is None:
+        return None
+    marker = lines[step_marker_idx]
+    marker_indent = len(marker) - len(marker.lstrip())
+
+    # Walk up from the key, no further than the documented bound.
+    for i in range(idx - 1, max(0, idx - _OPT28_JUSTIFY_LOOKBACK) - 1, -1):
+        text = lines[i]
+        stripped = text.strip()
+
+        if not stripped:
+            break  # a blank line ends the region
+
+        if not stripped.startswith("#"):
+            # Inside this step, the non-comment lines are its own scaffolding
+            # (`- uses:`, `with:`) and a comment may sit among them. Above the
+            # step marker, ordinary YAML ends the region.
+            if i >= step_marker_idx:
+                continue
+            break
+
+        if i < step_marker_idx and len(text) - len(text.lstrip()) > marker_indent:
+            # A comment above the step marker but indented DEEPER than it is
+            # inside the preceding step — the tail of a `run: |` block, say.
+            # That is the preceding step's shell text, not this step's
+            # justification.
+            break
+
+        if _OPT28_JUSTIFY_RE.search(stripped):
+            return stripped.lstrip("#").strip()
+
+    return None
 
 
 def _detect_opt28(doc: dict, raw: str) -> list[Hit]:
@@ -372,6 +545,7 @@ def _detect_opt28(doc: dict, raw: str) -> list[Hit]:
             continue
         if _job_needs_git_history(job, job_name):
             continue  # depth:0 is load-bearing here — removing it breaks the job
+        checkout_index = 0  # Track which checkout step this is (1-based)
         for step in (job.get("steps") or []):
             if not isinstance(step, dict):
                 continue
@@ -380,13 +554,332 @@ def _detect_opt28(doc: dict, raw: str) -> list[Hit]:
                 continue
             depth = (step.get("with") or {}).get("fetch-depth")
             if str(depth) == "0":
-                line = _line_of_in_job(raw, job_name, "fetch-depth: 0")
+                checkout_index += 1
+                # Find the line for THIS checkout (the Nth occurrence of "fetch-depth: 0"
+                # in the job block), not the first one.
+                line = _line_of_nth_in_job(raw, job_name, "fetch-depth: 0", checkout_index)
+                # A documented justification above the line settles it: the
+                # depth is load-bearing, so stay silent for this step. A comment
+                # can be stale or wrong, and this trades a possible missed
+                # finding for never recommending a fix that breaks a job — the
+                # direction this pattern already chose.
+                if _opt28_history_justification(raw, line):
+                    continue
                 hits.append(Hit(
                     line=line,
                     affected_jobs=[job_name],
                     evidence=f"job `{job_name}` uses `{uses}` with `fetch-depth: 0` "
                              f"(no git-history operation found in the job)",
                     match_text=job_name,
+                ))
+    return hits
+
+
+# ---- OPT76 — Submodule / Git LFS Checkout Payload (P5.5) ---------------------
+
+# Two checkout-time payloads OPT28 does NOT cover: the submodule clone
+# (`submodules: true|recursive`) and the LFS object download (`lfs: true`, or a
+# `git lfs pull|fetch` run step). Both are paid on every run of every job that
+# asks for them, whether or not the job reads a byte of the payload.
+#
+# The finding needs THREE facts, all read from the repo — never assumed:
+#   1. the repo DECLARES a payload path (`.gitmodules` paths / `.gitattributes`
+#      `filter=lfs` patterns). No declaration → no finding: with nothing declared
+#      we cannot name a path the job fails to read, and asserting unread payload
+#      we never saw is exactly the evidence-claim class the guards forbid.
+#   2. a job PULLS it (the checkout `with:` key, or a `git lfs` run step).
+#   3. NO step in that job references any declared path — searched across the
+#      job's run blocks, working-directory, matrix values, step `if:`/`name:`,
+#      `with:` values, `uses:` refs, and the body of any LOCAL composite action
+#      it invokes (transitively).
+# When a local composite action can't be read we fail CLOSED (skip the job), the
+# same stance OPT28 takes: the cost is a missed finding, never a breaking fix.
+#
+# `git lfs checkout` is deliberately NOT here: it populates the working tree from
+# objects that are ALREADY local, so it downloads nothing and flagging it would
+# assert a network payload we never established.
+_LFS_RUN_RE = re.compile(r"git\s+lfs\s+(pull|fetch)\b", re.I)
+_LOCAL_USES_RE = re.compile(r"uses:\s*['\"]?(\./[^\s'\"#]+)")
+
+# Populated once per scan() from the repo root (see the scan() wiring below).
+_SUBMODULE_PATHS: list[str] = []
+_LFS_PATH_HINTS: list[str] = []
+# Local `uses: ./…` ref → its action file text (plus the text of every local
+# action it transitively invokes), or None when any link is unreadable.
+_LOCAL_ACTION_TEXT: dict[str, "str | None"] = {}
+
+
+def _read_repo_file(root: Path, name: str) -> str:
+    try:
+        return (root / name).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_gitmodules(text: str) -> list[str]:
+    """The `path = …` values declared in `.gitmodules`. Values may be quoted (a
+    path containing a space has to be) and may carry a trailing `#` comment;
+    dropping those silently shrinks the declared payload, which would let the
+    evidence enumerate an incomplete declaration and flag a job that does read
+    the submodule it omitted."""
+    out: list[str] = []
+    for line in text.splitlines():
+        m = re.match(r"\s*path\s*=\s*(.+?)\s*(?:#.*)?$", line)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if len(val) > 1 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        val = re.sub(r"^\./", "", val).strip("/")
+        if val:
+            out.append(val)
+    return sorted(set(out))
+
+
+def _parse_lfs_attributes(text: str) -> list[str]:
+    """Searchable hints for the paths `.gitattributes` tracks with LFS. A
+    pattern like `*.psd` yields `.psd` (an extension a step would name); a path
+    pattern like `assets/**` yields its literal prefix `assets/`. Patterns that
+    reduce to nothing searchable (a bare `*`) are dropped — they would match any
+    job text and silently suppress every finding."""
+    out: list[str] = []
+    for line in text.splitlines():
+        fields = line.split()
+        # A comment line is not a declaration — and its `#` would otherwise
+        # become a hint that matches almost every run block, silently switching
+        # the whole LFS half of the pattern off. `-filter=lfs` UNSETS the
+        # attribute, and `filter=lfsfoo` is a different attribute entirely.
+        if not fields or fields[0].startswith("#"):
+            continue
+        if "filter=lfs" not in fields[1:]:
+            continue
+        pat = fields[0]
+        if pat.startswith("*.") and len(pat) > 2:
+            out.append(pat[1:])            # "*.psd" -> ".psd"
+            continue
+        literal = re.split(r"[\*\?\[]", pat)[0].strip("/")
+        if literal:
+            out.append(literal)
+    return sorted(set(out))
+
+
+def _read_local_action(root: Path, ref: str) -> "str | None":
+    """The action file's text for a local `uses: ./…` ref, or None when no
+    candidate file is readable."""
+    base = root / ref[2:]
+    candidates = [base] if base.suffix in (".yml", ".yaml") else [
+        base / "action.yml", base / "action.yaml"]
+    for cand in candidates:
+        try:
+            return cand.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return None
+
+
+def _index_local_action_text(root: Path,
+                             parsed: list[tuple[str, dict, str]]) -> dict[str, "str | None"]:
+    """Local `uses: ./…` ref → its action text CONCATENATED with the text of
+    every local action it transitively invokes; None when any link in that chain
+    is unreadable. A composite action routinely delegates to another local
+    action, and that inner one can be the step that reads the payload — reading
+    only the outer body would make the job look clean and recommend a removal
+    that breaks the build. An unreadable link anywhere fails the whole chain
+    CLOSED, the same stance a directly-unreadable action takes."""
+    refs: set[str] = set()
+    for _rel, doc, _raw in parsed:
+        for job in _jobs_from_doc(doc).values():
+            if not isinstance(job, dict):
+                continue
+            for s in _steps(job):
+                u = _uses(s).split("@")[0].strip()
+                if u.startswith("./"):
+                    refs.add(u)
+    out: dict[str, "str | None"] = {}
+    for ref in refs:
+        parts: list[str] = []
+        seen: set[str] = set()
+        queue: list[str] = [ref]
+        unreadable = False
+        while queue:
+            cur = queue.pop()
+            if cur in seen:
+                continue        # a cycle terminates instead of spinning
+            seen.add(cur)
+            text = _read_local_action(root, cur)
+            if text is None:
+                unreadable = True
+                break
+            parts.append(text)
+            queue += [m.split("@")[0].strip() for m in _LOCAL_USES_RE.findall(text)]
+        out[ref] = None if unreadable else "\n".join(parts)
+    return out
+
+
+def _job_payload_blob(job: dict) -> "str | None":
+    """Everything in the job that could name a checked-out path: run blocks,
+    step and job-level `working-directory`, matrix values, step `if:`/`name:`,
+    `uses:` refs, `with:`/`env:` values, and the body of each local composite
+    action it invokes (transitively). None when a local action can't be read —
+    the caller then skips the job (fail closed).
+
+    The blob has to cover EVERY place the job's own YAML can name a path,
+    because the finding's evidence asserts that no step in the job references a
+    declared one. A path sitting in `defaults.run.working-directory` or a matrix
+    value is in the very text the evidence claims to have searched, so missing it
+    is a false claim, not a documented blind spot."""
+    parts: list[str] = [str(job.get("name") or "")]
+    for block in ("env", "defaults", "strategy"):
+        vals = job.get(block)
+        if vals is not None:
+            parts.append(_yaml_text(vals))
+    for s in _steps(job):
+        parts.append(_run(s))
+        parts.append(str(s.get("working-directory") or ""))
+        parts.append(str(s.get("name") or ""))
+        parts.append(str(s.get("if") or ""))
+        uses = _uses(s)
+        parts.append(uses)
+        for block in ("with", "env"):
+            vals = s.get(block)
+            if isinstance(vals, dict):
+                parts += [str(v) for v in vals.values()]
+        ref = uses.split("@")[0].strip()
+        if ref.startswith("./"):
+            text = _LOCAL_ACTION_TEXT.get(ref)
+            if text is None:
+                return None     # unreadable local action — can't prove it unread
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _yaml_text(node: Any) -> str:
+    """Every scalar reachable from `node`, flattened — used to search nested
+    blocks (`defaults`, `strategy.matrix`) whose shape varies."""
+    if isinstance(node, dict):
+        return "\n".join(f"{k}\n{_yaml_text(v)}" for k, v in node.items())
+    if isinstance(node, (list, tuple)):
+        return "\n".join(_yaml_text(v) for v in node)
+    return str(node)
+
+
+def _payload_line(raw: str, job_name: str, key: str, accepted: tuple[str, ...]) -> int:
+    """The line inside `job_name` that writes `key: <one of accepted>`. Anchoring
+    on a bare `key:` needle would cite the FIRST such line in the job, so a job
+    with two checkouts renders `submodules: false` as the verbatim proof of a
+    `submodules: true` finding. Returning 0 when no accepted literal is written
+    also suppresses the YAML-truthy-but-runner-false values: PyYAML resolves
+    `yes`/`on` to True, while actions/checkout enables submodules only for
+    `TRUE`/`RECURSIVE`, so `submodules: yes` pulls nothing at all."""
+    for value in accepted:
+        for cased in (value, value.upper(), value.capitalize()):
+            for lit in (cased, f'"{cased}"', f"'{cased}'"):
+                line = _line_of_in_job(raw, job_name, f"{key}: {lit}")
+                if line:
+                    return line
+    return 0
+
+
+def _detect_opt76(doc: dict, raw: str) -> list[Hit]:
+    """A checkout that pulls submodules or LFS objects in a job that references
+    none of the declared submodule / LFS-tracked paths."""
+    if not (_SUBMODULE_PATHS or _LFS_PATH_HINTS):
+        return []   # nothing declared in the repo — no path to prove unread
+    on = doc.get("on") or doc.get(True)
+    # Same dev-facing scope as OPT28: a dispatch-/schedule-only helper runs
+    # ~0x/mo, so its checkout payload is noise, not a ranked optimization.
+    if not _on_includes(on, ("pull_request", "push", "workflow_call")):
+        return []
+    hits: list[Hit] = []
+    for job_name, job in _jobs_from_doc(doc).items():
+        if not isinstance(job, dict):
+            continue
+        blob = _job_payload_blob(job)
+        if blob is None:
+            continue    # fail closed
+        # Git path matching is effectively case-insensitive on the macOS and
+        # Windows checkouts these workflows run against, so a step naming
+        # `assets/LOGO.PSD` really does read the `*.psd` payload.
+        blob_l = blob.lower()
+        reads_submodule = any(p.lower() in blob_l for p in _SUBMODULE_PATHS)
+        reads_lfs_path = any(h.lower() in blob_l for h in _LFS_PATH_HINTS)
+        # One payload is downloaded once, however many steps ask for it — a job
+        # with both `lfs: true` and `git lfs pull` must not double-count it.
+        flagged: set[str] = set()
+        for step in _steps(job):
+            if not _uses(step).startswith("actions/checkout"):
+                continue
+            with_ = step.get("with")
+            if not isinstance(with_, dict):
+                with_ = {}
+            # A `repository:` checkout clones SOMEONE ELSE's tree, whose
+            # submodules and LFS objects this repo's `.gitmodules` /
+            # `.gitattributes` say nothing about. Naming our declared paths as
+            # its unread payload would be a claim about data never observed.
+            if str(with_.get("repository") or "").strip():
+                continue
+            sub = str(with_.get("submodules", "")).lower()
+            line = (_payload_line(raw, job_name, "submodules", ("true", "recursive"))
+                    if sub in ("true", "recursive") else 0)
+            if (_SUBMODULE_PATHS and line and not reads_submodule
+                    and "submodule" not in flagged):
+                flagged.add("submodule")
+                paths = ", ".join(f"`{p}`" for p in _SUBMODULE_PATHS)
+                hits.append(Hit(
+                    line=line,
+                    affected_jobs=[job_name],
+                    evidence=(
+                        f"job `{job_name}` checks out with `submodules: {sub}`, and no "
+                        f"step in the job (nor a local composite action it invokes) "
+                        f"references the submodule path(s) declared in `.gitmodules`: "
+                        f"{paths}"),
+                    match_text=job_name,
+                    snippet=_raw_line(raw, line),
+                ))
+            lfs_line = (_payload_line(raw, job_name, "lfs", ("true",))
+                        if str(with_.get("lfs", "")).lower() == "true" else 0)
+            if (_LFS_PATH_HINTS and lfs_line and not reads_lfs_path
+                    and "lfs" not in flagged):
+                flagged.add("lfs")
+                line = lfs_line
+                hints = ", ".join(f"`{h}`" for h in _LFS_PATH_HINTS)
+                hits.append(Hit(
+                    line=line,
+                    affected_jobs=[job_name],
+                    evidence=(
+                        f"job `{job_name}` checks out with `lfs: true`, and no step in "
+                        f"the job (nor a local composite action it invokes) references "
+                        f"the LFS-tracked path(s) in `.gitattributes`: {hints}"),
+                    match_text=job_name,
+                    snippet=_raw_line(raw, line),
+                ))
+        # `git lfs pull` / `git lfs fetch` in a run block downloads the same
+        # objects the `lfs:` input would — flag it on the same evidence.
+        if _LFS_PATH_HINTS and not reads_lfs_path and "lfs" not in flagged:
+            matched = next(
+                (m.group(0) for m in (_LFS_RUN_RE.search(_run(s)) for s in _steps(job))
+                 if m),
+                None,
+            )
+            if matched:
+                flagged.add("lfs")
+                # Anchor on the `pull`/`fetch` command we actually matched, not
+                # the job's first `git lfs` line: a job commonly runs `git lfs
+                # install` (or `checkout`) first, and those download nothing —
+                # quoting one as the verbatim proof of a network payload would
+                # cite a command this detector deliberately refuses to flag.
+                line = (_line_of_in_job(raw, job_name, matched)
+                        or _line_of_in_job(raw, job_name, "git lfs"))
+                hints = ", ".join(f"`{h}`" for h in _LFS_PATH_HINTS)
+                hits.append(Hit(
+                    line=line,
+                    affected_jobs=[job_name],
+                    evidence=(
+                        f"job `{job_name}` runs `git lfs` to download LFS objects, and "
+                        f"no step in the job (nor a local composite action it invokes) "
+                        f"references the LFS-tracked path(s) in `.gitattributes`: {hints}"),
+                    match_text=job_name,
+                    snippet=_raw_line(raw, line),
                 ))
     return hits
 
@@ -1728,6 +2221,7 @@ _DETECTORS: dict[str, Any] = {
     "OPT23": _detect_opt23,
     "OPT27": _detect_opt27,
     "OPT28": _detect_opt28,
+    "OPT76": _detect_opt76,
     "OPT29": _detect_opt29,
     "OPT31": _detect_opt31,
     "OPT32": _detect_opt32,
@@ -2113,6 +2607,532 @@ def _ci_turbo_tasks(root: Path, parsed: list[tuple[str, dict, str]]) -> set[str]
     return tasks
 
 
+# --- Test-runner isolation (OPT78 corroboration, not a finding) --------------
+# The OPT78 lever ("per-file isolation is rebuilding shared module state") is
+# routed at DRILL time from the measured long pole's log (ARCHITECTURE §12.3),
+# but the log alone cannot say whether the repo is still PAYING for per-file
+# isolation — that is a config fact. This reader supplies it, and only it: it
+# reports what the vitest config says, never whether a finding should fire.
+# Emitted as a top-level `test_runner_isolation` block for `blocking_path.py`
+# to gate the `vitest-isolate-pool` leaf on.
+#
+# WHICH files count as config. Not a fixed list of names: an opt-out is as
+# likely to sit in `vitest.unit.config.ts`, `vitest.config.e2e.ts` or a shared
+# base (`vitest.shared.ts`, `vitest.base.mts`) pulled in by `mergeConfig` as in
+# the default `vitest.config.ts`, and a missed opt-out tells a repo that already
+# applied this HIGH-risk lever to apply it again. So every `vitest*` file with a
+# config extension is read (setup and `.d.ts` files excepted), plus any
+# `vite.*config*` file. `.json` is accepted because vitest 3.x's
+# `vitest.workspace.json` / `vitest.projects.json` carry project settings; the
+# name filter below is the only filter — a `vitest.config.json` is read too,
+# harmlessly, since vitest itself never loads one.
+_VITEST_CONFIG_EXTS = ("ts", "mts", "cts", "js", "mjs", "cjs", "json")
+
+
+def _is_vitest_config_name(name: str) -> bool:
+    stem, dot, ext = name.rpartition(".")
+    if not dot or ext not in _VITEST_CONFIG_EXTS or not stem:
+        return False
+    parts = stem.lower().split(".")
+    if any("setup" in p for p in parts) or parts[-1] == "d":
+        return False            # setup files / type declarations: never config
+    if parts[0].startswith("vitest"):
+        return True
+    return parts[0] == "vite" and any("config" in p for p in parts[1:])
+
+
+# A monorepo keeps its suites' configs under `packages/*/`, `apps/*/` etc., so a
+# root-only read would report "no config" on exactly the repos this lever is
+# about. Walk a BOUNDED slice of the tree instead — build output and local
+# copies pruned, and the walk stopped by a DEPTH bound and by a cap on how many
+# configs it will collect, so a huge checkout can't turn the scan into a deep
+# tree crawl. (Those two are the only real bounds: the cap counts MATCHED
+# configs, not directories visited, so a wide-but-shallow tree is still walked
+# in full. Depth 4 is what keeps that bounded in practice.) Whenever a bound
+# leaves plausible config ground unvisited the walk reports itself `truncated`,
+# and the consumer withholds the finding (it cannot claim "no opt-out ANYWHERE"
+# from a partial walk).
+_VITEST_CONFIG_MAX_DEPTH = 4
+# Sized for large monorepos (one real repo carries 200+ vitest/vite configs); a
+# cap hit still reports truncation rather than a clean read.
+_VITEST_CONFIG_MAX_FILES = 400
+# Relative imports a config pulls in (a `mergeConfig` base) are followed up to
+# this many extra files; past it, the rest are unresolved and the read fails
+# closed.
+_VITEST_CONFIG_MAX_FOLLOW = 20
+# Never a workspace package: pruned silently.
+_VITEST_SKIP_DIRS = {"node_modules", "dist", "coverage", "__pycache__"}
+# Dot-directories that are tool state, build output, or a local untracked copy
+# of the repo (an agent worktree) — never the committed config, so pruned
+# silently. Every OTHER dot-directory is walked like any other: `.config/` is a
+# conventional home for `vitest.config.ts`, and pruning it silently asserted
+# "no config exists" about a repo that has one.
+_VITEST_SKIP_DOT_DIRS = {".git", ".github", ".next", ".turbo", ".nuxt",
+                         ".svelte-kit", ".venv", ".claude", ".yarn", ".cache",
+                         ".idea", ".vscode", ".pytest_cache", ".gradle"}
+# Pruned as build output, but a real workspace package CAN carry one of these
+# names — so pruning one that holds a package root marks the walk truncated.
+_VITEST_PRUNE_MAYBE_WORKSPACE = {"build", "out", "vendor", "target"}
+# vitest's isolation opt-out. Two command-line spellings are documented,
+# `--no-isolate` and `--isolate=false`; vitest's `--isolate` takes no value, so
+# `--isolate false` (a space) is NOT an opt-out and is not matched.
+_VITEST_NO_ISOLATE_FLAG_RE = re.compile(r"--no-isolate\b|--isolate=false\b")
+# Every mention of an `isolate` key or identifier — quoted (`"isolate"` in a 3.x
+# workspace JSON, `['isolate']` computed), bare, shorthand (`{ isolate }`) or a
+# member (`shared.isolate`). What follows it decides, and the two outcomes are
+# reported SEPARATELY because they are different facts: the literal `: true` is
+# isolation on; the literal `: false` is a RESOLVED opt-out (`isolation_opt_out`,
+# quotable as "the repo already opts out"); anything else — a shorthand, a
+# computed value, an expression, the word in a comment — is UNRESOLVED
+# (`isolate_unresolved`). Both withhold the lever, because the lever's whole
+# claim is "you are still paying for isolation" and an unresolvable mention is
+# not evidence of that. They must not be conflated: reporting an unresolvable
+# mention as an opt-out made the report state, as a fact about the repo, that it
+# "already opts out (at vitest.config.ts:12)" when line 12 read
+# `isolate: process.env.X`. Matched over the WHOLE file, so a value on the next
+# line (`isolate:\n  false`) is read, not missed.
+_VITEST_ISOLATE_TOKEN_RE = re.compile(r"""(?<![\w$-])(["']?)isolate\1(?![\w$-])""")
+_VITEST_ISOLATE_VALUE_RE = re.compile(r"""\]?\s*:\s*(true|false)\b""")
+# vitest 3.x's `singleThread` / `singleFork` also disabled per-file isolation
+# (vitest 4's migration guide maps them to `maxWorkers: 1, isolate: false`).
+_VITEST_SINGLE_WORKER_RE = re.compile(
+    r"""(?<![\w$-])["']?single(?:Thread|Fork)["']?\s*:\s*true\b""")
+# The vm pools cannot turn isolation off at all (`isolate` has no effect on
+# `vmThreads` / `vmForks`), so the opt-in-project recipe would do nothing there.
+_VITEST_VM_POOL_RE = re.compile(
+    r"""(?<![\w$-])["']?pool["']?\s*:\s*["']vm(?:Threads|Forks)["']"""
+    r"|--pool[= ]vm(?:Threads|Forks)\b")
+# Module specifiers a config pulls in: static/dynamic import, require, and a
+# project's string `extends`.
+_VITEST_IMPORT_SPEC_RE = re.compile(
+    r"""(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*|\bextends\s*:\s*)"""
+    r"""(["'])([^"'\n]+)\1""")
+# A BARE specifier (a package, not a file in this repo) is one this read cannot
+# follow. Whether that matters is decided by HOW THE CONFIG USES IT, never by
+# what it is called:
+#   * used as a CONFIG BASE — merged (`mergeConfig(base, …)`), spread
+#     (`...base`), read (`base.test`), named by `extends:`, or re-exported whole
+#     (`export default base`) — then the package may itself set `isolate: false`
+#     and the read must fail closed;
+#   * used as anything else — a plugin (`plugins: [nuxt()]`), an environment, a
+#     mock helper, a side-effect import (`import 'dotenv/config'`) — then it
+#     cannot carry the opt-out and is ignored.
+# A name-token test was tried first and was wrong in BOTH directions: it missed
+# `@acme/tooling` (a shared base whose name says nothing) and it withheld the
+# lever forever from every repo importing `@cloudflare/vitest-pool-workers`,
+# `vitest-environment-nuxt` or `@storybook/test-runner` — ordinary plugins that
+# happen to carry "vitest" or "test" in the name.
+_VITEST_RESOLVE_EXTS = (".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json")
+# `import <clause> from "<spec>"` and `const <lhs> = require("<spec>")` /
+# `= await import("<spec>")` — the two shapes that BIND a module to a name.
+_VITEST_IMPORT_CLAUSE_RE = re.compile(
+    r"""\bimport\s+(?P<clause>[^;\n]*?)\s+from\s*(["'])(?P<spec>[^"'\n]+)\2""")
+_VITEST_REQUIRE_CLAUSE_RE = re.compile(
+    r"""\b(?:const|let|var)\s+(?P<clause>[^=;\n]+?)\s*=\s*(?:await\s+)?"""
+    r"""(?:require|import)\s*\(\s*(["'])(?P<spec>[^"'\n]+)\2\s*\)""")
+# A project's string `extends` names a config base outright — no binding needed.
+_VITEST_EXTENDS_SPEC_RE = re.compile(
+    r"""["']?extends["']?\s*:\s*(["'])([^"'\n]+)\1""")
+
+
+def _import_bindings(clause: str) -> list[str]:
+    """The local names an import/require clause binds (`X`, `* as ns`,
+    `{ a as b }`), so the reader can ask what the config DOES with them."""
+    names: list[str] = []
+    clause = clause.strip()
+    if clause.startswith("type "):
+        clause = clause[len("type "):]
+    star = re.search(r"\*\s*as\s+([\w$]+)", clause)
+    if star:
+        names.append(star.group(1))
+    brace = re.search(r"\{([^}]*)\}", clause)
+    if brace:
+        for part in brace.group(1).split(","):
+            name = re.split(r"\s+as\s+", part.strip())[-1].strip()
+            if re.fullmatch(r"[\w$]+", name):
+                names.append(name)
+        clause = clause[:brace.start()]
+    head = clause.split(",")[0].strip()
+    if re.fullmatch(r"[\w$]+", head):
+        names.append(head)
+    return names
+
+
+def _binding_is_config_base(text: str, name: str) -> bool:
+    """Does the config use this local binding AS A CONFIG BASE? (Merged, spread,
+    `.test`-read, `extends:`-ed, or exported as the whole config.)"""
+    n = re.escape(name)
+    # A config base is passed as a VALUE. `(?!\s*\()` everywhere is what keeps
+    # `export default defineConfig({…})` — the binding every config imports from
+    # `vitest/config` — from reading as "the config is this package".
+    for rx in (rf"\.\.\.\s*{n}(?![\w$])(?!\s*\()",
+               rf"(?<![\w$.]){n}\s*\.\s*test\b",
+               rf"""["']?extends["']?\s*:\s*{n}(?![\w$])(?!\s*\()""",
+               rf"\bexport\s+default\s+{n}(?![\w$])(?!\s*\()",
+               rf"\bmodule\.exports\s*=\s*{n}(?![\w$])(?!\s*\()"):
+        if re.search(rx, text):
+            return True
+    # `mergeConfig(base, defineConfig({…}))` — and the base can be either
+    # argument, so look across the call, not just up to the first `)`.
+    for m in re.finditer(r"\bmergeConfig\s*\(", text):
+        if re.search(rf"(?<![\w$.]){n}(?![\w$])(?!\s*\()",
+                     text[m.end():m.end() + 400]):
+            return True
+    return False
+
+
+def _unfollowable_config_bases(text: str) -> list[str]:
+    """Bare specifiers this config pulls its SETTINGS from — the ones whose
+    `isolate: false`, if any, is invisible to this read. A bare specifier the
+    config merely uses (a plugin, an environment, a side-effect import) is not
+    one of these and is ignored."""
+    out: list[str] = []
+
+    def _bare(spec: str) -> bool:
+        return not (spec.startswith("./") or spec.startswith("../"))
+
+    for rx in (_VITEST_IMPORT_CLAUSE_RE, _VITEST_REQUIRE_CLAUSE_RE):
+        for m in rx.finditer(text):
+            spec = m.group("spec").strip()
+            if not _bare(spec):
+                continue
+            if any(_binding_is_config_base(text, b)
+                   for b in _import_bindings(m.group("clause"))):
+                out.append(spec)
+    for m in _VITEST_EXTENDS_SPEC_RE.finditer(text):
+        spec = m.group(2).strip()
+        if _bare(spec):
+            out.append(spec)            # `extends` IS the base, by definition
+    return out
+
+
+def _vitest_config_files(root: Path) -> "tuple[list[Path], bool, list[Path]]":
+    """Config candidates at the repo root plus a bounded walk beneath it, as
+    ``(configs, truncated, manifests)`` — ``manifests`` being the `package.json`
+    files in the directories the walk visited (their scripts can carry the CLI
+    opt-out).
+
+    ``truncated`` is True when the walk stopped with ground that could PLAUSIBLY
+    HOLD A CONFIG still unvisited. That matters because the consumer's claim is
+    "no `isolate: false` ANYWHERE", which a partial walk cannot establish: the
+    opt-out may sit in a config the walk never reached. "Walk exhausted" and "no
+    config exists" therefore reach the SAME withheld outcome, for different
+    reasons, so both are reported.
+
+    The "plausibly" is load-bearing, and is why an unvisited directory is only
+    counted when it is a package root (a `package.json` in it) or holds one
+    ONE grouping level beneath it (`libs/x/package.json`). A vitest config sits
+    at a JS package root; ordinary source trees go far deeper than the depth
+    bound and hold no config at all. Counting every deep directory would mark
+    essentially every real repo truncated and silently retire the pattern —
+    trading a rare false finding for a permanent false silence, which is the
+    worse failure of the two. An entry the OS will not even stat is counted:
+    unreadable ground is unvisited ground.
+    """
+    found: list[Path] = []
+    manifests: list[Path] = []
+    truncated = False
+    root = root.resolve()
+    stack: list[tuple[Path, int]] = [(root, 0)]
+
+    def _may_hold_config(d: Path) -> bool:
+        try:
+            if (d / "package.json").exists():
+                return True
+            for i, child in enumerate(d.iterdir()):
+                if i >= 200:
+                    return True     # too wide to rule out — fail closed
+                if child.is_dir() and (child / "package.json").exists():
+                    return True
+            return False
+        except OSError:
+            return True     # cannot tell ⇒ assume it might, and fail closed
+
+    while stack and len(found) < _VITEST_CONFIG_MAX_FILES:
+        base, depth = stack.pop(0)
+        try:
+            entries = sorted(base.iterdir())
+        except OSError:
+            # An unreadable DIRECTORY is unvisited ground, not a clean miss.
+            truncated = True
+            continue
+        for entry in entries:
+            try:
+                is_link = entry.is_symlink()
+                is_dir = entry.is_dir()
+            except OSError:
+                # Listable but not stat-able (e.g. a `r--` directory): unvisited
+                # ground, never a crash of the whole scan.
+                truncated = True
+                continue
+            if is_dir:
+                if entry.name in _VITEST_SKIP_DIRS or (
+                        entry.name.startswith(".")
+                        and entry.name in _VITEST_SKIP_DOT_DIRS):
+                    continue            # never a workspace — deliberately not a gap
+                if is_link:
+                    # Bazel's `bazel-*` convenience links mirror the workspace
+                    # (root package.json included); following them is a loop, and
+                    # counting them would mark every Bazel repo truncated.
+                    if entry.name.startswith("bazel-"):
+                        continue
+                    # Pruned for loop safety; a symlinked workspace package
+                    # could still hold the opt-out.
+                    truncated = truncated or _may_hold_config(entry)
+                elif entry.name in _VITEST_PRUNE_MAYBE_WORKSPACE:
+                    truncated = truncated or _may_hold_config(entry)
+                elif depth < _VITEST_CONFIG_MAX_DEPTH:
+                    stack.append((entry, depth + 1))
+                else:
+                    truncated = truncated or _may_hold_config(entry)
+            elif entry.name == "package.json":
+                manifests.append(entry)
+            elif _is_vitest_config_name(entry.name):
+                found.append(entry)
+                if len(found) >= _VITEST_CONFIG_MAX_FILES:
+                    # A cap hit says there is more of exactly the thing we are
+                    # looking for — always unvisited ground that matters.
+                    truncated = True
+                    break
+    # Anything still queued when the cap broke the loop is unvisited too.
+    return found, (truncated or bool(stack)), manifests
+
+
+def _vitest_line_at(text: str, pos: int) -> "tuple[int, str]":
+    start = text.rfind("\n", 0, pos) + 1
+    end = text.find("\n", pos)
+    return text.count("\n", 0, pos) + 1, text[start:end if end >= 0 else None].strip()
+
+
+def _resolve_local_import(frm: Path, spec: str, root: Path) -> "Path | None":
+    """A relative specifier resolved the way a TS/JS toolchain would, or None."""
+    base = (frm.parent / spec)
+    cands = [base] + [Path(str(base) + e) for e in _VITEST_RESOLVE_EXTS]
+    # TS ESM writes `./x.js` for a `./x.ts` source.
+    for js, ts in ((".js", ".ts"), (".mjs", ".mts"), (".cjs", ".cts")):
+        if spec.endswith(js):
+            cands.append(Path(str(base)[: -len(js)] + ts))
+    cands += [base / f"index{e}" for e in _VITEST_RESOLVE_EXTS]
+    for c in cands:
+        try:
+            if c.is_file():
+                r = c.resolve()
+                r.relative_to(root)         # outside the repo ⇒ ValueError
+                return r
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _read_config_text(path: Path) -> "str | None":
+    """A config's text, or None when the bytes on disk are not UTF-8 text this
+    read can search. Decoding a UTF-16 config with `errors="replace"` produced
+    garbage that matched no pattern and was then reported as a COMPLETE read
+    with no opt-out — a repo that had opted out being told to opt out again.
+    None routes the file to `unreadable`, which withholds the lever."""
+    data = path.read_bytes()                        # OSError → caller's handler
+    for bom in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff", b"\xff\xfe", b"\xfe\xff"):
+        if data.startswith(bom):
+            return None                             # UTF-16 / UTF-32
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _iso_block(**overrides: Any) -> dict[str, Any]:
+    """The ONE definition of the `test_runner_isolation` block's shape, so the
+    crash fallback and the completed read cannot drift apart (a key present on
+    only one of them is a consumer default that fails OPEN). Defaults are the
+    fail-closed ones: nothing read, nothing proven, verdict unknown."""
+    block: dict[str, Any] = {
+        "runner": None,
+        "configs": [],
+        "unreadable": [],
+        "unresolved_imports": [],
+        "isolate_unresolved": [],
+        "readable": False,
+        "truncated": True,
+        "isolation_opt_out": False,
+        # The opt-out is a REPO-WIDE fact here: the lever is withheld for the
+        # whole repo when any config or package script opts out, not per project.
+        "opt_out_scope": "repo",
+        "opt_out_evidence": [],
+        "opt_out_evidence_count": 0,
+        "opt_out_configs": [],
+        "vm_pool": False,
+        "error": None,
+        "verdict": "unknown",
+    }
+    block.update(overrides)
+    return block
+
+
+def _isolation_verdict(block: dict[str, Any]) -> str:
+    """The block's ONE collapsed reading, computed here at the producer so no
+    consumer has to re-derive it from six booleans in the right order:
+
+      `opted_out`      resolved evidence that isolation is already off;
+      `unknown`        the read could not establish either way (fail closed);
+      `not_applicable` a vm pool, where `isolate` has no effect;
+      `isolation_on`   every config was read, completely, and none opts out.
+    """
+    if block.get("isolation_opt_out"):
+        return "opted_out"
+    if (block.get("error") or block.get("truncated") or block.get("unreadable")
+            or block.get("unresolved_imports") or block.get("isolate_unresolved")
+            or not block.get("configs")):
+        return "unknown"
+    if block.get("vm_pool"):
+        return "not_applicable"
+    return "isolation_on"
+
+
+def _read_test_runner_isolation(root: Path) -> dict[str, Any]:
+    """Read the repo's vitest config(s) and report whether per-file isolation is
+    still on. Never raises: whatever the read hits, the rest of the scan must
+    run, so an unexpected failure yields a block the consumer withholds on."""
+    try:
+        return _read_test_runner_isolation_unguarded(root)
+    except Exception as e:  # noqa: BLE001 — fail closed, never take the scan down
+        # NEVER silently: a crashed reader and a genuinely huge monorepo both
+        # withhold the lever, and without this line they are indistinguishable —
+        # a broken reader would retire the pattern with nobody the wiser.
+        print(f"ci-speedup: the vitest config reader failed "
+              f"({type(e).__name__}: {e}); the per-file-isolation lever (OPT78) "
+              "will be WITHHELD for this repo — this is a scanner failure, not a "
+              "fact about the repo.", file=sys.stderr)
+        return _iso_block(error=type(e).__name__)
+
+
+def _read_test_runner_isolation_unguarded(root: Path) -> dict[str, Any]:
+    """FAILS CLOSED in every direction that matters: no config file found, or a
+    candidate unreadable, or an import the read cannot follow, or a walk that
+    could not cover the repo, is reported as such (and the consumer withholds
+    the finding); an `isolate` mention this static read cannot resolve is
+    reported in `isolate_unresolved` — which also withholds — never as isolation
+    being on, and never as a resolved opt-out it is not."""
+    root = root.resolve()
+    configs: list[str] = []
+    unreadable: list[str] = []
+    unresolved: list[str] = []
+    unresolved_isolate: list[str] = []
+    evidence: list[str] = []
+    opt_out_configs: list[str] = []
+    vitest_signal = False
+    vm_pool = False
+    paths, truncated, manifests = _vitest_config_files(root)
+
+    def _rel(path: Path) -> str:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:                                  # pragma: no cover
+            return path.name
+
+    queue = list(paths)
+    seen = {p.resolve() for p in queue}
+    followed = 0
+    while queue:
+        path = queue.pop(0)
+        name = _rel(path)
+        try:
+            text = _read_config_text(path)
+        except OSError:
+            text = None
+        if text is None:
+            unreadable.append(name)
+            continue
+        configs.append(name)
+        if "vitest" in text.lower() or Path(name).name.lower().startswith("vitest"):
+            vitest_signal = True
+        hits: dict[int, str] = {}
+        unresolved_hits: dict[int, str] = {}
+        for m in _VITEST_ISOLATE_TOKEN_RE.finditer(text):
+            v = _VITEST_ISOLATE_VALUE_RE.match(text, m.end())
+            ln, src = _vitest_line_at(text, m.start())
+            if v and v.group(1) == "true":
+                continue                    # the one reading that is isolation ON
+            if v and v.group(1) == "false":
+                hits.setdefault(ln, src)    # RESOLVED: the repo opts out
+            else:
+                unresolved_hits.setdefault(ln, src)   # cannot be read either way
+        for rx in (_VITEST_NO_ISOLATE_FLAG_RE, _VITEST_SINGLE_WORKER_RE):
+            for m in rx.finditer(text):
+                ln, src = _vitest_line_at(text, m.start())
+                hits.setdefault(ln, src)
+                unresolved_hits.pop(ln, None)
+        if hits:
+            opt_out_configs.append(name)
+        evidence += [f"{name}:{ln}: {src[:160]}" for ln, src in sorted(hits.items())]
+        unresolved_isolate += [f"{name}:{ln}: {src[:160]}"
+                               for ln, src in sorted(unresolved_hits.items())]
+        vm_pool = vm_pool or bool(_VITEST_VM_POOL_RE.search(text))
+        for m in _VITEST_IMPORT_SPEC_RE.finditer(text):
+            spec = m.group(2).strip()
+            if spec.startswith("./") or spec.startswith("../"):
+                target = _resolve_local_import(path, spec, root)
+                if target is None:
+                    unresolved.append(f"{name}: {spec}")
+                elif target not in seen:
+                    seen.add(target)
+                    followed += 1
+                    if followed > _VITEST_CONFIG_MAX_FOLLOW:
+                        unresolved.append(f"{name}: {spec} (follow cap)")
+                    else:
+                        queue.append(target)
+        # …and the bare specifiers this config takes its SETTINGS from.
+        unresolved += [f"{name}: {spec}" for spec in _unfollowable_config_bases(text)]
+    # The CLI opt-out most often lives in a package script, not in the config or
+    # the workflow line the job log echoes.
+    for path in manifests:
+        name = _rel(path)
+        try:
+            text = _read_config_text(path)
+        except OSError:
+            text = None
+        if text is None:
+            unreadable.append(name)
+            continue
+        for m in _VITEST_NO_ISOLATE_FLAG_RE.finditer(text):
+            ln, src = _vitest_line_at(text, m.start())
+            evidence.append(f"{name}:{ln}: {src[:160]}")
+            if name not in opt_out_configs:
+                opt_out_configs.append(name)
+        if re.search(r"(?<![\w-])vitest(?![\w-])", text):
+            vitest_signal = True
+        vm_pool = vm_pool or bool(_VITEST_VM_POOL_RE.search(text))
+    block = _iso_block(
+        # Only an actual vitest signal (a `vitest*` config name, the word in a
+        # config, or a `vitest` invocation in a package script) says vitest.
+        # A pure Vite app has `vite.config.ts` and no vitest at all.
+        runner=("vitest" if vitest_signal else ("vite" if configs else None)),
+        configs=sorted(configs),
+        unreadable=sorted(unreadable),
+        # A config pulls settings from a module this read could not follow (a
+        # missing file, a shared config package): its opt-out, if any, is
+        # invisible here. The consumer must fail closed on this.
+        unresolved_imports=sorted(set(unresolved)),
+        # An `isolate` mention whose value this static read cannot resolve. NOT
+        # an opt-out (saying so asserted a line as evidence of something it does
+        # not say) — but not evidence isolation is on either, so it withholds.
+        isolate_unresolved=sorted(set(unresolved_isolate)),
+        readable=bool(configs),
+        # The walk left ground unvisited, so "no opt-out was found" is NOT the
+        # same as "no opt-out exists". The consumer must fail closed on this.
+        truncated=truncated,
+        isolation_opt_out=bool(evidence),
+        opt_out_evidence=evidence[:4],
+        opt_out_evidence_count=len(evidence),
+        opt_out_configs=sorted(set(opt_out_configs)),
+        # A vm pool cannot disable isolation, so the lever cannot apply.
+        vm_pool=vm_pool,
+    )
+    block["verdict"] = _isolation_verdict(block)
+    return block
+
+
 def _detect_turbo(root: Path, ci_turbo_tasks: set[str] | None = None):
     """OPT52/53/58/59/60 against turbo.json (catalog Stack-Specific heuristics).
     Each pattern emits at most one consolidated finding listing the affected
@@ -2443,6 +3463,79 @@ def _build_workflow_call_graph(
     return graph
 
 
+# GitHub Actions reads booleans the YAML 1.2 way: `true` / `false` and their capitalised
+# spellings, and nothing else. PyYAML reads YAML 1.1, where `yes`, `on`, `y`, `no`, `off`
+# and `n` are ALSO booleans. The two disagree on real workflow files: `continue-on-error:
+# yes` reaches this scan as Python `True` while GitHub reads the plain string "yes" and the
+# job keeps failing its run exactly as before. Reading the parsed value alone would let the
+# report print "declared advisory" over the slowest check in the repository on the strength
+# of a spelling GitHub does not honour.
+#
+# So the ONE keyword the report speaks about is re-read through this loader, which drops
+# PyYAML's YAML-1.1 boolean words and resolves only the spellings GitHub accepts. It is
+# deliberately NOT the loader the rest of the scan uses: every other detector keeps today's
+# parse, so the blast radius of this correction stays on the fact that needs it.
+class _GitHubBoolLoader(yaml.SafeLoader):
+    """A `SafeLoader` whose booleans are GitHub's, not YAML 1.1's."""
+
+
+_GitHubBoolLoader.yaml_implicit_resolvers = {
+    ch: [(tag, rx) for tag, rx in resolvers if tag != "tag:yaml.org,2002:bool"]
+    for ch, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_GitHubBoolLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"))
+
+
+def _github_bool_jobs(raw: str) -> dict[str, Any]:
+    """The workflow's `jobs:` mapping re-read with GitHub's boolean spellings.
+
+    `{}` when the text cannot be re-read that way. The caller treats a job missing from this
+    mapping as NOT advisory: silence is the safe direction for a disclosure, and a sentence
+    resting on a boolean this scan could not confirm is worse than no sentence."""
+    try:
+        # Not an unsafe load: _GitHubBoolLoader subclasses SafeLoader and changes only the
+        # implicit boolean resolvers, so the SafeConstructor still rejects arbitrary object
+        # tags. Scanners that match on the loader's NAME rather than its bases need telling.
+        doc = yaml.load(raw, Loader=_GitHubBoolLoader)  # nosec B506
+    except yaml.YAMLError:
+        return {}
+    return _jobs_from_doc(doc) if isinstance(doc, dict) else {}
+
+
+def _strict_job(strict: Any) -> dict:
+    """The strictly re-read job node, or a node with no `continue-on-error` at all - never
+    the loosely parsed one, whose boolean is the very thing that cannot be trusted."""
+    return strict if isinstance(strict, dict) else {}
+
+
+def _job_continue_on_error_is_literally_true(job: dict) -> bool:
+    """Whether a job declares `continue-on-error: true` as a LITERAL, at job level.
+
+    Takes a job node parsed by `_GitHubBoolLoader`, so `yes` / `on` / `y` arrive as the
+    strings they are to GitHub rather than as booleans. The value-level semantics are the
+    ones the security engine's `_continue_on_error_is_literally_true` already applies: a
+    literal true, or the quoted string that means the same thing.
+
+    Job-level `continue-on-error: true` prevents the workflow RUN from failing when the job
+    fails (GitHub's documented wording for `jobs.<job_id>.continue-on-error`: "Prevents a
+    workflow run from failing when a job fails"). It says nothing about the job's own
+    check-run conclusion, so a consumer may report the run-level fact and no more.
+
+    Only a literal counts. `continue-on-error: ${{ matrix.experimental }}` is true on some
+    matrix legs and false on others, and the YAML cannot say which, so an expression is not
+    judged. GitHub also accepts the quoted string, which parses as a str and means the same
+    thing, so that counts. A STEP-level declaration is deliberately NOT read here: it is
+    job-scoped (it stops a step from failing its JOB) and proves nothing about what the job's
+    own failure does to the run.
+    """
+    value = job.get("continue-on-error")
+    return value is True or (isinstance(value, str)
+                             and value.strip().lower() == "true")
+
+
 def _build_workflow_job_graph(
     parsed: list[tuple[str, dict, str]],
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -2458,6 +3551,9 @@ def _build_workflow_job_graph(
     - `reusable` marks a job that invokes a reusable workflow (`uses:` at job level): its
       leaf check-runs surface as `<job name> / <child job>`, so the consumer groups those
       children under this caller.
+    - `continue_on_error` marks a job that declares a LITERAL `continue-on-error: true`
+      (see `_job_continue_on_error_is_literally_true`), so a consumer that crowns the job as
+      a long pole can state what its failure does to the workflow run without re-reading YAML.
     - `matrix` marks a job with a `strategy.matrix`: GitHub appends the leg to its check-run
       name (`<name> (<leg…>)`) even when the `name:` carries NO `${{ matrix.* }}` placeholder
       to expand, so the consumer must tolerate that appended parenthetical for these jobs.
@@ -2467,6 +3563,13 @@ def _build_workflow_job_graph(
     graph: dict[str, dict[str, dict[str, Any]]] = {}
     for rel, doc, _raw in parsed:
         jobs: dict[str, dict[str, Any]] = {}
+        # Only pay for the strict re-read when the loose parse turned some job's
+        # `continue-on-error` into a boolean at all - the two parsers cannot disagree
+        # otherwise, and most workflow files never mention the keyword.
+        strict_jobs: dict[str, Any] = {}
+        if any(isinstance(j, dict) and isinstance(j.get("continue-on-error"), bool)
+               for j in _jobs_from_doc(doc).values()):
+            strict_jobs = _github_bool_jobs(_raw)
         for jid, job in _jobs_from_doc(doc).items():
             if not isinstance(job, dict):
                 continue
@@ -2483,6 +3586,8 @@ def _build_workflow_job_graph(
                 "reusable": isinstance(job.get("uses"), str),
                 "matrix": isinstance(strategy, dict) and bool(strategy.get("matrix")),
                 "timeout_minutes": "timeout-minutes" in job,
+                "continue_on_error": _job_continue_on_error_is_literally_true(
+                    _strict_job(strict_jobs.get(str(jid)))),
             }
         if jobs:
             graph[rel] = jobs
@@ -2624,6 +3729,9 @@ def scan(root: Path, catalog_path: Path) -> dict[str, Any]:
     # than being silently treated as covered. OPT74 (trust-boundary cache split)
     # is catalogued for human application but has no auto-detector: it needs
     # fork-PR cache trust-boundary signals we don't sample from run history.
+    # OPT78 (vitest per-file isolation) is not routed here either: it is emitted
+    # by a drill-time log leaf in blocking_path.py, gated on this scan's
+    # `test_runner_isolation` block.
     structural_detected = {"OPT70", "OPT71", "OPT72", "OPT73", "OPT75"}
     structural_without_detector = sorted(
         c.pattern for c in catalog
@@ -2659,6 +3767,14 @@ def scan(root: Path, catalog_path: Path) -> dict[str, Any]:
     # `git checkout origin/main` hidden inside `uses: ./.github/actions/foo`.
     global _GIT_HISTORY_LOCAL_ACTIONS
     _GIT_HISTORY_LOCAL_ACTIONS = _index_local_git_actions(root, parsed)
+
+    # Index the repo's DECLARED checkout payload (submodule paths, LFS-tracked
+    # path patterns) and the text of every local composite action, so OPT76 can
+    # tell a job that pulls a payload it never reads from one that needs it.
+    global _SUBMODULE_PATHS, _LFS_PATH_HINTS, _LOCAL_ACTION_TEXT
+    _SUBMODULE_PATHS = _parse_gitmodules(_read_repo_file(root, ".gitmodules"))
+    _LFS_PATH_HINTS = _parse_lfs_attributes(_read_repo_file(root, ".gitattributes"))
+    _LOCAL_ACTION_TEXT = _index_local_action_text(root, parsed)
 
     # Coverage is a property of the catalog + the registered detectors, NOT of
     # whatever workflows happened to parse. Compute it directly so a repo with
@@ -2762,11 +3878,16 @@ def scan(root: Path, catalog_path: Path) -> dict[str, Any]:
         # collect_runs to scope the critical-path pole to merge-blocking (required-
         # reachable) work. Repo-agnostic; harmless if unconsumed.
         "workflow_job_graph": _build_workflow_job_graph(parsed),
+        # What the repo's vitest config says about per-file isolation. NOT a
+        # finding — the corroborating config fact the drill-time OPT78 leaf
+        # (`blocking_path`'s `vitest-isolate-pool`) must read before it can
+        # claim the repo is still paying for per-file isolation.
+        "test_runner_isolation": _read_test_runner_isolation(root),
         "catalog_patterns_total": len(catalog),
         "catalog_patterns_with_detector": len(static_entries) - len(unmatched_patterns),
         "catalog_patterns_without_detector": sorted(unmatched_patterns),
         # Structural catalog entries with no critical-path router (currently
-        # OPT74). Reported so a catalogued-but-undetected structural pattern is
+        # OPT74, and OPT78, which a drill-time log leaf routes instead). Reported so a catalogued-but-undetected structural pattern is
         # honest about its coverage instead of silently never appearing.
         "catalog_structural_patterns_without_detector": structural_without_detector,
     }
