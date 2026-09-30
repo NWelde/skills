@@ -67,7 +67,7 @@ _FIX_TABLE: dict[str, dict[str, str]] = {
                    "  group: ${{ github.workflow }}-${{ github.ref }}"),
     },
     "ci.cache.dependency-cache": {
-        "tldr": "Every run re-downloads all your dependencies from scratch - caching reuses the last install instead of fetching them again.",
+        "tldr": "Every run re-downloads all your dependencies from scratch - caching reuses the last install instead of fetching them again. A cache that measurably costs more than it saves should be removed, and this check reads configuration only, so it cannot see that measurement; a repo that removed such a cache still loses this point.",
         "impact": "high", "risk": "low",
         "impact_note": "dependency installs re-download on every run without it",
         "risk_note": "low: a stale cache is keyed by lockfile hash and self-heals",
@@ -434,7 +434,7 @@ def render_report(doc: dict[str, Any], registry: dict[str, Any]) -> str:
         lines += ["## Recommendations", "",
                   "Every applicable check passes — nothing to recommend. "
                   "(Re-run after CI changes; the practices above are the "
-                  "full v0.1.3 rubric.)", ""]
+                  "full v0.1.4 rubric.)", ""]
         lines += _render_appendix(registry)
         return "\n".join(lines) + "\n"
 

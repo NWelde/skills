@@ -462,7 +462,11 @@ def test_every_live_call_asks_for_headers_so_no_second_probe_is_ever_fired(monke
     _patch_run(monkeypatch, _run)
     client = GhClient()
     assert client.json("repos/o/r") == {"a": 1}
-    assert cmds == [["gh", "api", "-i", "repos/o/r"]]
+    assert cmds == [["gh", "api", "-i", "--allow-escape-sequences",
+                     "repos/o/r"]], (
+        "one call, carrying both `-i` (the server's own retry guidance, so a "
+        "blocked worker never re-probes) and the escape-sequence flag (without "
+        "which gh refuses to print a coloured job log at all)")
     assert client.queries == 1
 
 
@@ -1300,3 +1304,427 @@ def test_a_403_with_an_exhausted_bucket_is_a_rate_limit_even_without_the_keyword
     assert client.errors == 1, (
         "a rate-limited job log must count as a coverage gap, not vanish because the "
         "endpoint tolerates 404s")
+
+
+# =============================================================================
+# A COLOURED RESPONSE BODY  (gh's escape-sequence refusal)
+# =============================================================================
+
+_COLOURED = "2026-09-15T00:00:00Z \x1b[31mFAIL\x1b[0m tests/test_api.py::test_login\n"
+_OK_HEADERS = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+_REFUSAL = ("the response contains terminal escape sequences; pass "
+            "--allow-escape-sequences to output it anyway\n")
+
+
+class _FakeGh:
+    """The `gh` binary's behaviour around coloured bodies, in both vintages."""
+
+    def __init__(self, *, supports_flag: bool = True) -> None:
+        self.supports_flag = supports_flag
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        has_flag = "--allow-escape-sequences" in argv
+        if has_flag and not self.supports_flag:
+            return _completed(returncode=1,
+                              stderr="unknown flag: --allow-escape-sequences\n")
+        if has_flag or not self.supports_flag:
+            return _completed(returncode=0, stdout=_OK_HEADERS + _COLOURED)
+        # Modern gh, asked without the flag, refuses to print the body.
+        return _completed(returncode=1, stdout=_OK_HEADERS, stderr=_REFUSAL)
+
+
+def test_a_coloured_job_log_is_read_not_silently_dropped(monkeypatch):
+    """`gh api` exits 1 on a body containing escape sequences unless told
+    otherwise — while the HTTP status is 200. CI logs are coloured, so without
+    the flag essentially every log fetch fails, and it fails invisibly: logs are
+    fetched `allow_missing=True`, so the failure is not even counted. Measured
+    2026-09-15 on a live repo: 13 of 13 reds reported as unreadable, all 13 logs
+    served 200 at ~450KB.
+    """
+    fake = _FakeGh()
+    monkeypatch.setattr(collect_runs.subprocess, "run", fake)
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+
+    body = GhClient().text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+
+    assert body is not None and "test_login" in body
+    assert any("--allow-escape-sequences" in argv for argv in fake.calls)
+
+
+def test_the_escape_sequences_are_stripped_from_what_callers_see(monkeypatch):
+    """gh withholds that output to protect the terminal; asking for it anyway
+    moves the sanitising duty here. A job log is attacker-influenced content and
+    is quoted into a rendered report."""
+    monkeypatch.setattr(collect_runs.subprocess, "run", _FakeGh())
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+
+    body = GhClient().text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+
+    assert "\x1b" not in body
+    assert "FAIL" in body
+
+
+def test_a_gh_too_old_for_the_flag_still_returns_its_log(monkeypatch):
+    fake = _FakeGh(supports_flag=False)
+    monkeypatch.setattr(collect_runs.subprocess, "run", fake)
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+    client = GhClient()
+
+    body = client.text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+    assert body is not None and "test_login" in body
+
+    # And the rejection is remembered, so the next log costs one call.
+    before = len(fake.calls)
+    client.text("repos/o/r/actions/jobs/2/logs", allow_missing=True)
+    assert len(fake.calls) - before == 1
+
+
+def test_a_coloured_log_is_returned_stripped_whatever_the_client_calls_its_memo(monkeypatch):
+    """The BEHAVIOURAL contract, stated without reference to any implementation
+    symbol: a modern gh that refuses a coloured body unless asked must still yield
+    the log, and the log must arrive without its colour codes. A client that never
+    asks gets the refusal, returns None, and this fails on the assertion — not on
+    a missing attribute."""
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True, raising=False)
+    calls: list[list[str]] = []
+
+    def _modern_gh(argv, **kwargs):
+        calls.append(list(argv))
+        if "--allow-escape-sequences" in argv:
+            return _completed(returncode=0, stdout=_OK_HEADERS + _COLOURED)
+        return _completed(returncode=1, stdout=_OK_HEADERS, stderr=_REFUSAL)
+    monkeypatch.setattr(collect_runs.subprocess, "run", _modern_gh)
+
+    body = GhClient().text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+
+    assert body == "2026-09-15T00:00:00Z FAIL tests/test_api.py::test_login\n", (
+        f"expected the stripped log back, got {body!r} after {calls}")
+
+
+class _SpyGovernor:
+    """Stand-in for the token-wide REST governor: records every admission."""
+
+    def __init__(self) -> None:
+        self.routes: list[str] = []
+
+    def acquire(self, route: str = "") -> None:
+        self.routes.append(route)
+
+
+def test_the_fallback_reissue_is_paced_and_counted_like_any_other_live_call(monkeypatch):
+    """When an old gh rejects the flag, the plain re-issue is a SECOND real HTTP
+    call. It must take its own token from the token-wide governor and be counted
+    in `queries` — under the prefetch pool every in-flight worker pays its own
+    rejection at once, so an unmetered re-issue is a burst of up to pool-width
+    calls that neither the pacing nor the accounting ever saw."""
+    fake = _FakeGh(supports_flag=False)
+    monkeypatch.setattr(collect_runs.subprocess, "run", fake)
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+    client = GhClient()
+    spy = _SpyGovernor()
+    client._governor = spy
+
+    body = client.text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+
+    assert body is not None and "test_login" in body
+    assert len(fake.calls) == 2, "one rejected call with the flag, one plain re-issue"
+    assert len(spy.routes) == 2, (
+        f"the re-issue must acquire the governor too; acquired {len(spy.routes)}x")
+    assert client.queries == 2, (
+        f"the re-issue is a real call and must be counted; queries == {client.queries}")
+
+
+@pytest.mark.parametrize("stderr", [
+    "gh: Bad Gateway (HTTP 502)\n",
+    "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n",
+    # The refusal itself NAMES the flag — that is the modern gh telling us to pass
+    # it, not an old gh rejecting it.
+    _REFUSAL,
+])
+def test_a_failure_that_is_not_a_flag_rejection_does_not_poison_the_memo(
+        monkeypatch, no_sleep, stderr):
+    """`_flag_was_rejected` must key on gh's "unknown flag" wording, not on the
+    flag's name appearing in stderr. A 5xx, a network error, or the refusal
+    message itself must leave the memo True — otherwise one transient failure
+    would silently downgrade every later log fetch to the plain call that gh
+    refuses on coloured bodies."""
+    assert collect_runs._flag_was_rejected(stderr) is False
+
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+    calls: list[list[str]] = []
+    seq = [
+        _completed(returncode=1, stdout="HTTP/1.1 502 Bad Gateway\r\n\r\n", stderr=stderr),
+        _completed(returncode=0, stdout=_OK_HEADERS + _COLOURED),
+    ]
+
+    def _flaky_gh(argv, **kwargs):
+        calls.append(list(argv))
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+    monkeypatch.setattr(collect_runs.subprocess, "run", _flaky_gh)
+
+    body = GhClient().text("repos/o/r/actions/jobs/1/logs", allow_missing=True)
+
+    assert body is not None and "test_login" in body
+    assert collect_runs._ESCAPE_FLAG_SUPPORTED is True, "the memo must not flip on a non-flag failure"
+    assert all("--allow-escape-sequences" in argv for argv in calls), (
+        f"every attempt must keep asking for the coloured body: {calls}")
+
+
+def test_strip_keeps_the_whitespace_a_log_is_made_of_and_drops_the_rest():
+    strip = collect_runs._strip_terminal_escapes
+    # Tab, newline and carriage return are ordinary log text (CRLF logs, progress
+    # bars redrawn with \r, tab-indented stack traces) and must survive.
+    assert strip("a\tb\r\nc\rd\n") == "a\tb\r\nc\rd\n"
+    # CSI (colour, cursor, private modes), OSC (hyperlinks / titles, both
+    # terminators) and the two-character escapes are removed whole.
+    assert strip("\x1b[1;31mFAIL\x1b[0m") == "FAIL"
+    assert strip("\x1b[2K\x1b[1A\x1b[?25lstep\x1b[?25h") == "step"
+    assert strip("\x1b]8;;https://x.test\x07link\x1b]8;;\x07") == "link"
+    assert strip("\x1b]0;title\x1b\\body") == "body"
+    assert strip("\x1b(Bplain\x1b=\x1b>") == "plain"
+    # Stray C0 controls (a BEL, a NUL) go; the log text between them stays.
+    assert strip("ding\x07\x00dong") == "dingdong"
+    # Mixed: a real coloured pytest line keeps its \n and its text.
+    assert strip(_COLOURED) == "2026-09-15T00:00:00Z FAIL tests/test_api.py::test_login\n"
+
+
+def test_strip_removes_csi_sequences_with_private_parameter_bytes():
+    """ECMA-48 lets a CSI parameter string open with any of `<=>?`, not just `?`
+    — xterm's SGR-mouse reports (`ESC[<…M`), `ESC[=…h` screen modes and `ESC[>c`
+    device attributes all appear in captured terminal output. Leaving them in
+    would hand a rendered report a bare ESC followed by junk."""
+    strip = collect_runs._strip_terminal_escapes
+    assert strip("\x1b[<35;10;5Mclick") == "click"
+    assert strip("\x1b[=3hmode") == "mode"
+    assert strip("\x1b[>cattrs") == "attrs"
+    assert strip("\x1b[?1049hscreen\x1b[?1049l") == "screen"
+
+
+def test_four_workers_rejected_at_once_flip_the_memo_once_and_reissue_once_each(monkeypatch):
+    """The memo flip under the prefetch pool: every in-flight worker sees its own
+    rejection in the same instant. Each must re-issue its own call exactly once —
+    never twice (a worker that re-reads the memo and re-tries the flag), never
+    zero times (a worker that trusts another worker's re-issue for its own
+    endpoint) — and the memo must end False."""
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+    n = 4
+    barrier = threading.Barrier(n, timeout=5)
+    lock = threading.Lock()
+    calls: list[list[str]] = []
+
+    def _old_gh(argv, **kwargs):
+        with lock:
+            calls.append(list(argv))
+        if "--allow-escape-sequences" in argv:
+            barrier.wait()          # all four rejections land together
+            return _completed(returncode=1,
+                              stderr="unknown flag: --allow-escape-sequences\n")
+        return _completed(returncode=0, stdout=_OK_HEADERS + _COLOURED)
+    monkeypatch.setattr(collect_runs.subprocess, "run", _old_gh)
+
+    client = GhClient()
+    endpoints = [f"repos/o/r/actions/jobs/{i}/logs" for i in range(n)]
+    results: dict[str, str | None] = {}
+
+    def _worker(ep):
+        results[ep] = client.text(ep, allow_missing=True)
+    threads = [threading.Thread(target=_worker, args=(ep,)) for ep in endpoints]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert collect_runs._ESCAPE_FLAG_SUPPORTED is False
+    assert all(results[ep] and "test_login" in results[ep] for ep in endpoints), results
+    for ep in endpoints:
+        flagged = [c for c in calls if c[-1] == ep and "--allow-escape-sequences" in c]
+        plain = [c for c in calls if c[-1] == ep and "--allow-escape-sequences" not in c]
+        assert len(flagged) == 1 and len(plain) == 1, (
+            f"{ep}: {len(flagged)} flagged, {len(plain)} plain re-issues")
+    assert len(calls) == 2 * n
+
+
+def test_four_workers_rejected_at_once_log_the_fallback_once_not_once_each(monkeypatch, caplog):
+    """The fallback is discovered once per PROCESS, and the DEBUG line that says so
+    is written once — not once per worker that happened to be in flight at the
+    instant of discovery. Under the prefetch pool that instant holds a pool-width
+    of workers, and N identical lines for one event misreads as N events."""
+    monkeypatch.setattr(collect_runs, "_ESCAPE_FLAG_SUPPORTED", True)
+    n = 4
+    barrier = threading.Barrier(n, timeout=5)
+
+    def _old_gh(argv, **kwargs):
+        if "--allow-escape-sequences" in argv:
+            barrier.wait()          # all four rejections land together
+            return _completed(returncode=1,
+                              stderr="unknown flag: --allow-escape-sequences\n")
+        return _completed(returncode=0, stdout=_OK_HEADERS + _COLOURED)
+    monkeypatch.setattr(collect_runs.subprocess, "run", _old_gh)
+
+    client = GhClient()
+    with caplog.at_level(logging.DEBUG, logger="collect_runs"):
+        threads = [threading.Thread(target=client.text,
+                                    args=(f"repos/o/r/actions/jobs/{i}/logs", True))
+                   for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+    fallback_lines = [r for r in caplog.records
+                      if "does not support --allow-escape-sequences" in r.getMessage()]
+    assert collect_runs._ESCAPE_FLAG_SUPPORTED is False
+    assert len(fallback_lines) == 1, (
+        f"one discovery, one line; got {len(fallback_lines)} lines from {n} workers")
+# -----------------------------------------------------------------------
+# Record mode (`CI_SPEEDUP_GH_RECORD`, maintainer-only) — the collision guard
+# must hold under the fetch pool, and a fixture must be whole or absent
+# -----------------------------------------------------------------------
+
+# Two DISTINCT endpoints that `_fixture_name` (lossy: every unsafe char becomes
+# `_`) maps to ONE file. This is the shape the guard exists for.
+_COLLIDE_A = "repos/o/r/actions/runs/1?x"
+_COLLIDE_B = "repos/o/r/actions/runs/1&x"
+
+
+def _record_client(monkeypatch, rec_dir) -> GhClient:
+    monkeypatch.setenv("CI_SPEEDUP_GH_RECORD", str(rec_dir))
+    monkeypatch.delenv("CI_SPEEDUP_GH_FIXTURES", raising=False)
+    return GhClient()
+
+
+def test_two_threads_recording_colliding_endpoints_in_one_wave_raise_exactly_once(
+        tmp_path, monkeypatch):
+    """The guard's docstring promises a collision RAISES. Under the shared fetch pool two
+    workers can reach `_record` for two colliding endpoints in the SAME wave; if the
+    check ("has this file been claimed?") and the claim are not one critical section,
+    both observe "unclaimed", both write, the last writer wins and the guard never
+    fires — exactly the silent valid-but-WRONG corpus the guard exists to refuse.
+
+    Both workers are held at a barrier placed AFTER the old check and BEFORE the file
+    write (the record dir's `mkdir`, which every write does first), so on the racy
+    code both are provably past the check before either writes. On the fixed code the
+    loser raises under the lock and never reaches the barrier, so the winner's wait
+    times out and it simply proceeds — the barrier is a gate, not an assertion."""
+    fname = collect_runs._fixture_name(_COLLIDE_A, "json")
+    assert fname == collect_runs._fixture_name(_COLLIDE_B, "json")
+    bodies = {_COLLIDE_A: '{"total_count": 1}', _COLLIDE_B: '{"total_count": 2}'}
+    _patch_run(monkeypatch, lambda cmd, *a, **kw: _completed(stdout=_ok(bodies[cmd[-1]])))
+
+    gate = threading.Barrier(2, timeout=1.0)
+    real_mkdir = collect_runs.Path.mkdir
+
+    def _gated_mkdir(self, *a, **kw):
+        try:
+            gate.wait()
+        except threading.BrokenBarrierError:
+            pass                    # the other worker already raised: nothing to wait for
+        return real_mkdir(self, *a, **kw)
+
+    monkeypatch.setattr(collect_runs.Path, "mkdir", _gated_mkdir)
+    client = _record_client(monkeypatch, tmp_path)
+
+    outcomes: dict[str, BaseException | None] = {}
+
+    def _worker(endpoint):
+        try:
+            client.json(endpoint)
+            outcomes[endpoint] = None
+        except BaseException as e:      # noqa: BLE001 — the raise IS the assertion
+            outcomes[endpoint] = e
+
+    threads = [threading.Thread(target=_worker, args=(e,)) for e in (_COLLIDE_A, _COLLIDE_B)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    raised = [e for e, exc in outcomes.items() if exc is not None]
+    assert len(raised) == 1, (
+        f"exactly one of the two colliding writers must raise; got raised={raised!r} "
+        f"outcomes={outcomes!r} — both succeeded means last-writer-wins and a silent "
+        f"wrong fixture")
+    assert isinstance(outcomes[raised[0]], RuntimeError)
+    assert "collision" in str(outcomes[raised[0]])
+    (winner,) = [e for e in outcomes if e != raised[0]]
+    assert client._recorded_from[fname] == winner
+    assert (tmp_path / fname).read_text(encoding="utf-8") == bodies[winner], (
+        "the surviving fixture must be the WINNER's body, not the loser's")
+
+
+def test_re_recording_the_same_endpoint_is_still_an_idempotent_overwrite(tmp_path, monkeypatch):
+    """The claim is per ENDPOINT: the same endpoint recorded twice (a legitimate
+    re-request — consumption is pop-once) overwrites its own fixture and is not a
+    collision. Preserved from before the guard moved under the lock."""
+    _patch_run(monkeypatch, lambda *a, **kw: _completed(stdout=_ok('{"n": 1}')))
+    client = _record_client(monkeypatch, tmp_path)
+    client.json(_COLLIDE_A)
+    _patch_run(monkeypatch, lambda *a, **kw: _completed(stdout=_ok('{"n": 2}')))
+    client.json(_COLLIDE_A)
+    fname = collect_runs._fixture_name(_COLLIDE_A, "json")
+    assert (tmp_path / fname).read_text(encoding="utf-8") == '{"n": 2}'
+    assert list(tmp_path.iterdir()) == [tmp_path / fname], "no temp-file litter"
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, OSError("disk full")])
+def test_an_interrupted_fixture_write_leaves_no_fixture_at_the_final_path(
+        tmp_path, monkeypatch, interrupt):
+    """A fixture is either COMPLETE or ABSENT. The write goes to a temp file in the
+    record dir and is renamed into place only once it is whole, so a Ctrl-C / crash /
+    disk error mid-write cannot leave a truncated file that replays as valid-but-short
+    JSON (a `{"jobs": [` prefix reads back as "no jobs"). Absent is honest: replay
+    reports the fixture missing. The temp file is removed on the way out, too."""
+    payload = '{"jobs": [' + ", ".join('{"id": %d}' % i for i in range(2000)) + "]}"
+    _patch_run(monkeypatch, lambda *a, **kw: _completed(stdout=_ok(payload)))
+    client = _record_client(monkeypatch, tmp_path)
+    fname = collect_runs._fixture_name(_COLLIDE_A, "json")
+    real_write_text = collect_runs.Path.write_text
+
+    def _half_then_die(self, data, *a, **kw):
+        real_write_text(self, data[: len(data) // 2], *a, **kw)   # a partial file exists…
+        raise interrupt                                           # …and the writer dies
+
+    monkeypatch.setattr(collect_runs.Path, "write_text", _half_then_die)
+    if isinstance(interrupt, type):
+        with pytest.raises(interrupt):
+            client.json(_COLLIDE_A)
+    else:
+        assert client.json(_COLLIDE_A) is not None      # an OSError stays best-effort
+    assert not (tmp_path / fname).exists(), "a half-written fixture must never land"
+    assert list(tmp_path.iterdir()) == [], "no temp-file litter either"
+
+
+def test_a_failed_write_keeps_the_claim_so_a_collider_still_raises_and_a_retry_still_lands(
+        tmp_path, monkeypatch):
+    """The claim is taken BEFORE the write and kept if the write fails: a collision is a
+    property of what the run REQUESTED, not of what reached the disk. So after endpoint
+    A's write fails (best-effort: warns, no file), a colliding endpoint B must still be
+    refused — otherwise B would land under the shared name and a later successful
+    re-record of A would silently overwrite it, which is the last-writer-wins corpus
+    the guard exists to prevent. And A itself, re-requested, is not a collision: it
+    lands normally, so a transient disk error costs nothing but one retry."""
+    fname = collect_runs._fixture_name(_COLLIDE_A, "json")
+    bodies = {_COLLIDE_A: '{"n": "a"}', _COLLIDE_B: '{"n": "b"}'}
+    _patch_run(monkeypatch, lambda cmd, *a, **kw: _completed(stdout=_ok(bodies[cmd[-1]])))
+    client = _record_client(monkeypatch, tmp_path)
+    real_write_text = collect_runs.Path.write_text
+
+    def _disk_full(self, *a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(collect_runs.Path, "write_text", _disk_full)
+    assert client.json(_COLLIDE_A) is not None, "a write error stays best-effort"
+    assert not (tmp_path / fname).exists()
+    monkeypatch.setattr(collect_runs.Path, "write_text", real_write_text)
+
+    with pytest.raises(RuntimeError, match="collision"):
+        client.json(_COLLIDE_B)
+    assert not (tmp_path / fname).exists(), (
+        "the collider must not land just because the claimant's write failed")
+
+    assert client.json(_COLLIDE_A) is not None
+    assert (tmp_path / fname).read_text(encoding="utf-8") == bodies[_COLLIDE_A], (
+        "re-recording the claimant after a failed write is a plain overwrite, not a collision")
+    assert list(tmp_path.iterdir()) == [tmp_path / fname], "no temp-file litter"

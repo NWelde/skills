@@ -1007,6 +1007,150 @@ jobs:
     assert "OPT28" not in _scan_one(tmp_path, neg, name="regenerate.yml")
 
 
+def test_opt28_suppressed_on_backslash_continued_history_command(tmp_path: Path):
+    """A `run:` block that continues a git command onto the next line with a
+    trailing backslash is ONE shell command. The merge-base diff below needs
+    full history, so `fetch-depth: 0` is load-bearing — OPT28 must not
+    recommend shallowing the job just because the operand sits on line two."""
+    neg = """name: prebuild
+on: pull_request
+jobs:
+  affected-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          git diff --name-only \\
+            "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" \\
+            > /tmp/changed-files.txt
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="prebuild.yml")
+
+
+def test_opt28_suppressed_on_diff_against_a_variable_base_ref(tmp_path: Path):
+    """A `git diff` whose base operand is a shell variable is still a diff
+    against a base commit — a shallow clone does not contain it — so
+    `fetch-depth: 0` is load-bearing and OPT28 must stay silent."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  changed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          base=$(cat base.txt)
+          git diff --no-renames --name-only "$base" HEAD
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="changed.yml")
+
+
+def test_opt28_suppressed_on_cat_file_reachability_probe(tmp_path: Path):
+    """`git cat-file -e <sha>^{commit}` probes whether an object is present in
+    the clone — it only succeeds with the history fetched, so the job needs
+    `fetch-depth: 0` and OPT28 must not flag it."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          git cat-file -e "${base}^{commit}"
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="probe.yml")
+
+
+def test_opt28_suppressed_by_a_documented_history_justification_comment(tmp_path: Path):
+    """A YAML comment above `fetch-depth: 0` naming a history command is the one
+    artifact that settles whether the depth is load-bearing — and comments are
+    dropped at parse time, so the detector never saw it. It must now stay
+    silent rather than recommend a change that breaks the job."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # full history is required: the version stamp comes from `git describe`
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="build.yml")
+
+
+def test_opt28_still_fires_when_a_comment_denies_the_depth_is_needed(tmp_path: Path):
+    """The justification suppressor must read the comment, not merely notice one.
+    A comment saying the depth is unnecessary is not a justification, and the
+    word `depth` alone never suppresses."""
+    pos = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 is unnecessary here, left over from an old job
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" in _scan_one(tmp_path, pos, name="build.yml")
+
+
+def test_opt28_ignores_a_history_comment_too_far_above_the_step(tmp_path: Path):
+    """The suppressor reads a NEARBY comment block. A history comment attached to
+    an earlier step is not a justification for this one, and must not silence it."""
+    pos = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # this earlier step is the one that needs `git log`
+      - run: echo one
+      - run: echo two
+      - run: echo three
+      - run: echo four
+      - run: echo five
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" in _scan_one(tmp_path, pos, name="build.yml")
+
+
+def test_opt28_suppressed_on_positional_parameter_base_ref(tmp_path: Path):
+    """A `git diff` whose base operand is a positional parameter like `$1` is
+    still a diff against a base commit that must be in the history — a shallow
+    clone does not contain it — so `fetch-depth: 0` is load-bearing and OPT28
+    must not recommend shallowing."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  changed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          git diff --name-only "$1" HEAD
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="changed.yml")
+
+
 def test_opt28_line_points_at_the_flagged_job_not_the_first_match(tmp_path: Path):
     """A per-job OPT28 hit must record ITS OWN `fetch-depth: 0` line, not the
     file-global first match. prebuild.yml has depth:0 in the `changes` job (two-SHA
@@ -1186,6 +1330,67 @@ jobs:
       - run: pnpm test
 """
     assert "OPT28" in _scan_one(tmp_path, pos)
+
+
+def _opt28_workflow(job: str, run_body: str) -> str:
+    indented = "\n".join("          " + ln for ln in run_body.strip("\n").split("\n"))
+    return f"""name: CI
+on: pull_request
+jobs:
+  {job}:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+{indented}
+"""
+
+
+def test_opt28_fires_when_diff_output_is_redirected_to_a_variable_path(tmp_path: Path):
+    """`git diff --stat >> $GITHUB_STEP_SUMMARY` writes a diff of the working
+    tree into a file whose path is a variable. A redirection target is never a
+    ref, so nothing here reads history and OPT28 must still fire."""
+    wf = _opt28_workflow("summary", 'git diff --stat >> $GITHUB_STEP_SUMMARY')
+    assert "OPT28" in _scan_one(tmp_path, wf, name="summary.yml")
+
+
+def test_opt28_fires_when_diff_output_is_redirected_with_single_arrow(tmp_path: Path):
+    """Same shape with `>` instead of `>>`: the variable is the file being
+    written, not a base ref, so the checkout is still unjustified."""
+    wf = _opt28_workflow("out", 'git diff > $OUT')
+    assert "OPT28" in _scan_one(tmp_path, wf, name="out.yml")
+
+
+def test_opt28_fires_when_variable_after_dash_dash_is_a_pathspec(tmp_path: Path):
+    """After a bare `--` separator every operand is a pathspec, never a ref.
+    `git diff --exit-code -- "$FILE"` compares the working tree against the
+    index for one path and needs no history, so OPT28 must fire."""
+    wf = _opt28_workflow("dirty", 'git diff --exit-code -- "$FILE"')
+    assert "OPT28" in _scan_one(tmp_path, wf, name="dirty.yml")
+
+
+def test_opt28_fires_when_cat_file_reads_a_blob_at_head(tmp_path: Path):
+    """`git cat-file -p HEAD:package.json` reads a blob at the checked-out
+    commit. That object is present at any clone depth, so this is not a
+    history read and OPT28 must fire."""
+    wf = _opt28_workflow("read", 'git cat-file -p HEAD:package.json > pkg.json')
+    assert "OPT28" in _scan_one(tmp_path, wf, name="read.yml")
+
+
+def test_opt28_fires_on_working_tree_git_commands(tmp_path: Path):
+    """`git diff --cached`, `git diff --quiet`, `git status` and `git add` all
+    read the index or the working tree only — none of them reaches back into
+    history, so a `fetch-depth: 0` alongside them stays unjustified."""
+    for job, cmd in (
+        ("cached", "git diff --cached --name-only"),
+        ("quiet", "git diff --quiet"),
+        ("status", "git status --porcelain"),
+        ("add", "git add -A"),
+    ):
+        wf = _opt28_workflow(job, cmd)
+        assert "OPT28" in _scan_one(tmp_path / job, wf, name=f"{job}.yml"), cmd
 
 
 def test_opt35_suppressed_on_diagnostic_matrix(tmp_path: Path):
@@ -2678,8 +2883,8 @@ jobs: {}
     graph = _scan(tmp_path).get("workflow_job_graph", {})
     ci = graph.get(".github/workflows/ci.yml")
     assert ci is not None
-    assert ci["changes"] == {"name": "changes", "needs": [], "reusable": False, "matrix": False, "timeout_minutes": False}  # missing needs -> []; no name -> job id; no strategy.matrix
-    assert ci["build"] == {"name": "Build", "needs": ["changes"], "reusable": False, "matrix": False, "timeout_minutes": True}  # bare string normalized
+    assert ci["changes"] == {"name": "changes", "needs": [], "reusable": False, "matrix": False, "timeout_minutes": False, "continue_on_error": False}  # missing needs -> []; no name -> job id; no strategy.matrix
+    assert ci["build"] == {"name": "Build", "needs": ["changes"], "reusable": False, "matrix": False, "timeout_minutes": True, "continue_on_error": False}  # bare string normalized
     assert ci["test"]["needs"] == ["changes", "build"]                                    # list preserved
     assert ci["test"]["name"] == "UNIT Test (Shard ${{ matrix.shard }})"                  # matrix placeholder kept intact
     assert ci["test"]["matrix"] is True                                                   # strategy.matrix -> matrix flag
@@ -2854,7 +3059,7 @@ def test_opt66_stays_retired_not_silently_deleted():
     dropping (or reusing) an id — a removed pattern must keep a stub, like the
     OPT49/50/51 CUTs — so historical reports/evals/fix-strategy strings never
     collide. This guards against OPT66 vanishing (which also silently staled
-    every '73-pattern' doc claim, see the count test below)."""
+    every '76-pattern' doc claim, see the count test below)."""
     import sys as _sys
     _sys.path.insert(0, str(_SKILL_DIR / "scripts"))
     import scan  # noqa: E402
@@ -2874,8 +3079,8 @@ def test_opt66_stays_retired_not_silently_deleted():
 
 def test_catalog_pattern_count_matches_doc_claims():
     """Every '<N>-pattern' / 'all <N> patterns' claim in the shipped docs must use
-    the REAL current catalog count. OPT66's removal-as-a-retired-stub keeps that
-    count at 73; a silent delete drops it to 72 and staled five claims at once
+    the REAL current catalog count (76 with OPT77 and OPT78). OPT66's removal-as-a-retired-stub
+    keeps OPT66 in that count; a silent delete drops it by one and staled five claims at once
     (SKILL.md, ARCHITECTURE.md, evals.json). This is the guard that was missing."""
     import sys as _sys
     _sys.path.insert(0, str(_SKILL_DIR / "scripts"))
@@ -2888,3 +3093,917 @@ def test_catalog_pattern_count_matches_doc_claims():
             assert int(claimed) == count, (
                 f"{rel} claims a {claimed}-pattern catalog but the real count is "
                 f"{count} — reconcile the doc with optimization-patterns.md")
+
+
+def test_catalog_pattern_count_breakdown_sums_to_the_total():
+    """The headline count is followed, in both shipped docs, by a hygiene +
+    structural breakdown. Bumping only the total leaves the very sentence a
+    reader uses to check the number contradicting itself — which is exactly what
+    the total-only guard above cannot see."""
+    import sys as _sys
+    _sys.path.insert(0, str(_SKILL_DIR / "scripts"))
+    import scan  # noqa: E402
+
+    count = len(scan.load_catalog(_CATALOG_PATH))
+    breakdown = re.compile(
+        r"(\d+)[- ]pattern\s*\n?catalog\s*[—-]\s*(\d+)\s+\*\*hygiene/data-driven\*\*"
+        r".*?plus\s+(\d+)\s+\*\*structural",
+        re.S)
+    for rel in ("SKILL.md", "ARCHITECTURE.md"):
+        text = (_SKILL_DIR / rel).read_text(encoding="utf-8")
+        m = breakdown.search(text)
+        assert m, f"{rel} no longer states a hygiene + structural breakdown to check"
+        total, hygiene, structural = (int(g) for g in m.groups())
+        assert total == count, f"{rel} headline count {total} != real count {count}"
+        assert hygiene + structural == total, (
+            f"{rel} breaks down its {total}-pattern catalog as {hygiene} hygiene + "
+            f"{structural} structural = {hygiene + structural} — the breakdown must "
+            f"sum to the total")
+
+
+# =============================================================================
+# OPT76 — Submodule / Git LFS Checkout Payload
+# =============================================================================
+
+_GITMODULES = """[submodule "vendor/protos"]
+\tpath = vendor/protos
+\turl = https://github.com/example/protos.git
+"""
+
+_GITATTRIBUTES = "*.psd filter=lfs diff=lfs merge=lfs -text\n"
+
+
+def _write_repo_file(root: Path, name: str, content: str) -> None:
+    (root / name).write_text(content, encoding="utf-8")
+
+
+def test_opt76_fires_on_submodule_checkout_no_step_reads_it(tmp_path: Path):
+    """A PR-gating job that clones every submodule but never references the
+    submodule path pays the clone on every run."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    pos = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: pnpm install && pnpm test
+"""
+    assert "OPT76" in _scan_one(tmp_path, pos)
+
+
+def test_opt76_suppressed_when_a_step_builds_from_the_submodule(tmp_path: Path):
+    """The submodule payload is LOAD-BEARING when a step reads it — dropping
+    `submodules:` would break the job, so OPT76 must NOT fire."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: make -C vendor/protos generate && pnpm build
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_suppressed_when_no_gitmodules_declares_a_path(tmp_path: Path):
+    """With no `.gitmodules` in the checkout we can't name a submodule the job
+    fails to read — fail CLOSED rather than assert unread payload we never saw."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: pnpm test
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_fails_closed_on_unreadable_local_action(tmp_path: Path):
+    """A local composite action whose file can't be read may itself read the
+    submodule — suppress rather than recommend a payload removal that breaks it."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/mystery
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_sees_submodule_use_inside_a_local_composite_action(tmp_path: Path):
+    """The step that reads the submodule can live in a local composite action —
+    resolve it, and suppress the finding just as if it were in the workflow."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    act = tmp_path / ".github" / "actions" / "gen"
+    act.mkdir(parents=True, exist_ok=True)
+    (act / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n    - run: make -C vendor/protos generate\n"
+        "      shell: bash\n", encoding="utf-8")
+    neg = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/gen
+      - run: pnpm test
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_fires_on_lfs_checkout_no_step_reads_a_tracked_path(tmp_path: Path):
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    pos = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: pnpm test
+"""
+    assert "OPT76" in _scan_one(tmp_path, pos)
+
+
+def test_opt76_fires_on_git_lfs_pull_in_a_run_block(tmp_path: Path):
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    pos = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git lfs pull
+      - run: pnpm test
+"""
+    assert "OPT76" in _scan_one(tmp_path, pos)
+
+
+def test_opt76_suppressed_when_a_step_reads_an_lfs_tracked_path(tmp_path: Path):
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: node scripts/render.js assets/logo.psd
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_ignores_dispatch_only_helper_workflows(tmp_path: Path):
+    """A `workflow_dispatch`-only helper isn't dev-facing CI (runs ~0x/mo), so
+    its checkout payload is noise, not a ranked optimization (OPT28's scope)."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    neg = """name: helper
+on: workflow_dispatch
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: pnpm test
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg, name="helper.yml")
+
+
+def test_opt76_evidence_names_the_declared_payload_and_anchors_its_job(tmp_path: Path):
+    """The finding must cite the submodule path it read from `.gitmodules` and
+    anchor on the flagged job's OWN `submodules:` line, not a file-global match."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    wf = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: make -C vendor/protos generate
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: pnpm test
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    hits = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT76"]
+    # Only `test` is flagged; `build` genuinely reads the submodule.
+    assert [f["affected_jobs"] for f in hits] == [["test"]]
+    assert "vendor/protos" in hits[0]["evidence"]
+    sub_lines = [i + 1 for i, ln in enumerate(wf.splitlines())
+                 if ln.strip() == "submodules: recursive"]
+    assert hits[0]["line"] == sub_lines[1]  # test's line, not build's
+
+
+# --- OPT76 regressions: the evidence must match what was actually checked ----
+
+
+def test_opt76_does_not_call_git_lfs_checkout_a_download(tmp_path: Path):
+    """`git lfs checkout` populates the working tree from objects ALREADY local
+    — it downloads nothing. Flagging it would assert a network payload the
+    detector never established, and the catalog's own recipe greps only for
+    `git lfs pull` / `git lfs fetch`."""
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git lfs checkout
+      - run: pnpm test
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_resolves_a_local_action_nested_inside_a_local_action(tmp_path: Path):
+    """A composite action may invoke ANOTHER local action, and that inner one
+    may be the step that reads the payload. Following only one level makes the
+    job look clean and recommends a removal that breaks the build."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    outer = tmp_path / ".github" / "actions" / "build"
+    outer.mkdir(parents=True, exist_ok=True)
+    (outer / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/inner\n",
+        encoding="utf-8")
+    inner = tmp_path / ".github" / "actions" / "inner"
+    inner.mkdir(parents=True, exist_ok=True)
+    (inner / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n"
+        "    - run: make -C vendor/protos generate\n      shell: bash\n",
+        encoding="utf-8")
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: ./.github/actions/build
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_fails_closed_when_a_nested_local_action_is_unreadable(tmp_path: Path):
+    """The fail-closed stance has to survive one level down too: an inner action
+    we cannot read may be the payload's reader."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    outer = tmp_path / ".github" / "actions" / "build"
+    outer.mkdir(parents=True, exist_ok=True)
+    (outer / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n    - uses: ./.github/actions/mystery\n",
+        encoding="utf-8")
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: ./.github/actions/build
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_ignores_a_checkout_of_a_different_repository(tmp_path: Path):
+    """`repository:` clones SOMEONE ELSE's tree, whose submodules this repo's
+    `.gitmodules` says nothing about. Naming our declared paths as the unread
+    payload would be a claim about data the scanner never saw."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: other/other-repo
+          submodules: recursive
+          path: other
+      - run: make -C other all
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_ignores_commented_and_negated_gitattributes_lines(tmp_path: Path):
+    """A commented `.gitattributes` line must not become the hint `#`, which
+    appears in almost every run block and would silently switch the whole LFS
+    half of the pattern off. A `-filter=lfs` unset is not a declaration either."""
+    _write_repo_file(
+        tmp_path, ".gitattributes",
+        "# *.bin filter=lfs diff=lfs -text\n"
+        "*.log -filter=lfs\n"
+        "*.psd filter=lfs diff=lfs merge=lfs -text\n")
+    pos = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: |
+          # build the thing
+          pnpm test
+"""
+    assert "OPT76" in _scan_one(tmp_path, pos)
+
+
+def test_opt76_reads_quoted_and_dot_prefixed_gitmodules_paths(tmp_path: Path):
+    """A path with a space is quoted in `.gitmodules`, and `./`-prefixed paths
+    are legal. Dropping them silently shrinks the declared payload, so the
+    evidence enumerates an incomplete declaration and fires on a job that does
+    read the submodule."""
+    _write_repo_file(
+        tmp_path, ".gitmodules",
+        '[submodule "assets"]\n\tpath = "assets/big data"\n'
+        '\turl = https://example.invalid/a.git\n'
+        '[submodule "vendor"]\n\tpath = ./vendor/protos\n'
+        '\turl = https://example.invalid/b.git\n')
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: make -C "assets/big data" all
+      - run: make -C vendor/protos generate
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_anchors_on_the_checkout_that_actually_pulls_the_payload(tmp_path: Path):
+    """Two checkouts in one job: the snippet the report renders as verbatim
+    proof must be the `submodules: true` line, never the `submodules: false`
+    line that happens to come first."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    wf = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: pnpm test
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    hits = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT76"]
+    assert len(hits) == 1
+    assert "submodules: true" in hits[0]["evidence_snippet"]
+    assert "false" not in hits[0]["evidence_snippet"]
+
+
+def test_opt76_does_not_fire_on_yaml_truthy_submodules_yes(tmp_path: Path):
+    """PyYAML resolves `yes` to True; the runner does not — actions/checkout
+    enables submodules only for `TRUE`/`RECURSIVE`, so `submodules: yes` clones
+    nothing. Firing would flag a payload that is never pulled, and quote a
+    `submodules: true` that is not in the file."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: yes
+      - run: pnpm test
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_sees_paths_named_in_job_defaults_matrix_and_step_if(tmp_path: Path):
+    """These references are in the job's own YAML — the very text the evidence
+    claims to have searched. Missing them recommends dropping a payload the job
+    demonstrably uses."""
+    _write_repo_file(tmp_path, ".gitmodules", _GITMODULES)
+    for wf in (
+        """name: CI
+on: pull_request
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vendor/protos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: make all
+""",
+        """name: CI
+on: pull_request
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pkg: [vendor/protos]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: make -C ${{ matrix.pkg }} generate
+""",
+        """name: CI
+on: pull_request
+jobs:
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: build vendor/protos
+        if: hashFiles('vendor/protos/**') != ''
+        run: make all
+""",
+    ):
+        assert "OPT76" not in _scan_one(tmp_path, wf)
+
+
+def test_opt76_reports_one_finding_per_job_for_one_lfs_payload(tmp_path: Path):
+    """`lfs: true` and `git lfs pull` in the same job download the SAME objects
+    once. Two findings would double-count one payload in the ranked list."""
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    wf = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: git lfs pull
+      - run: pnpm test
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    hits = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT76"]
+    assert len(hits) == 1
+
+
+def test_opt76_matches_declared_paths_case_insensitively(tmp_path: Path):
+    """Git path matching is effectively case-insensitive on the macOS/Windows
+    checkouts these workflows run against, so a step naming `assets/LOGO.PSD`
+    reads the `*.psd` payload."""
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - run: node scripts/render.js assets/LOGO.PSD
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_suppressed_when_a_git_lfs_run_step_job_reads_a_tracked_path(tmp_path: Path):
+    """The run-block branch needs its OWN suppression case: the `lfs: true`
+    negatives all go through the `with:`-key path, so a mutant that drops the
+    "no step reads a tracked path" condition from the `git lfs pull` branch
+    alone leaves the suite green while the detector fires on a job whose whole
+    purpose is reading the payload it just pulled."""
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    neg = """name: CI
+on: pull_request
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git lfs pull
+      - run: node scripts/render.js assets/logo.psd
+"""
+    assert "OPT76" not in _scan_one(tmp_path, neg)
+
+
+def test_opt76_run_block_anchors_on_the_downloading_git_lfs_command(tmp_path: Path):
+    """`git lfs install` (and `git lfs checkout`) download nothing — that is why
+    the run-block branch only fires on `pull`/`fetch`. Anchoring the finding on
+    the first `git lfs` line in the job pastes a non-downloading setup command as
+    the verbatim proof of a network payload, so the snippet must be the
+    `pull`/`fetch` line the detector actually matched."""
+    _write_repo_file(tmp_path, ".gitattributes", _GITATTRIBUTES)
+    wf = """name: CI
+on: pull_request
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git lfs install
+      - run: git lfs checkout
+      - run: git lfs pull
+      - run: pnpm test
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    hits = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT76"]
+    assert len(hits) == 1
+    assert "git lfs pull" in hits[0]["evidence_snippet"]
+    assert "install" not in hits[0]["evidence_snippet"]
+
+
+def test_workflow_job_graph_records_literal_continue_on_error(tmp_path: Path):
+    """A job declared `continue-on-error: true` cannot fail its workflow RUN, which is a
+    material fact about a job the report may crown as the long pole. The graph carries it so
+    the renderer never has to re-read YAML. Only a LITERAL true counts: an expression such as
+    `${{ matrix.experimental }}` is true on some matrix legs and false on others, and the YAML
+    cannot say which, so it is not judged. GitHub also accepts the quoted string form."""
+    wf = """name: CI
+on:
+  pull_request:
+jobs:
+  advisory:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: echo advisory
+  quoted:
+    runs-on: ubuntu-latest
+    continue-on-error: "TRUE"
+    steps:
+      - run: echo quoted
+  expression:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      matrix:
+        experimental: [true, false]
+    steps:
+      - run: echo maybe
+  explicit_false:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - run: echo blocking
+  step_level_only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo upload
+        continue-on-error: true
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo plain
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    jobs = _scan(tmp_path)["workflow_job_graph"][".github/workflows/ci.yml"]
+    assert jobs["advisory"]["continue_on_error"] is True
+    assert jobs["quoted"]["continue_on_error"] is True
+    # An expression, an explicit false, a STEP-level declaration (which is job-scoped, not
+    # run-scoped, and so proves nothing about the job) and a plain job all read as False.
+    for jid in ("expression", "explicit_false", "step_level_only", "plain"):
+        assert jobs[jid]["continue_on_error"] is False, jid
+
+
+def test_workflow_job_graph_rejects_yaml_1_1_boolean_words(tmp_path: Path):
+    """`continue-on-error: yes` is NOT an advisory job on GitHub, and the report must not
+    say it is.
+
+    GitHub Actions reads booleans the YAML 1.2 way: `true` / `false` (and their capitalised
+    spellings) and nothing else. PyYAML reads YAML 1.1, where `yes`, `on`, `y`, `no`, `off`
+    and `n` are ALSO booleans. So a workflow that says `continue-on-error: yes` arrives here
+    as Python `True` while GitHub reads it as the plain string "yes" and the job keeps
+    failing its run exactly as before. Trusting the parsed value would put a false
+    "declared advisory" sentence on the slowest check in the report.
+
+    The truthy words are the whole point of the test; `off`/`no` are here so the fix cannot
+    pass by reading every word as advisory instead."""
+    wf = """name: CI
+on:
+  pull_request:
+jobs:
+  word_yes:
+    runs-on: ubuntu-latest
+    continue-on-error: yes
+    steps:
+      - run: echo yes
+  word_on:
+    runs-on: ubuntu-latest
+    continue-on-error: on
+    steps:
+      - run: echo on
+  word_y:
+    runs-on: ubuntu-latest
+    continue-on-error: y
+    steps:
+      - run: echo y
+  word_off:
+    runs-on: ubuntu-latest
+    continue-on-error: off
+    steps:
+      - run: echo off
+  word_no:
+    runs-on: ubuntu-latest
+    continue-on-error: no
+    steps:
+      - run: echo no
+  really_advisory:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - run: echo advisory
+"""
+    _write_workflow(tmp_path, "ci.yml", wf)
+    jobs = _scan(tmp_path)["workflow_job_graph"][".github/workflows/ci.yml"]
+    for jid in ("word_yes", "word_on", "word_y", "word_off", "word_no"):
+        assert jobs[jid]["continue_on_error"] is False, jid
+    # The literal GitHub does accept still reads as advisory: the fix narrows the
+    # detection, it does not switch it off.
+    assert jobs["really_advisory"]["continue_on_error"] is True
+
+
+def test_github_bool_reread_still_refuses_python_object_tags():
+    """The narrowed boolean re-read must stay a SAFE load — nothing may be constructed.
+
+    `_github_bool_jobs` re-reads a workflow through `_GitHubBoolLoader`, which exists only
+    to drop PyYAML's YAML-1.1 boolean words (see the test above). That loader subclasses
+    `SafeLoader` and replaces nothing but the implicit boolean resolvers, so PyYAML's
+    SafeConstructor still refuses to instantiate objects from `!!python/...` tags.
+
+    Because the call sits behind a permanent `# nosec B506` annotation, static analysis
+    will NOT notice if that loader ever stops inheriting from `SafeLoader` or gains a
+    permissive constructor. This test is what stands in the scanner's place: it fails if a
+    hostile tag is ever constructed instead of rejected. The payload calls `os.getcwd`,
+    which does nothing observable if it runs — the assertion is that the parse is refused,
+    not that the damage was small.
+
+    The benign leg is here so the test cannot pass by the re-read being broken outright."""
+    if not _have_yaml():
+        pytest.skip("PyYAML not installed in the test runner")
+    import sys as _sys
+    _sys.path.insert(0, str(_SKILL_DIR / "scripts"))
+    import scan  # noqa: E402
+
+    hostile = "jobs:\n  evil: !!python/object/apply:os.getcwd []\n"
+    assert scan._github_bool_jobs(hostile) == {}, (
+        "the boolean re-read constructed a Python object from a workflow tag: "
+        "_GitHubBoolLoader is no longer a safe loader, and the B506 suppression on it "
+        "is now hiding a real finding")
+
+    benign = "jobs:\n  advisory:\n    continue-on-error: true\n"
+    assert scan._github_bool_jobs(benign)["advisory"]["continue-on-error"] is True, (
+        "the re-read must still parse an ordinary workflow; a loader that refuses "
+        "everything would pass the hostile leg while reporting nothing")
+def test_opt28_multiple_checkouts_each_reported_on_own_line(tmp_path: Path):
+    """Regression: when a job has multiple checkouts with fetch-depth: 0,
+    each must be reported on its OWN line. The first has a justifying comment
+    (suppressed); the second has no justification (reported)."""
+    yml = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # checkout 1 needs history for git describe
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: echo one
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    result = _scan_one(tmp_path, yml, name="multi.yml")
+    assert "OPT28" in result, "Expected OPT28 finding for the unjustified checkout"
+
+
+def test_opt28_preceding_step_comment_does_not_suppress(tmp_path: Path):
+    """Regression: a history-naming comment INSIDE a preceding step's body
+    should not suppress the following checkout's finding. The comment belongs
+    to that earlier step, not to the checkout that follows it."""
+    yml = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prev
+        # this step is the one that needs `git rev-list`
+        run: echo hi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    result = _scan_one(tmp_path, yml, name="boundary.yml")
+    assert "OPT28" in result, \
+        "checkout must NOT be suppressed by history comment inside preceding step"
+
+
+def test_opt28_blank_line_ends_the_justification_region(tmp_path: Path):
+    """The justification region is bounded and a blank line closes it. A history
+    comment separated from the step by a blank line is a note about something
+    else, so the finding must still fire."""
+    pos = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # full history is required: the version stamp comes from `git describe`
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" in _scan_one(tmp_path, pos, name="blank.yml")
+
+
+def test_opt28_justification_region_stops_six_lines_above_the_key(tmp_path: Path):
+    """The region reaches six lines above the matched `fetch-depth: 0` — enough
+    for a comment block written above the step. A history comment pushed beyond
+    that by four unrelated comment lines is out of range and must not suppress."""
+    pos = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # full history is required: the version stamp comes from `git describe`
+      # note four
+      # note three
+      # note two
+      # note one
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" in _scan_one(tmp_path, pos, name="far.yml")
+
+
+def test_opt28_comment_ending_a_preceding_run_block_does_not_suppress(tmp_path: Path):
+    """A comment written as the last line of the preceding step's `run: |` block
+    sits directly above the checkout's step marker, but it is shell text
+    belonging to that step — not a justification for this checkout."""
+    pos = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prev
+        run: |
+          echo one
+          # this step walks the ancestors, so it needs the history
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" in _scan_one(tmp_path, pos, name="scalar.yml")
+
+
+def test_opt28_justification_comment_between_uses_and_with_suppresses(tmp_path: Path):
+    """The region is the six lines above the key, so it covers the step's own
+    body. A justification written between `- uses:` and `with:` is as much this
+    step's justification as one written above the step."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # full history is required: the version stamp comes from `git describe`
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="inuses.yml")
+
+
+def test_opt28_justification_comment_above_the_key_suppresses(tmp_path: Path):
+    """A justification written on the line immediately above `fetch-depth: 0`,
+    inside `with:`, is the closest place a maintainer can put it and must
+    suppress."""
+    neg = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # full history is required: the version stamp comes from `git describe`
+          fetch-depth: 0
+      - run: make build
+"""
+    assert "OPT28" not in _scan_one(tmp_path, neg, name="inwith.yml")
+
+
+def test_opt28_comment_quoting_the_key_does_not_consume_a_checkout_slot(tmp_path: Path):
+    """A comment that quotes `fetch-depth: 0` is not a checkout. Counting it as
+    one shifts every checkout's reported line by one and drops the last
+    checkout's finding entirely: here the second, unjustified checkout would
+    never be reached."""
+    yml = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # keep fetch-depth: 0 here — the version stamp comes from `git describe`
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: echo one
+      - uses: actions/checkout@v4
+        with:
+          path: vendor
+          fetch-depth: 0
+      - run: make build
+"""
+    _write_workflow(tmp_path, "quote.yml", yml)
+    opt28 = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT28"]
+    lines = yml.split("\n")
+    depth_lines = [i + 1 for i, ln in enumerate(lines)
+                   if ln.strip() == "fetch-depth: 0"]
+    assert len(depth_lines) == 2
+    assert len(opt28) == 1, opt28
+    # The justified first checkout is suppressed; the finding belongs to the
+    # second checkout's own line, not to the comment that quotes the key.
+    assert opt28[0]["line"] == depth_lines[1]
+
+
+def test_opt28_single_checkout_is_reported_on_the_key_not_a_comment(tmp_path: Path):
+    """With one checkout and a comment quoting `fetch-depth: 0` above it, the
+    finding must still point at the configuration line, not at the comment."""
+    yml = """name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # TODO: drop fetch-depth: 0 once the stamp moves into the build script
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: make build
+"""
+    _write_workflow(tmp_path, "single.yml", yml)
+    opt28 = [f for f in _scan(tmp_path)["findings"] if f["pattern"] == "OPT28"]
+    lines = yml.split("\n")
+    depth_line = next(i + 1 for i, ln in enumerate(lines)
+                      if ln.strip() == "fetch-depth: 0")
+    assert len(opt28) == 1, opt28
+    assert opt28[0]["line"] == depth_line

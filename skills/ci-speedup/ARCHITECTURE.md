@@ -26,9 +26,9 @@ developer's wait. It gets its own prominent section below.
 
 ## 1. Purpose & scope
 
-ci-speedup audits a repository's GitHub Actions workflows against a 73-pattern
-catalog — 67 **hygiene/data-driven** patterns (OPT1–OPT69, with gaps 10 and 67) plus 6 **structural /
-critical-path** patterns (OPT70–OPT75, routed from the measured long pole; see
+ci-speedup audits a repository's GitHub Actions workflows against a 78-pattern
+catalog — 71 **hygiene/data-driven** patterns (OPT1–OPT69 with gaps 10 and 67, plus OPT76, OPT77, OPT79 and OPT80) plus 7 **structural /
+critical-path** patterns (OPT70–OPT75 and OPT78, routed from the measured long pole; see
 §11) — and produces a **root-cause-analysis** markdown report with **measured**
 impact on two axes: developer wall-clock wait (the ranking axis) and
 runner-minutes (the cloud bill). Detection, ranking, and every measured number
@@ -105,7 +105,12 @@ regardless, so opting in only copies an already-verified `.md`.
 **There is no fix-generation phase.** ci-speedup stops
 at the measured root cause; the report's per-pole agent prompts are the
 hand-off — the user pastes one into their own coding agent, which sees the repo
-and reasons out the fix. Detection + the measured report are deterministic and
+and reasons out the fix. Because that prompt is the entire contract, the
+renderer owns two blocks in it that no builder may omit or paraphrase: the
+"does NOT prescribe the fix" disclaimer and the no-weakening rail
+(`_NO_WEAKENING_LINES`). Any new prompt builder must emit both —
+`verify_report.py` counts each once per rendered prompt, so a rail-free path
+fails the gate on a real audit, not just in unit tests. Detection + the measured report are deterministic and
 reproducible from the findings JSON; the only non-deterministic step is the
 phase-4a LLM gap-fill for poles the catalog can't analyse (labelled + log-
 grounded, never touching the measured numbers). `record_timing.py` lets the orchestrator
@@ -731,7 +736,7 @@ multiset invariant:
 
 The plans and the call sites share their endpoint builders (`_volume_endpoint`,
 `_run_list_endpoint`, `_status_count_endpoint`, `_run_jobs_endpoint`,
-`_job_log_endpoint`) and their guard predicates (`_opt65_scope_event`,
+`_job_log_endpoint`) and their guard predicates (`_tier2_scope_event`,
 `_opt57_timeout_job_specs`, `_on_has_event`, `_recovers`) precisely so the two cannot
 disagree about which URL, or whether a call happens at all. A predicate re-stated inline
 next to the plan that computed it is a drift bug waiting to happen; there is exactly one
@@ -741,7 +746,8 @@ The waves, in order: the run-list family for every workflow → the whole shallo
 sample flattened across workflows → one wave per deepen round → the triage-recovery
 job fetches → the detector loop's run-list family → the rerun-attempt `filter=all`
 listings → the workflow `contents` reads, the cache-evidence logs, the cache push-probe
-logs, and the pole drill logs.
+logs, the OPT79 net-negative-cache probe logs (up to 24 job logs in one prefetch
+wave, issued without `--with-logs`), and the pole drill logs.
 
 **Peak memory: the JSON waves are flat, the LOG waves are a bounded window.** The JSON
 responses (run lists, job listings) are retained by the consumer for the rest of the pass
@@ -1027,6 +1033,337 @@ stamp bare run IDs for de-overlap: the credited unit is per-job billing round-up
 not whole-run elimination. The guardrail text must keep consolidation off the
 merge gate; lowering matrix parallelism or adding a serial `needs:` stage for an
 on-spine matrix is wall-clock-negative.
+OPT65 is also **superseded by OPT77** on any job set both claim, in
+`collect()` right after both have run for a workflow (`_supersede_opt65_with_opt77`).
+The two are not disjoint: OPT65 groups on a trailing parenthetical in the OBSERVED
+job name, so three ordinary jobs named `lint (eslint)` / `(biome)` / `(stylelint)`
+form an OPT65 base AND resolve to one YAML job each. One edit must render as one
+lever, so the consolidation wins; OPT65's round-up minutes for the overlap go
+unreported (a deliberate under-statement, since folding a billable-round-up
+quantity into OPT77's raw-compute basis would break it) and every drop is
+disclosed in `findings_doc["superseded_findings"]`.
+
+OPT77 (repeated fixed setup across independent small jobs) is the other measured
+Tier-2 consolidation lever. It splits each sampled job's step timeline into a
+LEADING setup prefix and useful work, using the same `_SETUP_STEP_RE` classifier
+the CUT hygiene detectors OPT49/OPT51 were defined against — widened in this wave
+to recognise GitHub's `Run <owner>/<action>@<ref>` rendering of an unnamed action
+step and the bare install commands (`npm ci`, `pip install`, …), without which
+the largest component of a real setup prefix was invisible. The prefix's SHAPE is
+read from every declared step and only its duration from the steps that measured
+above zero, because GitHub's one-second step granularity otherwise turns
+sub-second jitter into a change of signature.
+
+Its neutrality model is deliberately NOT the cluster floor: the projected
+consolidated job (`max(setup_p50) + max(useful_p50)`, tasks run concurrently
+inside it) is compared against the tallest job that REMAINS after the
+consolidation — a floor the group's own members help define would measure the fix
+against something the fix removes, and silenced the pattern on its own motivating
+shape. The certificate's `proof` token stays `below_cluster_floor` (shared with
+OPT65 as the dispatch key) and is historical for OPT77; `verify_report.py`'s
+`_opt77_consolidation_rederived` arm re-derives the saving, the margin, the
+grouping (each job's own stamped prefix must equal the credited shared one) and
+the eligible set the tallest-remaining job was chosen from. Like OPT65 it claims
+no speedup (`wall_clock_p50_s=0`, `realization=none`), and it shares
+`_billed_job_runner` and `_tier2_scope_event` with it.
+
+OPT77 and OPT80 each also keep an explicit list of the candidates they measured
+but could NOT decide — `opt77_withheld_candidates` (a formed group that exited on
+anything outside `_OPT77_VERDICT_GATES`) and `opt80_withheld_candidates` (a
+checkout with a measured tail that exited unresolved, outside
+`_OPT80_VERDICT_GATES`; after the log probe, only when the unread, unfetched or
+undecided tail runs could still have supplied the missing proof, named by their
+commonest reason). The per-gate tallies (`opt77_withheld_by_gate`,
+`opt80_withheld_by_gate`) are for maintainers; these lists reach the reader.
+
+The held-back disclosure is ONE mechanism shared by OPT77, OPT79 and OPT80.
+`blocking_path._WITHHELD_ROWS` maps each pattern's findings-doc key to its Data
+sources row label, its counted noun and its "Used for" cell, and
+`_withheld_candidates_line` builds the same sentence for all three:
+"N candidate … held back (<jobs>): <reason>." — the entries distinct and sorted,
+workflow-qualified as `<workflow.yml> / <job>` when two workflows share a job
+name (an OPT77 entry is the whole group), at most five then ", and K more", every
+repo-controlled name escaped for the table; the reason a plain-English phrase for
+the commonest gate, ties alphabetical. A pattern contributes only its key, its
+row text and its gate→phrase table (registered in `_WITHHELD_PHRASES_BY_KEY`),
+never its own row builder. The phrase tables (`_OPT77_WITHHOLD_PHRASES`,
+`_OPT79_HELD_BACK_REASONS`, `_OPT80_WITHHOLD_PHRASES`) map EVERY withhold gate
+their collector can record, and
+a test enumerates those gates from the detectors' source so a new gate cannot
+ship without a phrase. `verify_report.py`'s `check_coverage_disclosed` carries
+its own copy of the tables (pinned equal by a coupling test) and re-derives the
+whole line — count, jobs, reason — from the findings document, failing a report
+that omits the row, misstates any part of it, prints a gate name instead of a
+phrase, or carries a row with nothing behind it; a recorded gate with no phrase
+fails closed. A group that is the whole workflow (`group_is_the_whole_workflow`,
+no job outside it) is a verdict, not a withhold, and is never listed. The three
+files name the keys as constants a coupling test pins equal.
+
+OPT80 (checkout stalls on the tail) is the third measured Tier-2 lever, and the
+first whose admission rests on a LOG rather than on a timing alone. It measures
+one step's distribution across the sample — the checkout step, identified from
+the workflow YAML (directly `uses: actions/checkout@*`, or a local composite
+whose body does, read with a transitive local-action walk mirroring OPT76's; an
+unreadable or self-referential action fails closed) and never from its timing, because one-second step granularity makes a warm checkout
+measure 0s and a timing-based search would drop that run and inflate the p50.
+A tail is `p95 >= max(3 x p50, p50 + 30s)` with at least two runs at or above the
+threshold; only THEN are logs fetched, for the tail runs only, newest-first,
+bounded by `_OPT80_LOG_PROBE_MAX` — a job with no tail costs no gh call. The
+finding exists only if at least two of those logs show the transfer standing
+still — a gap of >= 20s between two consecutive `Receiving objects: N%` lines at
+the SAME N below 100, with both bracketing lines quoted verbatim, and only inside
+the checkout step's own time window. A log is split on newlines only, and each
+record split again on the carriage returns git writes its progress animation
+with, so an advancing transfer cannot masquerade as a stalled one.
+
+A stall is progress that STOPPED, not progress that had not started. The quiet
+before the first `remote:` line, the quiet across pack enumeration, and two
+receiving lines whose percentage advanced are all a LARGE REPOSITORY (OPT28's
+lever) and are withheld under `tail_pause_was_advancing_or_pre_transfer`; a pause
+at 100% is the runner writing the pack to disk and is withheld under
+`tail_pause_was_after_the_transfer_completed`. The large-repository shapes would
+also be aborted by the low-speed timeout this pattern recommends, so reporting
+them would hand the reader a fix that reds their CI.
+
+That log gate is the whole reason the pattern is admissible where OPT49 was cut:
+OPT49 read a CAUSE ("uncached") out of a DURATION. OPT80 rejects in both
+directions — a tail whose logs show a smooth fetch is withheld
+(`tail_without_log_gap`), and no log is fetched for a job with no tail, so a gap
+alone can never produce a finding. Every "no proof" case is counted apart, and
+every DISTINCT one across the probed runs is counted rather than only the most
+common, because progress switched off (`log_carries_no_progress_vocabulary`) and a log
+lost to retention (`tail_run_log_unavailable`) say nothing about the repository
+while a smooth fetch does. Log text is untrusted: only the closed
+progress vocabulary is read, and a quoted line carrying a credential shape drops
+that run's proof rather than being masked — withholding the finding outright if
+that leaves fewer than the two proofs the gate requires.
+
+Sizing is the tail-excess model — `mean - p50` of the checkout step, scaled by
+the job's own observed run frequency (`_effective_volume`) — never the full p95
+and never the whole step. `wall_clock_p50_s` is 0 by construction: the median
+run has no stall, so capping the tail cannot move the p50 merge gate; the tail
+runs' own improvement is bounded above by the longest observed pause, stamped
+(`tail_run_longest_pause_s`, with `on_critical_path`), named in the rendered
+evidence and deliberately left uncredited rather than rendered as a p50 saving. Its certificate carries its own `proof` token,
+`checkout_tail_excess`, and `verify_report.py`'s
+`_opt80_checkout_stall_rederived` arm recomputes the distribution, the tail
+threshold, which runs were tail runs, each pause's seconds from the quoted
+lines' own timestamps, and the credited minutes — bounding every count against
+the sampled occurrences. Every withhold increments
+`findings_doc["opt80_withheld_by_gate"]`, the same visible-zero discipline OPT77
+carries.
+
+OPT79 (a cache that costs more than it saves) is a measured Tier-2 bill lever
+(alongside OPT64, OPT65, OPT77 and OPT80). It reads job LOGS during collection
+without `--with-logs`; the cache-evidence and push-probe logs are already read
+under `--with-logs`, so what is new is that this probe needs no flag.
+For a job whose workflow file declares exactly one cache-restore step
+(`actions/cache`, `actions/cache/restore`, or an `owner/setup-*` action with
+its cache input set; caches on by default — `setup-go` v4+ unless `cache:
+false`, `setup-uv` v5+ via `enable-cache`, and self-caching actions such as
+`Swatinem/rust-cache` or `setup-gradle` (`_OPT79_OTHER_CACHE_USES_RE`) — count
+toward the "exactly one") that is saved by its own post phase, names a known
+package store, and is followed by a recognised install of the same ecosystem
+with no unrecognised `run:` step in between, it classifies the sampled occurrences
+HIT or MISS from the verbatim cache line — the `_CACHE_HIT_RE` / `_CACHE_MISS_RE`
+the rest of the cache family reads, plus `_OPT79_EXTRA_MISS_RE` /
+`_OPT79_EXTRA_HIT_RE` for the wordings those two cannot match: the `setup-*`
+family's own miss line (`<package manager> cache is not found`) and
+`astral-sh/setup-uv`'s pair. Both extras are kept OPT79-local so the eight other
+cache patterns reading the shared matcher are unaffected.
+
+`actions/setup-node` v5+ with no (or an empty) `cache:` input caches AUTOMATICALLY when the
+repo-root `package.json` names the package manager, so whether such a job has
+one cache or two is a fact about that file, not the YAML.
+`_opt79_resolve_package_json` reads it ONCE per repo, and only when
+`_opt79_package_json_needed` finds a job in a sampled workflow whose cache count depends on it,
+from the verified `--root` checkout first and otherwise with one
+`contents/package.json` call — the same sources, in the same order, as
+`_fetch_workflow_docs` — and the parsed object is passed to BOTH the plan and the
+detector, so they share one answer. `_opt79_setup_node_auto_cache` mirrors
+setup-node's `getNameFromPackageManagerField` per major: v5 reads the top-level
+`packageManager` for npm / yarn / pnpm (`^(?:\^)?(npm|yarn|pnpm)@`); v6+ read
+`devEngines.packageManager` then `packageManager` for npm only
+(`^(\^)?npm(@.*)?$`); a SHA or branch ref (`_opt79_ref_major` accepts only a
+version tag, so a SHA that starts with digits is not a major) is decided only
+when both rules agree. `package-manager-cache` is on only when empty or `true`, as in setup-node.
+On → a real cache (priced like any other, stamped `setup_node_auto_cache` so the
+recipe names `package-manager-cache: false`); off → not a cache; unknown (file
+missing / 404 / fetch failed / invalid JSON / not an object; no checkout before
+the setup step, or a checkout into a `path:` or of another `repository:`, which
+`_opt79_checkout_state` tracks; a SHA whose rules disagree) → fail closed as
+`setup_action_cache_default_depends_on_repository_files`. The read is stamped
+in `data_sources.setup_node_package_json` as `{needed, source, readable}`.
+
+That scan is SCOPED to the restore step's own `##[group]Run <step>` … block,
+which ends ONLY at the next `##[group]Run ` or `##[group]Post ` header; the
+action's inner groups and every `##[endgroup]` are skipped (`actions/cache`
+prints its hit/miss line after closing its own group). It has to be: Turborepo prints `cache miss, executing <task>`, Gradle prints
+`Build cache miss for task …` and buildx prints its own, all matched by
+`_CACHE_MISS_RE` and all in the TEST step's output. Read unscoped, every genuine
+cache HIT in a JavaScript monorepo classified as a two-cache job and was
+discarded — the lever was deadest exactly where `node_modules` is largest. Each
+per-run row stamps `log_line_group`, and the verifier refuses a row whose group
+is not the restore step. A log with no such group withholds the occurrence.
+
+Inside that group, a log showing both a miss and a hit line is excluded, never
+guessed, in either order (`run_log_shows_both_a_hit_and_a_miss_line`). A
+`restore-keys` fallback prints no miss line — the `@actions/cache` toolkit prints
+`Cache hit for restore-key: <key>` before the action's `Cache restored from key:`
+— so `_opt79_classify_log` returns the `partial_hit` verdict on that toolkit
+line, when the restored key (read from whichever line carries it) differs from
+the echoed primary `key:`, or when the post step saved a new cache; it is not a
+clean hit and is excluded (`run_log_shows_a_partial_restore_keys_hit`). Partial
+and two-verdict runs stay in the hit share's denominator
+(`hits / (hits + misses + ambiguous)`), so the minutes are priced on the share
+of runs that took the exact-hit path. Only successful job runs are
+classified (`occurrence_did_not_succeed` otherwise: a failed or cancelled run
+also skips the post save); a skipped occurrence is `occurrence_was_skipped`, and
+a block step whose timestamps are absent or unparseable withholds its occurrence
+as `step_timestamps_unparseable_in_this_occurrence`. An occurrence whose log was
+never fetched is counted as unread rather than folded into a population;
+an occurrence past the per-job 8-log cap is tallied
+`beyond_the_per_job_log_probe_cap`, not as unread. When
+unread occurrences leave either population short the withhold says
+`population_truncated_by_unread_logs` rather than blaming a thin sample; runs
+that were read and then set aside (no restore group, no cache line, two
+verdicts, a partial restore, another runner, a block that did not measure) do
+the same as `population_truncated_by_excluded_runs`.
+
+The install step is recognised from what it RUNS, never from its display name —
+so the near-universal `name: Install dependencies` spelling is found, and a step
+NAMED `npm ci` that runs `npm run build` is not priced as the install. A `run:`
+block whose every line is not an install (`pip install -e .` then `pytest -q`)
+withholds rather than charging the test suite to both sides. The display name is
+still what the step's duration is looked up by.
+
+Among the shape gates that answer from the workflow YAML alone (so those jobs
+cost no log fetch): a SEPARATE `actions/cache/save` step withholds
+(`cache_is_saved_by_a_separate_step` — its save is not the restore's post phase,
+so the block cannot measure it); an unrecognised `run:` step between the cache
+and the install withholds (`first_step_after_cache_is_not_a_recognised_install`
+— it may be the real install); a cache naming no known package store withholds
+(`cache_path_names_no_known_package_store`); an install whose ecosystem does not
+match the cache withholds (`install_package_manager_does_not_match_cache`); and
+more than one cache, counting the on-by-default and self-caching ones, withholds.
+
+Three things keep it honest. The step set comes from the YAML and a step the run
+RENDERED but did not time counts as 0s, so GitHub's one-second granularity cannot
+change which steps are being compared between runs. "Rendered sub-second" and
+"not there at all" are kept apart, because conflating them fails OPEN on the term
+that matters most: on `actions/cache` the save runs on a MISS, so a post step
+that never completed, or a constructed `Post <name>` that matched nothing GitHub
+rendered, would drop the biggest miss-side term and MANUFACTURE the excess. The
+first withholds the occurrence, the second withholds the job, and
+`actions/cache/restore` — which has no post phase — stamps `post_step: null`
+rather than inventing a label (that reading holds only because a separate
+`actions/cache/save` step withholds earlier, so no unmeasured save can exist). And the CREDIT gate requires the job's
+p50 to sit strictly BELOW the workflow's cluster floor, which is what makes
+`wall_clock_p50_s=0` literally true here — unlike OPT77, the
+`below_cluster_floor` token is not historical for OPT79, it is the proof. A
+net-negative cache on the long pole is a real wall-clock lever that needs the
+floor cascade the spine owns, so it is not PRICED here — but it is measured and
+reported. The floor does NOT gate `_opt79_candidates` (which is also what
+`_opt79_log_plan` selects from): gating there meant such a job's logs
+were never fetched and its cache never classified: not a suppressed measurement,
+an absent one, and one no reader could distinguish from a repository with no such
+cache. The candidate merely records `below_cluster_floor`; the floor gates
+CREDITING, in `_detect_opt79_net_negative_cache`. The detector measures both
+populations as usual and then splits:
+below the floor → the credited finding described above; at or above it → a row on
+`findings_doc[_OPT79_UNCREDITED_DOC_KEY]`, which `blocking_path`'s
+`_opt79_uncredited_block` renders as one numberless line beside
+`_dropped_unprovable_banner`.
+
+WHICH job is at or above the floor decides what that line may say. The floor is
+the SECOND-ranked job's p50, so "not strictly below it" spans everything from
+second place upwards, and only the workflow's long pole — on a workflow that can
+gate a PR — actually carries the merge wait. The row therefore stamps
+`long_pole_job`, `long_pole_p50_s`, `job_p50_s`, `floor_p50_s` and
+`on_critical_path`, and the renderer says "this workflow's slowest job, so the
+saving is on the merge wait" ONLY when `on_critical_path` is true. For every
+other uncredited job it says the job is at or above the workflow's second-slowest
+job, so this audit cannot prove that shrinking it leaves the merge gate
+unchanged. A schedule-only workflow is never told it has a merge wait at all.
+The docs take that same conservative framing: at or above the floor and below
+the pole is uncredited because no neutrality argument for the merge gate exists,
+not merely because it has not been sized.
+
+Uncredited rows are not findings — no `runner_min_saving`, no
+`wall_clock_p50_s`, no certificate, no Tier-2 row, no contribution to any total.
+They are built by the SAME `_opt79_stamp` builder as the credited block (one
+measurement, two outputs, one contract), so they carry `per_run` and every
+multiplier, and `verify_report.py`'s `check_opt79_uncredited_rows_rederived`
+re-derives them row by row with only the credited-minutes and neutrality branches
+skipped. That check is top-level rather than part of the Tier-2 pass, because a
+repository whose only OPT79 result is an uncredited row has no Tier-2 stamps for
+that pass to run on.
+
+Pricing them is the follow-up: pass the measured excess into `size_wall_clock`
+instead of hard-coding `wall_clock_p50_s=0` and let CAP 1 (§5) cap it at
+`long_pole_p50 - floor_p50`, the way it caps every other on-pole finding. The
+at-or-above-the-floor-but-below-the-pole case is part of that follow-up and is
+the easier half, but it still needs a neutrality argument for the merge gate
+before it can be credited; this version proves none.
+
+Its gh cost is a capped log probe plus at most one `contents/package.json` read
+per repo (only when a setup-node v5+ automatic cache decides a job's cache count
+and the checkout cannot serve the file). The log probe is run during
+collection WITHOUT `--with-logs`,
+(`_OPT79_LOG_PROBE_MAX = 8` occurrences per candidate job,
+`_OPT79_MAX_CANDIDATE_JOBS = 2` jobs per workflow, candidates ranked by job p50 —
+a PROXY for what a cache can cost, not a measurement of it — and
+`_OPT79_REPO_LOG_BUDGET = 24` across the whole repo; the first two are per
+workflow, so without the third a thirty-workflow monorepo would multiply them
+into hundreds of fetches), planned across every workflow up front by
+`_opt79_log_plan` and fanned out in one `_prefetch_text` wave before the detector
+loop. `_opt79_trim_repo_probe_plan` applies the repo-wide ceiling by SORTING the
+whole plan on candidate job p50 before slicing, so the budget is spent on the
+costliest candidates in the repository rather than on whichever workflow file was
+walked first; every occurrence it cuts is counted under
+`beyond_the_repo_wide_log_budget`, and the cut jobs' remaining occurrences count
+under `occurrence_has_no_captured_log` rather than looking like a thin hit/miss
+population. `_opt79_candidates` is the ONE selector shared by the plan and the
+detector, so the two can never disagree about which jobs are ELIGIBLE (which of
+those actually got logs is the budget's business, and is counted).
+
+`verify_report.py`'s `_opt79_net_negative_cache_rederived` arm recomputes every
+per-run block from its three parts, re-reads each row's quoted line against its
+stamped verdict AND against the log group it was read in, and re-derives both
+medians, the waste, the floor, the hit share, the effective volume, the credited
+minutes and the margin. Its restatements of the engine are of two kinds, and the
+tests say which: the stamp-key tuple, the four numeric thresholds and the shared
+cache tail fraction are asserted IDENTICAL to the engine's; the hit/miss regexes
+are independent re-readings and are only spot-checked line by line.
+
+Every gate that withheld is counted into `findings_doc["opt79_withheld_by_gate"]`
+and logged at DEBUG (a credit-eligible job on a workflow with no measured volume
+is `no_monthly_volume`, counted after it is measured). A candidate whose logs were
+probed and which then exits on anything but a verdict (`_OPT79_VERDICT_GATES`:
+measured healthy, or hitting too rarely) is also appended to
+`findings_doc["opt79_withheld_candidates"]` as `{workflow_file, job, gate}`, and
+so is a job whose YAML showed a cache and which fell out BEFORE any log was read
+(`_OPT79_EARLY_HELD_BACK_GATES`: two caches, unreadable `package.json`, a cache
+that does not serve the install, an unrecognised first step, a separate save step,
+an unpriceable runner, the per-workflow probe budget). A job with no cache at all
+is not a candidate. `blocking_path` renders the list through the SHARED
+held-back row builder described under OPT77 above, as the `cache hit/miss
+verdicts` Data sources row ("N candidate cache(s) held back (<jobs>): <reason>.").
+The reason is a module-level dict, gate to plain-English phrase
+(`_OPT79_HELD_BACK_REASONS`, registered in `_WITHHELD_PHRASES_BY_KEY`, with a
+standalone copy in `verify_report.py`), covering
+`_OPT79_HELD_BACK_GATES`; a test enumerates the gates from the source so a new one
+cannot ship without a phrase. `verify_report.py` re-derives the whole sentence
+(count, job list, reason) — the same re-derivation it runs for OPT77 and OPT80 —
+and FAILS on a gate with no phrase, so a held-back cache
+is not indistinguishable from no cache and a code is never printed. The probe's own cost is stamped ONCE, in
+`data_sources.cache_probe_logs` as `{planned, probed, returned, budget}` — the
+row the report renders and the verifier re-derives; when `planned` exceeds
+`probed` the rendered cell says so. And when probes were planned but NOTHING came
+back, OPT79 is recorded in `data_sources.detectors_skipped` for the affected
+workflows, so an unevaluated detector is named rather than reading as a detector
+that found nothing.
+
 
 OPT57 now has a measured timeout-default-burn upgrade. A missing
 `timeout-minutes` key is only the structural gate: `collect_runs.py` emits a
@@ -1305,7 +1642,9 @@ to `CASCADE` + its test; it then flows through every finding.
   - per-step durations (from the job JSON, no extra API calls);
   - trigger events that actually fired each workflow (`run.event`, collected
     into `events_by_wf`);
-  - cache hit/miss and install/build log lines (`--with-logs`).
+  - cache hit/miss and install/build log lines (`--with-logs` for the cache
+    evidence and push-probe logs; OPT79's own bounded probe of up to 24 job logs
+    is read during collection without it).
 - **Derived** (computed from the measurements):
   - `long_pole_p50` (max job p50) and `floor_p50` (second-tallest) per workflow;
   - the concurrency sets (`_concurrent_workflows`: which workflows share the
@@ -1380,7 +1719,7 @@ family):
 |---|---|---|---|
 | **derive** | OPT45 | `hit_rate × Σ(measured billable)` | `measured_spine_billable` |
 | **clamp** | OPT73 | `min(modeled, Σ(measured billable))` | `measured_spine_clamped` (or `measured_spine_billable` when already within) |
-| **not_spine_derivable** (the EXPLICIT whitelist) | the measured run-elimination detectors (OPT46/47/64/65 — basis is the eliminated-runs slice, not per-job billable); the modeled-static patterns (`direct` / `runner-min-only`, disclosed as modeled in the report's sized-of-total ratio); the other structural step-decomposition levers (OPT70/71/72/74/75, per-job step basis) | retained, with the reason recorded in `runner_min_door_note` | `not_spine_derivable` |
+| **not_spine_derivable** (the EXPLICIT whitelist) | the measured run-elimination detectors (OPT46/47/64/65 — basis is the eliminated-runs slice, not per-job billable); the measured setup-prefix detector (OPT77 — basis is the per-job leading setup prefix); the measured cache-block detector (OPT79 — basis is one job's restore + install + post-save timings split by the run log's own cache hit/miss line); the measured checkout tail-excess detector (OPT80 — basis is one step's mean-minus-p50 across the sample); the modeled-static patterns (`direct` / `runner-min-only`, disclosed as modeled in the report's sized-of-total ratio); the other structural step-decomposition levers (OPT70/71/72/74/75, per-job step basis) | retained, with the reason recorded in `runner_min_door_note` | `not_spine_derivable` |
 
 The whitelist is **visible, not a silent bypass**: a reasoned entry per family,
 and tightening the modeled/structural families from whitelist → clamp is tracked
@@ -1592,8 +1931,11 @@ before the timestamp.
   same finding set instead of re-sampling live history.
 
 gh usage is frugal: one workflow-list, one total-count per workflow, one
-job-list per sampled run (default 8), and one log per hottest cache job under
-`--with-logs` - no per-step API calls (step timings come from the job JSON).
+job-list per sampled run (default 8), one log per hottest cache job under
+`--with-logs`, up to 24 job logs for the OPT79 net-negative-cache probe (one
+prefetch wave, no `--with-logs` needed), and - only for a job that has already cleared every cheap OPT80
+gate - up to four job logs for that job's tail runs (`_OPT80_LOG_PROBE_MAX`),
+newest-first. No per-step API calls (step timings come from the job JSON).
 *How* those calls are issued (one shared pool, bounded prefetch waves, a token-wide
 rate governor) is §2.2; it changes the wall-clock of the pass, never its contents.
 
@@ -1762,8 +2104,9 @@ Tests live under `tests/` and are picked up by the repo-root `pyproject.toml`'s
 
 - **Detector unit tests** (`test_scan_detectors.py`, ~40 cases) - positive and
   **negative** (suppression) cases for the static detectors: OPT1/2/5/9/14/16/
-  18/21/27/28/29/31/33/36/39/62/63, including load-bearing carve-outs (OPT28
-  git-history jobs and local composite actions, OPT33 aggregator/change-detection
+  18/21/27/28/29/31/33/36/39/62/63/76, including load-bearing carve-outs (OPT28
+  git-history jobs and local composite actions, OPT76 declared-payload reads and
+  transitively-resolved local composite actions, OPT33 aggregator/change-detection
   suppression, and the shared **activation-fidelity** gate — a `pull_request:
   types:`-gated or job-`if:` label/activity-gated job is not "every PR", so
   OPT33/39/40 suppress it: `_pr_trigger_runs_every_pr`/`_job_runs_on_every_pr`).
@@ -1897,16 +2240,47 @@ bounds the gaps list originally named - three implemented, one deliberately not:
   `run.event`; required-check gating would add a usually-blank, contentious cap
   on top. Left out on purpose rather than shipped hollow.
 
+### Joint scenarios for two concurrent checks — contract present, nothing feeds it
+
+`scripts/joint_scenario.py` holds a data contract and a pure calculator for
+sizing **two findings on two different concurrent checks together**. It exists
+because the per-finding stamps cannot answer that question: with checks at 300s
+and 299s, cutting 100s off either alone moves the gate by 1s or 0s while doing
+both moves it by 100s, and `wall_clock_p50_s` is an already-capped merge-wait
+saving rather than a post-fix duration, so subtracting the stamps yields 1s.
+
+**It is imported by nothing.** No stage calls it, it has no `main()`, and no
+report renders a joint block. That is deliberate, not an oversight: the module's
+`MISSING_PRODUCER_EVIDENCE` tuple names the six things a producer would have to
+stamp first (per-observation durations for the whole gating set, stamped
+concurrency validation, per-observation local reductions, affected-step
+identity, stable matrix-leg identity, and a local-runtime-only certificate),
+none of which the engine stamps today. `load_inputs` on a current findings
+artifact returns `contract_inputs_absent` rather than reconstructing a scenario
+out of the aggregate stamps that happen to be present.
+
+The methodology is `references/wall-clock-methodology.md` §8; the tests are
+`tests/test_joint_sizing.py`, which pin the numbers and every rejection code.
+The refusal vocabulary is closed: `REJECTION_CODES` exports it, a rejection
+built with a code outside it raises, and the suite asserts the exported set is
+exactly the set of codes the module can actually produce.
+**The next step that would change this status is a producer**, not more
+calculator: until one exists the module stays inert, and it should be either
+wired or removed rather than left to become archaeology.
+
 ## 11. The structural / critical-path track
 
-The hygiene/data-driven catalog (OPT1–OPT69) is mostly **declarative** -
+The hygiene/data-driven catalog (OPT1–OPT69, OPT76, OPT77, OPT79, OPT80) is mostly **declarative** -
 static findings are locally-checkable YAML defects, while measured Tier-2 rows
 come from run history. Its blind spot: on real repos the merge is
 gated by a check that is *working as intended* and simply slow, with no
 catalog match. The old catalog-spine report used to dead-end there ("inherent
-cost, outside this catalog"). The **structural track** (catalog category 14, OPT70–OPT75,
+cost, outside this catalog"). The **structural track** (catalog category 14, OPT70–OPT75 plus OPT78,
 `class: structural`) is a **second finding class that is not catalog-bound** —
 it is routed from the measured critical path instead of matched against YAML.
+OPT70–OPT75 are routed by the deterministic router described below; **OPT78** is
+routed by the drill-time `vitest-isolate-pool` leaf detector (§12.3) and is
+reported by `scan.py` as having no critical-path router.
 
 ### Where it lives
 
@@ -1950,7 +2324,7 @@ it is routed from the measured critical path instead of matched against YAML.
   (dominant step/category, redundancy ratio, required-status, shared substep)
   annotate the pole they came from; the catalog OPT70–OPT75 findings are
   therefore **excluded** from the off-path "Also noticed" appendix
-  (`_also_noticed_block`, which is hygiene OPT1–OPT69 only) since the pole already
+  (`_also_noticed_block`, which is hygiene OPT1–OPT69/OPT76/OPT77/OPT79/OPT80 only) since the pole already
   represents them. Like every pole, a structural lever carries an agent prompt
   rather than a prescribed fix; for a HIGH-risk lever (e.g. OPT70 scope-to-
   changed) the prompt's failure-mode/guard section tells the agent to state the
@@ -1985,10 +2359,14 @@ non-PR-gating drop (`_dropped_non_pr`) and **before** `pr_checks_tuple` is sorte
 **`needs:`-reachability** over the workflow job graph.
 
 The graph itself is repo-agnostic: `scan.py`'s `_build_workflow_job_graph` emits
-`workflow_job_graph = {wf_file: {job_id: {name, needs:[job_id], reusable, timeout_minutes}}}`
-straight from the YAML (matrix `${{...}}` placeholders left in `name` for the consumer
-to regex-match; `reusable` flags a job with a `uses:` reusable-workflow call;
-`timeout_minutes` records whether the job declares `timeout-minutes`). `collect_runs`
+`workflow_job_graph = {wf_file: {job_id: {name, needs:[job_id], reusable, matrix,
+timeout_minutes, continue_on_error}}}` straight from the YAML (matrix `${{...}}`
+placeholders left in `name` for the consumer to regex-match; `reusable` flags a job with a
+`uses:` reusable-workflow call; `matrix` flags a `strategy.matrix` job, whose check-run
+names carry an appended `(leg…)`; `timeout_minutes` records whether the job declares
+`timeout-minutes`; `continue_on_error` records a LITERAL job-level `continue-on-error:
+true`, read through a loader that resolves booleans GitHub's way rather than PyYAML's, so
+`continue-on-error: yes` — a string to GitHub — is not reported as advisory). `collect_runs`
 consumes it:
 
 - **`_required_reachable_checks(candidates, req_names, job_graph, crit_by_wf)`** — returns
@@ -2298,11 +2676,36 @@ The rule composes with the existing rare-demotion (§12.2 `_ms_freq_demoted`) an
 ### 12.2 Representative-run selection — nearest-P50 (`_persist_pole_logs`)
 
 The drilled run is the **qualifying instance whose duration is closest to the job
-P50** (`job_p50_s`, else the check `p50_s`). *Qualifying* = duration ≥ 0.5×the
-slowest sampled instance, which drops short-circuit / self-skipped no-ops (a gated
-job like `changed-tests` that does nothing on most PRs) so they can't be picked.
-Nearest-P50 (not the slowest, not the high-skewed qualifying median) makes the
-drill **reconcile with the headline** instead of overstating it.
+P50** (`job_p50_s`, else the check `p50_s`). *Qualifying* = duration ≥ a floor of
+half the median sampled duration (with an absolute `_NOOP_FLOOR_S` backstop), which
+drops short-circuit / self-skipped no-ops (a gated job like `changed-tests` that
+does nothing on most PRs) so they can't be picked. Nearest-P50 (not the slowest, not
+the high-skewed qualifying median) makes the drill **reconcile with the headline**
+instead of overstating it.
+
+Everything the drill derives — the floor, the qualifying set, the representative
+run, its step timeline, the cross-run sample and the log handed to the fixing
+agent — comes from **one pool, scoped to the headline runner before the floor is
+computed**. A job whose sampled runs span more than one **runner label** inside one
+window has a P50 scoped to the label it runs on most (§ `_critical_path`), so an
+unscoped pool mixes populations the headline never measured with the one it did.
+The floor would then be set by the wrong machines: a slower non-headline population
+drags the median up, and genuine headline runs are discarded as "no-ops". Scoping
+first is what makes the drill's every figure describe the runs the headline
+reports. The scope falls back to the unfiltered pool when no headline label is
+recorded, or when filtering would empty the pool (losing the drill is worse than
+losing the runner scope); both fallbacks are traced at DEBUG.
+
+The relative floor is additionally **clamped to the stamped typical time**
+(`max(min(0.5 × median, stamped), _NOOP_FLOOR_S)`). Read that bound exactly: it
+stops the floor rising ABOVE the stamped typical time, so the run nearest the
+headline P50 always stays eligible and the drill can never reconcile with
+*nothing*. It does NOT bound the floor below the population's minimum — on the
+unfiltered fallback, headline runs BELOW the stamped P50 can still be cut (a
+mixed pool of 200/220/240/260/280 plus six at 2000 gives a floor of 240, dropping
+the 200 and 220). Only scoping the pool first keeps the whole population. The
+absolute backstop still wins over the clamp, so a job whose own typical time *is*
+a self-skip cannot pull no-op instances back in.
 
 The level-1 bar is the **check-run** gate time (`p50_s`); the timeline is the
 **job** clock (`job_p50_s`). They differ — the job includes the runner
@@ -2523,7 +2926,7 @@ contradiction.
 ### 12.3 The leaf detectors and the load-bearing magnitude (`_parse_log`)
 
 `blocking_path._parse_log` is the single source of truth for root-cause detection —
-five regex-over-tool-output detectors, each returning `{fix_key, unit_label, deeper:
+the regex-over-tool-output detectors below, each returning `{fix_key, unit_label, deeper:
 [levels], evidence, magnitude}` (`fix_key` names the root-cause family + selects the
 agent prompt in `_PROMPTS`; it is **not** a prescribed fix):
 
@@ -2531,7 +2934,8 @@ agent prompt in `_PROMPTS`; it is **not** a prescribed fix):
 | --- | --- | --- |
 | `prisma-migrate-once` | `db push --force-reset` per test group | DB-migration share of the slowest test file |
 | `vitest-v8-coverage` | istanbul coverage instruments every file | compile+instrument share of test work |
-| `vitest-isolate-pool` | per-file isolation re-pays the import cost | import share of the vitest run |
+| `vitest-isolate-pool` | per-file isolation re-pays the import cost (OPT78, HIGH risk). Gated on `scan.py`'s `test_runner_isolation` config fact — whose `verdict` field must read `isolation_on` — so every `_parse_log` caller (render, `_gap_poles`, `_persist_pole_logs` / `_magnitude_sample`) must pass that block; a guard test pins that every call site does | import share of the vitest run |
+| `vitest-import-bound` | the same import-bound split when OPT78 is WITHHELD (opted out, config not fully read, an unresolvable `isolate` value, a crashed config reader, vm pool): names the split and the withheld reason, forbids flipping isolation. Its config sentence travels as the leaf's `config_fact`, rendered outside the untrusted-log block | import share of the vitest run |
 | `turbo-remote-cache` | remote caching off / 0 cached → every package rebuilt | packages rebuilt (cache-miss %) |
 | `turbo-partial-cache` | caching ON but ≥40% rebuilt every run → unstable cache key (cache-key churn) | packages rebuilt despite caching (cache-miss %) |
 | `install-lifecycle-build` | a root `prepare`/`postinstall` lifecycle script runs a build DURING `<pm> install` — "work runs during install", not a cache miss | build wall run inside install (**seconds**) |
@@ -2591,8 +2995,10 @@ A cache-miss finding is born from ONE drilled run's log, and the drilled run is 
 slow-mode representative — so its miss rate is NOT evidence the cache is a broad wall-clock lever.
 For a cache leaf (`turbo-*`, `buildx-no-cache`, `install-lifecycle-build`), `_cache_distribution`
 stamps a per-pole **`cache_dist`** onto `pr_critical_path.poles[]`: the miss rate across the sampled
-runs, split PR vs push, with fork PRs excluded from the upstream median (a fork PR runs cold — it
-can't read the repo cache), plus a re-derivable **`verdict`** (`cold | churn | miss-tail |
+runs, split PR vs push, with fork PRs excluded from the upstream median (a fork PR gets no repo
+secrets, so a secrets-gated remote cache is unreachable to it, and it cannot restore an upstream
+feature branch's own scope — so it can run colder than upstream), plus a re-derivable
+**`verdict`** (`cold | churn | miss-tail |
 mostly-warm | insufficient`, `_cache_verdict`). The miss metric is always the per-run
 `cache_state.miss_pct` (read by `_cache_state_of_log` uniformly), NOT the leaf's magnitude (which is
 seconds for `install-lifecycle-build`).
@@ -2806,7 +3212,7 @@ order of preference:
 - [`SKILL.md`](SKILL.md) - the canonical contract (phases, admission gate,
   quality review).
 - [`references/optimization-patterns.md`](references/optimization-patterns.md) -
-  the 73-pattern catalog (METADATA + body per pattern); the source of truth for
+  the 78-pattern catalog (METADATA + body per pattern); the source of truth for
   detection and the report's TL;DR / pattern background.
 - [`references/wall-clock-methodology.md`](references/wall-clock-methodology.md)
   - critical-path / long-pole / cluster-floor model and the non-additive rule.

@@ -11,7 +11,120 @@ entries are dated (UTC). Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- ci-secure: `set +e; set -e; pytest -q` is recognised as a correctly wired
+  suite. Reading the restore by physical line left an empty slice where all
+  three share one line, failing a suite whose failure does end the job.
+  (2026-08-20)
+- ci-secure: printing the exit status no longer counts as re-raising it. An
+  `echo "rc=$?"` after a swallowed suite was read as a rescue and reported
+  the swallow as a pass. (2026-08-20)
+- ci-secure: `sec.gate.test-failure-fatal` matches the COMMAND a step runs,
+  not any occurrence of a tool's name on the line. An allowlisted name inside
+  an image tag, a process pattern, a directory, a filename, a message body or
+  an install argument — `docker pull ghcr.io/org/mypy:latest || true`,
+  `pkill -f karma || true`, `tar czf out.tgz .tox || true`,
+  `git checkout -- jest.config.js || true`,
+  `gh pr comment --body "eslint found 3 issues" || true`,
+  `npx playwright install --with-deps || true`, `npm i -D jest || true` —
+  was failing the check on repositories whose tests are perfectly fatal.
+  Interpreter runners and leading paths (`python -m pytest`,
+  `poetry run pytest`, `./mvnw test`) are still recognised. (2026-08-20)
+- ci-secure: `workflow_call` counts as a merge-gate trigger. A reusable
+  workflow is where a large repository usually keeps its suite, and out of
+  scope it left the denominator entirely rather than being judged.
+  (2026-08-20)
+- ci-secure: `|| exit 0` and `|| /bin/true` are recognised as the discards
+  they are; `|| exit 0` had been reported as a clean bill. (2026-08-20)
+- ci-secure: `sec.gate.test-failure-fatal` now judges only workflows that can
+  report a check on a pull request. A nightly `schedule` job or a
+  `workflow_dispatch`-only smoke run reports on no pull request, so a tolerant
+  `|| true` there is not the decorative merge gate the fact describes and is
+  no longer failed for one. (2026-08-20)
+- ci-secure: `sec.gate.test-failure-fatal` separates "nothing here to check"
+  from "nothing here this scan recognises". A repository whose only discarded
+  exit status sits on a command the allowlist cannot identify
+  (`bash ci/test.sh || true`) is now UNMEASURED with the steps named — a
+  coverage gap that stays in the denominator — instead of not-applicable,
+  which would have claimed no gap existed. (2026-08-20)
+- ci-secure: `set +e` and the suite written on one line (`set +e; pytest -q`)
+  is recognised as the same swallow as the two-line form; ordering the two by
+  line alone put them at one index and read it as a pass. (2026-08-20)
+- ci-secure: two more swallow shapes are recognised — `exit 0` followed by an
+  inline comment, and a one-line `npm test; exit 0` — and a `set -e` that
+  lands AFTER the suite already ran no longer counts as restoring its status.
+  (2026-08-20)
+- ci-secure: the trailing-`exit 0` swallow shape is now judged against the
+  step's effective shell. GitHub's default `run` shell carries errexit
+  (`bash -e {0}`), so a failing suite aborts the step before a trailing
+  `exit 0` is reached — flagging it was a false accusation against a job
+  that already fails. The arm now fires only where the discard is real:
+  `pwsh`, `powershell`, or `cmd`, declared on the step, the job or workflow
+  `defaults.run.shell`, or implied by a `windows-*` runner's `pwsh` default.
+  Every arm of the suite-command allowlist is also now pinned by a test, so
+  a dropped arm cannot silently flip a repository from fail to
+  not-applicable. (2026-08-20)
+- ci-secure: a check that does not apply is now disclosed in words on both
+  reader surfaces — a sentence in the report's hygiene section and a
+  `(1 not applicable)` note in the gate headline — so the count line can be
+  reconciled against the rows above it. (2026-08-20)
+- ci-secure: swallowed-suite evidence names the offending step by its `name:`
+  as well as its position, and reports `|| :` as `|| :` rather than as
+  `|| true`, so the string in the evidence is the string in the file.
+  (2026-08-20)
+- **2026-08-20** — **A test suite whose failure cannot fail its job is now a
+  config fact.** `sec.gate.test-failure-fatal` fails when a job that runs the
+  test or lint suite discards the suite's exit code — `|| true`, `|| :`,
+  `|| echo …`, a trailing `exit 0`, `set +e` with no later re-check, or
+  `continue-on-error: true` on the suite's own step or its job. It is the
+  sibling of `sec.required-checks.skippable`: that fact catches a required
+  check that reports green because it was SKIPPED, this one catches a check
+  that RAN and reports green whatever the tests did. Same consequence — the
+  merge gate is decorative — same reader, same fix. Scope is an ALLOWLIST of
+  recognised suite commands, so a `run:` block whose purpose the YAML cannot
+  establish is never failed, and `continue-on-error` on an upload, report, or
+  notification step (codecov, `upload-artifact`, `upload-sarif`, a webhook
+  curl) does not reach it, because a step is judged only by its own `run:`
+  line — that shape belongs to ci-speedup, and billing one configuration to
+  two engines would be a defect. A repository whose workflows run no suite at
+  all is NOT APPLICABLE, never a pass: it
+  leaves the denominator rather than earning a green for having no tests,
+  which is the shape ci-score settled on for the same question. The facts
+  block therefore gained a `not_applicable` list beside `unmeasured`, and
+  `applicable_count` now excludes a fact that does not apply — an unmeasured
+  fact is a coverage gap and stays in the count; a not-applicable one is not a
+  gap and does not. The report renders the not-applicable row rather than
+  dropping it, and SKILL.md's spoken close says it as itself — a row that
+  vanishes, or one folded into "all checks pass", reads as a pass. **The
+  config-fact aggregate this skill hands ci-advisor
+  changes shape**: nine facts instead of eight, so the blended CI Score's
+  security third moves for any repository that has a suite. What counts as
+  running the suite is read as a COMMAND, past any wrapper, interpreter,
+  leading path or shell keyword — `if ! pytest -q; then` and `for … do pytest`
+  run it, and missing them would drop the whole repository out of the fact's
+  denominator — while a here-doc body is text on its way to a file, so writing
+  a tolerant wrapper script is never read as swallowing a suite. Census row
+  and full scope statement in `references/security-facts.md`.
+
 ### Changed
+
+- **2026-08-25** — **The rejection record now accounts for every pattern id
+  the old catalog carried, and states the catalog's size correctly.**
+  `references/why-these-ten.md` is the one document that explains why each
+  pattern the scanner no longer ships was dropped, and three ids were missing
+  from it — untrusted-event trigger presence (P14.1), secret passed on the
+  command line (P14.21), and secrets accessible to jobs without environment
+  scoping (P14.4) — so a reader who met one of them in an older finding or
+  catalog reference had nothing defining it. Each now carries its rejection in
+  the document's own idiom. The opening line's arithmetic is corrected with
+  them: the pre-descope catalog held 27 patterns, of which nine of today's ten
+  survived and 18 were removed. It had been stated as 25 and then would have
+  been 28, both of which counted the tenth vector (P14.25) into a catalog it
+  was admitted a week after. The census guard now subtracts post-descope
+  admissions instead of deriving the historical size from every id the
+  document names, so it can fail on that error rather than restate it. No
+  detector, catalog entry or severity changes; the scanner is untouched.
 
 - **2026-08-20** — **Build provenance and artifact attestation now have a
   recorded verdict.** The rejection record in `references/why-these-ten.md`
@@ -27,6 +140,68 @@ entries are dated (UTC). Format loosely follows
   no detector, catalog entry, pattern id or count changes.
 
 ### Fixed
+
+- **2026-09-03** — **A required check produced by a matrix-templated job name
+  now resolves to its job.** `sec.required-checks.skippable` matched a job's
+  display name only when that name was literal. A job named `build shard
+  ${{ matrix.shard }}/4` with literal legs `[1, 2, 3, 4]` produces the required
+  checks `build shard 1/4` through `build shard 4/4`, and the resolver could
+  not map any of them back to the job that declares them: checks fully
+  determinable from the workflow YAML were reported as untraceable ("no job in
+  these workflows reports it") and the fact went UNMEASURED, so a repository
+  that shards a required job lost a security fact it could have been graded on.
+  Templated names are now rendered against the matrix's literal values through
+  the SAME enumeration that produces the `(…)` suffixes, and legs are read the
+  way GitHub substitutes them rather than the way Python prints them — a `true`
+  leg renders `true`, and a `null` leg renders nothing at all.
+
+  Both readings of a matrix job's contexts therefore share one set of refusals,
+  and each leaves the check UNTRACED and the fact UNMEASURED, because an
+  unknown must never render as a known negative:
+
+  - a matrix that cannot be enumerated — `fromJSON()` or any other computed
+    value, `include:`, a nested or non-list shape;
+  - a placeholder that is not a plain `matrix.<axis>` reference, and a `${{`
+    that is never closed (not a templated name at all, and it was letting a
+    matrix job stand in for the bare context GitHub never emits for it);
+  - an axis the name references that the matrix does not declare;
+  - a name with no literal LETTER anchoring it, whose rendering matching an
+    external app's check name is a coincidence. Punctuation was already refused
+    (`${{ matrix.a }}/${{ matrix.b }}` rendering `security/snyk`); underscores
+    and digits are refused with it, since `${{ matrix.os }}_${{ matrix.arch }}`
+    rendering a required `ubuntu_x64` is the same coincidence and a far more
+    ordinary job name. One literal letter still anchors, so `v${{ matrix.n }}`
+    binds;
+  - an EMPTY leg, which renders exactly what GitHub renders and thereby loses
+    the anchoring text the name was admitted on, and interior whitespace in a
+    leg or in the `name:`, which this scan normalises and GitHub does not;
+  - an `exclude:` this scan cannot read — a key naming no declared axis, a
+    computed value, or a value that is not a scalar. All three were silent
+    no-ops, and an exclude that fails to remove leaves EXTRA renderings, the
+    dangerous direction;
+  - a rendering a genuine reusable caller in these files also claims. That
+    refusal keys on the competing CLAIM, not on the template beginning with a
+    placeholder: position was only ever a proxy, and one literal word in front
+    (`Nightly ${{ matrix.variant }} / build` against a `Nightly Suite` caller)
+    walked straight past it. The competitor lookup renders a caller's own
+    templated `name:` through the same enumeration, and a caller it cannot
+    render competes for the names its literal text could still produce — not,
+    as it first did, for every name in the repository, which switched the whole
+    resolution off for any repository holding one `deploy ${{ matrix.env }}`
+    over a computed matrix. A job is no longer its own competitor.
+
+  Every one of those refusals now says which one it was. They shared a single
+  sentence — "a job name templated over a matrix this scan cannot enumerate" —
+  which is false for most of them, since in a degenerate name, a whitespace
+  rewrite, a misspelled axis or a competing reusable call the matrix enumerates
+  perfectly well. The evidence names the job that nearly produced the check and
+  why it did not, and names only a job whose literal text could have produced
+  that context.
+
+  Because the fact is SCORED, `security_score` changes on any repository with
+  matrix-templated required checks: the fact enters the scored denominator
+  where it used to sit out, as a PASS where the newly traced producers always
+  run and as a FAIL — lowering the score — where one of them can skip.
 
 - **2026-08-19** — **A deferred file that cannot be read is now a stop, not an
   improvisation.** SKILL.md defers load-bearing procedure to reference files in

@@ -34,11 +34,11 @@ Checkout · 6. Conditional Execution · 7. Trigger and Scope · 8. Release Workf
 12. Build Caching (Language-Agnostic) · 13. Hidden Failures and Dead Config ·
 14. Structural / Critical-Path Levers
 
-- **Category 1 — Caching** (`OPT1`–): tool installs, build/test caches, dynamic cache keys.
-- **Category 2 — Redundancy**: duplicate env, repeated setup sequences, redundant build steps.
+- **Category 1 — Caching** (`OPT1`–): tool installs, build/test caches, dynamic cache keys, and the one pattern pointed the other way — a cache measured to cost more than it saves (`OPT79`).
+- **Category 2 — Redundancy**: duplicate env, repeated setup sequences, redundant build steps, repeated fixed setup across independent small jobs (`OPT77`).
 - **Category 3 — Docker**: sleep-based readiness, over-broad `compose up`.
 - **Category 4 — Parallelization**: needless `needs:` serialization, unsharded long jobs.
-- **Category 5 — Actions and Checkout**: stale action pins, repeated setup, full-history checkout.
+- **Category 5 — Actions and Checkout**: stale action pins, repeated setup, full-history checkout, submodule / Git LFS checkout payload, checkout stalls on the tail (`OPT80`).
 - **Category 6 — Conditional Execution**: merge_group step-vs-job conditions, draft-PR gating.
 - **Category 7 — Trigger and Scope**: missing path filters, no `--filter` on PR turbo, cron frequency.
 - **Category 8 — Release Workflow**: release-path caching + redundancy.
@@ -47,11 +47,13 @@ Checkout · 6. Conditional Execution · 7. Trigger and Scope · 8. Release Workf
 - **Category 11 — Stack-Specific**: turbo task outputs, unstable turbo env keys.
 - **Category 12 — Build Caching (language-agnostic)**: uncached compiled-language builds.
 - **Category 13 — Hidden Failures and Dead Config**: dead env vars, misconfigured caches.
-- **Category 14 — Structural / Critical-Path Levers** (`OPT70`–`OPT75`): routed from the measured long pole (see ARCHITECTURE §11), not a flat grep.
+- **Category 14 — Structural / Critical-Path Levers** (`OPT70`–`OPT75`, `OPT78`): routed from the measured long pole (see ARCHITECTURE §11), not a flat grep. `OPT78` is routed by the drill-time leaf detector rather than the structural router.
 
 (Catalog OPT-ids are the static scan; the `blocking_path.py` `_parse_log` **leaf
-detectors** — prisma / vitest / turbo / playwright — are a separate render-time
-set, documented in ARCHITECTURE §12.3.)
+detectors** — prisma / vitest / turbo / playwright — are a separate set run over
+the drilled long poles' captured logs, documented in ARCHITECTURE §12.3. `OPT78`
+is the one catalog entry routed by that log-leaf set: it documents and reserves
+the id for the `vitest-isolate-pool` leaf, and is not part of the static scan.)
 
 ---
 
@@ -356,6 +358,394 @@ title_template: "Tool-Specific Cache Flag Not Enabled"
 
 ---
 
+### OPT79 — A Cache That Costs More Than It Saves
+
+<!-- METADATA
+pattern: OPT79
+impact: MEDIUM
+class: data-driven
+detector: actions-job-net-negative-cache
+affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
+fix_strategy: cache-costs-more-than-it-saves
+title_template: "A Cache That Costs More Than It Saves"
+-->
+
+**Anti-pattern**: A job restores a dependency cache and then installs
+dependencies, and restoring the cache takes longer than the install it was meant
+to shorten. The archive is large, it comes off a network store, it has to be
+decompressed onto the runner's disk, and the install it replaces would have
+resolved most of its work from a warm local store anyway. Every other caching
+entry in this catalog says *add a cache*; this is the one that says the cache you
+already have is costing you time, and it only ever says so from measurement.
+
+```
+before (cache hit):   restore 28s  →  install 3s   →  post-save 0s   = 31s
+before (cache miss):  restore  1s  →  install 7s   →  post-save 4s   = 12s
+after  (no cache):                    install 7s                     =  7s
+```
+
+*(Illustrative shape only. The rendered finding always quotes this repo's own
+measured numbers.)* The one public write-up this pattern was drawn from reports a
+`node_modules` cache hit restoring in about 28 seconds against about 7.5 seconds
+for a filtered install, and the cache being removed as a result —
+<https://linear.app/now/ci-bottleneck-reworked>. That is cited as somebody else's
+result, never as this skill's sizing: no OPT79 finding ever renders a number that
+did not come from the audited repository's own runs.
+
+**Detection heuristic**: measured, and every gate fails closed. The constants
+named here are the detector's own, not restatements of them — with one
+inheritance called out where it appears: the 0.25 hit-share floor in step 6 is
+the shared cache tail floor (`_CACHE_TAIL_MIN_FRAC`), which the whole cache
+family reads, so retuning it there moves this gate too.
+
+1. From the **workflow file** (never from the observed step list), the job must
+   declare exactly **one** cache-restore step — `actions/cache`,
+   `actions/cache/restore`, or an `owner/setup-*` action whose cache input
+   (`cache:`, or `enable-cache` / `bundler-cache` where that is the switch) is
+   set to anything other than empty / `false` / `no` / `off`; `cache: ${{ … }}` is an
+   unevaluated expression whose value the static parse cannot know and withholds
+   rather than reading as a yes — and **that cache step must be saved by its own
+   post phase**. A separate `actions/cache/save` step withholds
+   (`cache_is_saved_by_a_separate_step`): the save runs on the miss path but is
+   not the restore's post phase, so the three-step block cannot measure it.
+   Caches that are **on by default** count toward "exactly one": `setup-go` v4+
+   caches unless it says `cache: false`, and `astral-sh/setup-uv` v5+ defaults
+   `enable-cache` to `auto` (on GitHub-hosted runners, off on self-hosted ones;
+   OPT79 counts it as on everywhere, which can only withhold), so a job pairing
+   either with an `actions/cache` step is a multi-cache job and withholds. So do
+   actions that restore a cache of their own (`Swatinem/rust-cache`,
+   `gradle/actions/setup-gradle`, `gradle/gradle-build-action`,
+   `bahmutov/npm-install`, sccache and ccache actions): beside a cache OPT79 prices they make two caches, and on
+   their own they withhold as `cache_action_is_not_one_this_pattern_measures`.
+   A ref that is not a version tag (a commit SHA, a branch) names no major
+   version, even when the SHA starts with digits.
+
+   `actions/setup-node` **v5+ with no `cache:` input** (or an empty one, which
+   setup-node reads the same way) caches automatically when
+   the repository's `package.json` names the package manager, so OPT79 reads that
+   file the way setup-node does and counts the cache **only when it is really
+   on**. setup-node reads `$GITHUB_WORKSPACE/package.json` (the repository root,
+   whatever `working-directory` says) and switches the automatic cache off when
+   `package-manager-cache` is anything but `true` (default `true`). The field
+   rule depends on the major version: **v5** reads the top-level
+   `packageManager` and auto-caches `npm@…`, `yarn@…` and `pnpm@…` (a bare `npm`
+   with no `@` does not match); **v6 and later** read
+   `devEngines.packageManager` (an object, or an array of objects, by `name`)
+   and then `packageManager`, and auto-cache **npm only** (`npm`, `npm@…`,
+   `^npm@…`). `cache-dependency-path` changes which lockfile is hashed, not
+   whether the cache is on. The outcomes:
+   - **on** — it is a real cache. Beside an `actions/cache` step the job is a
+     two-cache job and withholds; on its own it is the cache OPT79 prices, read
+     from setup-node's own log lines, and the fix names
+     `package-manager-cache: false` because there is no `cache:` input to
+     remove.
+   - **off** — it is not a cache, so a job running setup-node v5 next to its own
+     `actions/cache` step is measured like any other.
+   - **unknown** — `package.json` is missing, a 404, a failed fetch, invalid
+     JSON or not a JSON object; the job has no checkout before the setup step,
+     or checks out into a `path:` or another `repository:`, so the root file is
+     not the one OPT79 read; or the ref is a SHA or branch on which the v5 and
+     v6 rules disagree. These fail closed as
+     `setup_action_cache_default_depends_on_repository_files`, counted in the
+     per-gate tally.
+
+   The file is read **once per repository**, and only when the cache count of a
+   job in a sampled workflow depends on it: from the local checkout when `--root` has it, else one
+   `contents/package.json` call against the default branch — the same sources,
+   in the same order, as the workflow YAML (`data_sources.setup_node_package_json`
+   records which). Like the YAML, it is the audited commit's copy, not each
+   run's own. The cache is followed by an **install**
+   step, and **no unrecognised `run:` step may sit between the cache and that
+   install** (`first_step_after_cache_is_not_a_recognised_install` withholds
+   otherwise — the unrecognised step, `cd web && npm ci` say, may be the real
+   install, and pricing a later one pairs the cache with the wrong step). The
+   cache must name a **known package store** — a `setup-*` action's ecosystem, or
+   an `actions/cache` path naming exactly one store
+   (`cache_path_names_no_known_package_store` withholds otherwise: a browser or
+   build-output cache pays off in a later step outside the measured block, so
+   its cost would read as pure waste) — and the install must belong to the
+   **same ecosystem** (`install_package_manager_does_not_match_cache` withholds a
+   `node_modules` cache followed by `pip install`, for example). An install step is recognised by **what it runs**, not by what it was
+   called, so `name: Install dependencies` over `run: npm ci` is found like any
+   other — and a step *named* `npm ci` that *runs* `npm run build` is not one. A
+   multi-line `run:` block must be installs **all the way down**: `pip install
+   -e .` followed by `pytest -q` withholds, because pricing it would charge the
+   whole test suite to both sides of the comparison. The install verbs are the
+   install alternatives of the shared setup
+   classifier and nothing else: `npm|pnpm|yarn|bun ci|install|i`,
+   `pip|pip3|pipenv|poetry|uv install|sync`, `uv pip install`,
+   `python -m pip install`, `bundle install`, `composer install`,
+   `mix deps.get`, `go mod download`, `cargo fetch`, `mvn dependency:`. Checkout,
+   configure and the cache step itself are setup but are not installs, and
+   pairing a cache with one of them would price an unrelated block. Two cache
+   steps in the job withholds (counting the on-by-default caches above): the
+   log's hit line could belong to either.
+2. The job must resolve to exactly **one** job in the workflow YAML by name (an
+   interpolated matrix leg resolves to none; a name carried by more than one job
+   in a single run is not one job), and to one known per-minute-billed runner
+   label.
+3. Across the sampled runs, each occurrence's log is classified **HIT** or
+   **MISS** by the **verbatim cache line** — the matchers the rest of the cache
+   family reads, plus the `setup-*` family's own miss wording (those actions
+   print `<package manager> cache is not found`, which the cache action's
+   phrasing does not match) and `astral-sh/setup-uv`'s pair (`uv cache restored
+   from GitHub Actions cache with key` / `No GitHub Actions cache found for
+   key`) — never by a duration.
+
+   That scan is **scoped to the restore step's own log group**: it starts at
+   the restore step's `##[group]Run <step>` header and ends **only** at the next
+   `##[group]Run ` or `##[group]Post ` header. The action's own inner groups and
+   every `##[endgroup]` are skipped, because `actions/cache` prints its hit/miss
+   line after closing its group but still inside its own step. It has to be: Turborepo
+   prints `cache miss, executing <task>`, Gradle prints `Build cache miss for
+   task …`, and both land in the *test* step. Read unscoped, every genuine cache
+   hit in a JavaScript monorepo looked like a two-cache job. Each row stamps the
+   group its line came from, and a log with no such group withholds the
+   occurrence rather than guessing.
+
+   Inside that group, a log showing **both** a miss and a hit line is
+   **excluded and counted** (`run_log_shows_both_a_hit_and_a_miss_line`), never
+   guessed, in either order. A `restore-keys` fallback prints no miss line: the
+   `@actions/cache` toolkit prints `Cache hit for restore-key: <key>` and the
+   action then `Cache restored from key: <key>`, so it is read as a **partial
+   hit** (`run_log_shows_a_partial_restore_keys_hit`) on that toolkit line, when
+   the restored key differs from the primary `key:` the step echoed, or when the
+   post step saved a new cache (`Cache saved with key` / `Cache saved with the
+   key`), which an exact hit never does. A partial hit is not a clean hit — its
+   restore size and time are not the exact-key restore this comparison prices —
+   so it is excluded from both paths rather than counted as a hit, and still
+   counts in the hit share's denominator. When excluded runs leave too few hits
+   or misses, the job withholds as `population_truncated_by_excluded_runs`, not
+   as a thin sample.
+
+   Only **successful** job runs are classified: a failed or cancelled run's
+   step timings are truncated and its post save does not run, so it is withheld
+   as `occurrence_did_not_succeed`. An occurrence GitHub skipped never ran and
+   is counted as `occurrence_was_skipped`.
+
+   An occurrence whose log was never fetched is **counted as unread**, not folded
+   into the populations; an occurrence past the per-job log cap of 8 is tallied
+   separately as `beyond_the_per_job_log_probe_cap`, not as unread. When unread
+   occurrences leave either population short, the withhold says so rather than
+   reporting a thin sample. At least **3 hits
+   and 3 misses** are required; a comparison with one side unmeasured is the
+   shape-assumption the evidence guards forbid.
+4. Every credited occurrence must have run on the **same runner label**. A hit on
+   a slow runner against a miss on a fast one is not a cache comparison.
+5. Both paths measure the **same three steps** — restore + install + the post
+   save — identified in step 1 and summed per run. A step the run **rendered**
+   but did not time counts as **0s**: GitHub stamps step timestamps at one-second
+   granularity and drops a sub-second step from the timing data entirely, so
+   reading the step set from what happened to be timed would let that noise
+   change *which* steps are being compared.
+
+   A step that was **never rendered at all** is a different fact, and it fails
+   open on the term that matters most: on `actions/cache` the save runs on a
+   MISS, so silently zeroing it removes the biggest miss-side term and
+   manufactures the excess. A post step that started and never completed
+   withholds the occurrence; a block step whose timestamps are missing or do
+   not parse did not measure 0s, it did not measure, and withholds the
+   occurrence as `step_timestamps_unparseable_in_this_occurrence`; a post label
+   that matched **no** occurrence
+   withholds the job; and `actions/cache/restore`, which has no post phase at
+   all, records that there is no save rather than inventing a step name. That
+   is only true when no *separate* `actions/cache/save` step exists in the job;
+   one that does withholds in step 1, because its save cannot be measured here.
+
+   The block's p50 over the hit runs must exceed its p50 over the
+   miss runs by at least **max(5s, 20% of the miss path)** — a named floor, so a
+   one-second "loss" never renders as a finding.
+6. The **hit share** — exact hits over every run read and kept, the excluded
+   partial-restore and two-verdict runs included — must be at least **0.25**. A
+   cache that almost never hits has a key-entropy problem, which OPT6 and OPT8
+   own; route there rather than report the same cache twice.
+7. To be **credited**, the job's measured p50 must sit **strictly below the
+   workflow's cluster floor**. This is a crediting gate, not a candidate gate: a
+   job at or above the floor is still measured by steps 1-6 and is reported
+   uncredited. See *Why this credits no wall-clock time* below.
+
+Job logs are the expensive call in this engine, so the probe is capped three
+times: at most **8** sampled occurrences of one job, at most **2** candidate jobs
+per workflow, and at most **24** log fetches across the whole repository — the
+first two are per workflow, and without the third a monorepo with thirty workflow
+files would multiply them into hundreds of calls. Candidates are ranked by
+measured job p50, which is a **proxy** for what a cache can cost and not a
+measurement of it: the longest-running cached jobs are probed first, and what the
+cache actually costs is only known once its logs are read. The repo-wide ceiling
+is applied to the whole plan **after** that ranking, so the budget reaches the
+costliest candidates in the repository rather than whichever workflow file was
+walked first, and every occurrence it cuts is counted. The report's Data sources
+row states both what was planned and what was read. This probe runs during
+collection and does **not** need `--with-logs`.
+
+**Held-back candidates are disclosed.** A candidate that a gate held back does
+not vanish, whether that happened after its logs were probed or before any log was
+read (two caches, an unreadable `package.json`, a cache that does not serve the
+install, a first step that is not a recognised install, a separate save step): each
+one is recorded as `{workflow_file, job, gate}` in `opt79_withheld_candidates`, and
+the report's Data sources table carries a **`cache hit/miss verdicts`** row — "N
+candidate cache(s) held back (<job>, <job>, ...): <plain-English reason for the
+most common gate>." (ties go to the alphabetically first gate; at most five jobs
+then "and K more", workflow-qualified where two workflows share a job name) —
+which `verify_report.py` re-derives from that list.
+So a repository with a withheld cache reads differently from one with no cache
+at all. A cache measured healthy, or one hitting too rarely to judge (step 6), is
+a verdict, not a withhold, and is not listed. The full per-gate tally, including
+every shape gate that cost no log fetch, stays in `opt79_withheld_by_gate`.
+
+Every gate about a job's SHAPE — no cache, two caches, a separate save step, no
+recognised install right after the cache, a package-manager mismatch — is
+answered from data already in hand, so those jobs cost no log fetch. That is
+not the same as "no log is fetched for a job that could not produce a finding":
+the workflow's slowest job is probed too, and what it produces is the uncredited
+line below.
+
+**Sizing (measured)**:
+
+```
+waste_s     = p50(cache block | HIT runs) − p50(cache block | MISS runs)
+hit_share   = hits / (hits + misses + ambiguous)           [every run read and kept]
+runner_min  = waste_s × hit_share × effective_monthly / 60
+```
+
+`effective_monthly` is the workflow's 30-day volume for the sampled event scope,
+scaled by how often this job actually ran in the sample, so a conditional job is
+not billed at the whole workflow's frequency. `sizing_basis = "measured"`. A
+below-the-floor job on a workflow with no measured 30-day volume cannot be
+credited and is withheld as `no_monthly_volume`, after it is measured (the
+uncredited row below needs no volume and stamps it as null).
+
+The credited figure is a **lower bound** on what removing the cache would save:
+the miss path it is measured against still pays the restore step and the post
+save today, and both disappear with the cache.
+
+**Why this credits no wall-clock time.** `wall_clock_p50_s` is always 0, and a
+job must sit strictly below the workflow's cluster floor to be **credited** —
+which is exactly what makes that zero true and re-derivable, and is the
+finding's `below_cluster_floor` neutrality certificate. The floor does not gate
+which jobs are measured: at or above it, the job is measured and reported
+uncredited, as described next.
+
+**The case above the floor: measured, reported, not priced.** A job that is not
+strictly below the cluster floor cannot carry the neutrality certificate a
+credited runner-minute row needs. It is measured anyway, on the same evidence and
+by the same code as every credited finding, and **reported with no number**.
+
+Which job it is decides what the line may say, because the floor is the
+*second-ranked* job's p50 — so "not below the floor" covers everything from
+second place upwards, and only the workflow's **long pole**, on a workflow that
+can gate a PR, actually carries the merge wait:
+
+> a cache on `build` measured net-negative by 19s per cache hit (5 hit / 4 miss
+> run(s) sampled); `build` is this workflow's slowest job, so the saving is on the
+> merge wait and is **not credited** in this version.
+
+> a cache on `unit` measured net-negative by 19s per cache hit (4 hit / 4 miss
+> run(s) sampled); `unit` is at or above this workflow's second-slowest job
+> (600s), so this audit cannot prove that shrinking it leaves the merge gate
+> unchanged; **not credited** in this version.
+
+For a job that is not the long pole the saving may be pure runner-minutes, but
+this audit cannot prove that shrinking it leaves the merge gate unchanged, so it
+is not credited. A workflow that cannot gate a PR is never told it has a merge
+wait.
+
+No runner-minutes, no wall-clock claim, no certificate, no Tier-2 row, and no
+contribution to any total — the measurement is complete, only the sizing is
+deferred. The row carries the same stamped block as a credited finding, including
+its per-run measurements, so the report's self-check re-derives it exactly as it
+re-derives the credited ones. The fix is the same one the credited findings hand
+over; only the size of the win is unstated. Rendered next to the
+dropped-unprovable note, its nearest precedent: a measured fact deliberately kept
+out of the numbers and shown anyway.
+
+Sizing it is the follow-up: route the measured excess through the wall-clock
+bound cascade, where CAP 1 already caps an on-pole saving at
+`long_pole_p50 − floor_p50`; the at-or-above-the-floor-but-below-the-pole job is
+the easier half of the same follow-up, but only once a neutrality argument for
+the merge gate exists. Until
+then the honest report is a line without a number, not silence — and silence is
+what this used to be, because the floor test ran in the candidate selector and
+the job's logs were never fetched at all.
+
+**Fix**: in this order, and never "just delete it".
+
+1. **Re-key or narrow, then re-measure.** A restore is usually slow because the
+   archive is big. Cache the package manager's **store** (`~/.pnpm-store`,
+   `~/.npm`, `~/.cache/uv`, the Go or Cargo module cache) instead of an expanded
+   `node_modules` tree for a whole workspace, or scope the cache — and the
+   install — to the package this job actually needs (pairs with OPT54's filtered
+   install and OPT8's key granularity). Re-run the audit; the comparison above is
+   the acceptance test.
+2. **Remove the cache step and its post save** — only once a narrowed install is
+   already faster than any restore. State plainly what this does: the miss path
+   becomes the **only** path, so the miss-path numbers in the evidence are what
+   every run will pay from then on. That is the trade the measurement says is
+   worth making, and it is worth re-measuring after any change to the dependency
+   graph.
+
+**Runner-class caveat**: the comparison is valid for the runner class it was
+measured on, and the finding names that label. A runner with slower disk or
+faster network can flip the result, so do not carry the conclusion to another job
+or another runner without re-measuring there.
+
+**No-weakening caveat**: the saving must never be bought by narrowing what the
+install installs, by dropping the step the cache feeds, or by skipping the
+install on some runs. Those reduce what CI verifies; this pattern is about paying
+less for the same work.
+
+**ci-score interaction**: ci-score's *Dependency caching* check reads
+configuration only and has no run history, so a repo that measured its cache,
+found it net-negative and removed it will still be docked that point — the
+measurement lives here, in the ci-speedup report, and reconciling the two is an
+open owner decision rather than an engine behaviour either skill implements
+today.
+
+**Tier-2 render note**: OPT79 promotes only with measured evidence and a
+neutrality certificate whose `proof` token is `below_cluster_floor` — which for
+this pattern is **literal**: the credited job's own p50 is below the workflow's
+cluster floor, and the margin is that difference. The finding must stamp
+`wall_clock_p50_s=0`, `sizing_basis=measured`, the two-path model in
+`measured_signal`, and a structured `cache_net_negative` block that lets
+`verify_report.py` re-derive the credited minutes and the margin without reading
+one number as an answer. Every key below is hard-required by that re-derivation:
+
+| key | what it carries |
+|---|---|
+| `kind` | `opt79_net_negative_cache` for a credited finding, `opt79_uncredited_pole_cache` for an uncredited row — the tag that routes the block to this re-derivation instead of the generic one |
+| `job` | the credited job; must be the finding's only `affected_jobs` entry |
+| `runner_label` / `cache_ref` | the one runner class every credited run ran on, and the cache action the block was built around |
+| `restore_step` / `install_step` / `post_step` | the three steps, as named in the YAML, that both paths measure; `post_step` is null for `actions/cache/restore`, which has no post phase |
+| `per_run[]` | one row per credited run: its `status`, the **verbatim** `log_line` that verdict came from, the `log_line_group` it was read in (which must be the restore step), its `runner_label`, and `restore_s` / `install_s` / `post_s` / `block_s` |
+| `hits` / `misses` / `classified_runs` / `ambiguous_runs` / `occurrences_on_other_runner` | the populations, the two-verdict and partial-restore runs excluded from them (still counted in the hit share), and the occurrences dropped for running on another runner label |
+| `hit_path_p50_s` / `miss_path_p50_s` / `waste_s` / `waste_floor_s` | the two medians, their difference, and the floor it had to clear |
+| `hit_share` | `hits / (classified_runs + ambiguous_runs)` |
+| `job_runs` / `sampled_successful_run_count` / `monthly_volume` / `effective_monthly_volume` | the scaling; `classified_runs` can never exceed `job_runs`, which can never exceed the sampled run count |
+| `runner_min_saving` | restated inside the block and checked against the finding's own; **null** on an uncredited row, where a number would be a failure |
+
+An uncredited row carries every key above plus `workflow_file`, `job_p50_s`,
+`floor_p50_s`, `long_pole_job`, `long_pole_p50_s` and `on_critical_path` — the
+last being what decides whether the rendered line may speak of a merge wait.
+
+The re-derivation recomputes each row's `block_s` from its three parts, re-reads
+every row's quoted line against the hit and miss matchers (a row labelled `hit`
+whose line says the cache was not found is a failure, and so is a row quoting
+both), recomputes both medians, the waste, the floor, the hit share, the
+effective volume and the credited minutes, and re-derives the margin from
+`per_workflow_timing`. Uncredited rows go through the same re-derivation with the
+credited-minutes and neutrality branches skipped, and one extra check: they must
+carry no sizing at all. A tampered number anywhere in that chain reddens the
+report.
+
+The verifier restates the engine in two different ways, and the tests say which
+is which: the stamped key list, the population minimums, the two waste-floor
+constants and the shared cache tail fraction are asserted **identical** to the
+engine's; the hit and miss matchers are deliberately **independent** re-readings
+— a verifier sharing the engine's matcher could not catch a mislabelled row — so
+they are only spot-checked, line by line.
+
+---
+
 ### OPT11 — Redundant Environment Variables
 
 <!-- METADATA
@@ -567,7 +957,8 @@ title_template: "Repeated Checkout/Setup Without Artifact Handoff (and Slow Tool
 | **ESLint**         | **oxlint**            | **~8–20×** realistic (NOT the 50–100× advertised when type-aware rules and custom plugins exist) | Partial fit only  | Recommend a **dual-run scoped ESLint pattern** when ANY of the following are present: custom local rules, `tailwindcss` plugin, type-aware rules requiring `tsgolint`, framework plugins (`convex/*`, `next/*`, `@typescript-eslint/*` type-aware rules), or a `react-hooks/exhaustive-deps` configuration the team relies on. In dual-run, oxlint runs first across the tree; ESLint runs second with a config restricted to the rules oxlint can't replicate. Do NOT recommend a wholesale oxlint-only swap when these gates are present. |
 | **Babel**          | **SWC**               | **~10×** compile                                                                                 | Yes for most      | Drop-in via `next/babel`, framework integration, or `@swc/jest`. Verify any custom Babel plugins have SWC equivalents before recommending.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | **Webpack**        | **Turbopack**         | **~2–5×** build                                                                                  | Yes (Next.js 16+) | Default in Next.js 16+. Check for `webpack:` overrides in `next.config.js` that force fallback to webpack — those often need to be ported or removed before Turbopack is actually active.                                                                                                                                                                                                                                                                                                                                                   |
-| **`tsc --noEmit`** | esbuild/swc typecheck | **DO NOT recommend**                                                                             | **Anti-pattern**  | esbuild and swc do not typecheck. They strip types. `tsc --noEmit` is the only real type-check in the TypeScript ecosystem. Recommending this swap is a coverage regression masquerading as a speedup — the "speed without coverage is a regression" principle explicitly forbids it. Skip it.                                                                                                                                                                                                                                              |
+| **`tsc --noEmit`** (TypeScript 5.x/6.x) | **TypeScript 7** (`typescript@^7`, the native port; the command is still `tsc`) | Vendor-stated "typically 8x to 12x on full builds" (TypeScript 7.0 announcement); measure per repo | Yes for type-check-only steps | Same checker, native and multithreaded: an upgrade of the real type-check, not a swap to a tool that skips it, and NOT the esbuild/swc anti-row below, which strips types. TypeScript 7.0 is stable (7.0.2 is `latest` on npm); the older `tsgo` / `@typescript/native-preview` preview is superseded, so do not recommend it. Caveats: 7.0 ships without a programmatic compiler API (expected in 7.1), so tools that call it (typescript-eslint type-aware rules, webpack/ts-loader style loaders) need the side-by-side `@typescript/typescript6` alias (`tsc6`); 7.0 changes defaults (`strict: true`, `types: []`, no `baseUrl`), so expect new errors on upgrade. On small CI runners, `--checkers` / `--singleThreaded` bound memory. Keep the old compiler for anything needing the API. |
+| **`tsc --noEmit`** | esbuild/swc typecheck | **DO NOT recommend**                                                                             | **Anti-pattern**  | esbuild and swc do not typecheck. They strip types. A real type-check needs the TypeScript compiler itself (`tsc`, or its TypeScript 7 native port above). Recommending this swap is a coverage regression masquerading as a speedup — the "speed without coverage is a regression" principle explicitly forbids it. Skip it.                                                                                                                                                                                                                                              |
 
 **Detection heuristic**:
 
@@ -667,6 +1058,269 @@ done
 ```
 
 **Fix**: Remove the duplicate invocation. If the rebuild is a workaround for stale artifacts, fix the root cause (e.g., cache key, build system incremental support) instead.
+
+---
+
+### OPT77 — Repeated Fixed Setup Across Independent Small Jobs
+
+<!-- METADATA
+pattern: OPT77
+impact: MEDIUM
+class: data-driven
+detector: actions-job-setup-consolidation
+affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
+fix_strategy: repeated-fixed-setup-across-independent-small-jobs
+title_template: "Repeated Fixed Setup Across Independent Small Jobs"
+-->
+
+**Anti-pattern**: A workflow declares several small, independent checks — lint,
+typecheck, a licence audit, a formatting check, a spellcheck — and every one of
+them starts a runner, checks out the repository and installs dependencies before
+doing work that takes no longer than the setup did. The same fixed setup prefix is
+paid N times for one commit. The jobs are not tiny in billed terms (each is
+comfortably over a minute once checkout and install are paid), so nothing about
+per-job billing round-up describes this; what is wasted is repeated setup
+*runtime*. (The gate is "setup is at least as large as the useful work", not
+"the work takes seconds" — the finding's evidence quotes the measured maximum.)
+
+Consolidating N such jobs into one, and running their tasks concurrently inside
+it, pays the setup once instead of N times.
+
+```
+before:  N jobs  →  N x (start runner + checkout + install)  +  N x seconds of work
+after:   1 job   →  1 x (start runner + checkout + install)  +  the same work, concurrent
+saved:   (N - 1) x setup, every run
+```
+
+**Detection heuristic**:
+
+1. For every sampled job, split its measured step timeline (jobs API `steps[]`
+   timestamps) into the **leading run of setup steps** — the implicit `Set up
+   job`, `actions/checkout`, `setup-*` actions, dependency installs — and the
+   remaining **useful work**. Take the p50 of each across the sampled runs, and
+   record the prefix's **signature**: the ordered identities of those setup
+   steps. An identity is the step's name, whitespace-collapsed and casefolded,
+   with the `Run ` prefix GitHub renders in front of an unnamed step dropped
+   (that last one is load-bearing: it is what makes `Run npm ci` and a step
+   *named* `npm ci` the same identity), and two kinds of churn removed — an
+   **action's** version ref (`actions/setup-node@v4` and `@v3` are one identity)
+   and **bare boolean** flag tokens (`npm ci` and `npm ci --prefer-offline` are
+   one identity).
+
+   Everything else is kept, so a different toolchain (`pip install` vs `npm ci`),
+   a different thing installed (`npm ci frontend/package.json`) and an extra step
+   all remain different setup. In particular an install *target* is not churn:
+   `--filter=api` / `--filter api`, `-w frontend` and `--target build` all name
+   what is being installed and keep their groups apart, and an `@` that is not an
+   `owner/repo` action reference (a pinned image digest) is left intact.
+   Comparing the names exactly would be correct but unusable: one pinned-version
+   bump anywhere in the group would silence the finding, and a lever that never
+   fires on a real repo cannot be told apart from a broken one.
+
+   The signature's **shape** comes from every step the job declares; only its
+   duration comes from the steps that measured above zero. GitHub stamps step
+   timestamps at one-second granularity, so a sub-second step is 0s in one run and
+   1s in the next on identical YAML; reading the shape from the timed steps alone
+   made that noise change the signature's length and silently drop the job.
+2. Keep a job as a candidate only if it resolves to exactly **one** job in the
+   workflow YAML by name (an interpolated matrix leg resolves to none and is
+   excluded; a name carried by more than one job in a single run is not one job
+   and is excluded too, which covers a matrix declaring a static `name:`), runs
+   on a single known
+   per-minute-billed runner label, shows the **same setup signature in every
+   sampled occurrence**, and its setup p50 is **at least as large as its
+   useful-work p50**.
+3. Group the candidates by resolved runner label **and by setup signature** —
+   never by runner label alone. The saving model removes `(N-1)` payments of
+   *one* prefix and projects the consolidated job at `max(setup_p50)` rather than
+   the sum of the setups, and both steps are only valid for jobs re-paying the
+   **same setup work**. Three checks that each spend 80s installing *different*
+   toolchains (a Node one, a Python one, a Go one) share a runner and a duration
+   but not a prefix: consolidating them removes only the one shared checkout,
+   while every distinct install still has to run. Grouping on the signature keeps
+   them in separate groups, each sized on its own. Emit only when:
+
+   * the group has at least **three** jobs;
+   * **no `needs:` edge**, direct or transitive, links any two of them — a chain
+     is not a consolidatable set;
+   * **no job outside the group** waits on a member, directly or transitively.
+     The projected consolidated job is always at least as tall as the tallest
+     member, so anything downstream of a member starts later and the change is
+     wall-clock *negative* — which a bill-only finding must never be. (A `needs:`
+     parent the group *shares*, such as `lint`/`typecheck`/`audit` all waiting on
+     one `build`, is fine and is the commonest real layout for this shape.) A
+     dangling `needs:` naming a job the workflow does not declare withholds too:
+     dropping an unresolvable parent would strengthen the independence claim
+     rather than question it;
+   * the shared prefix contains at least one **recognizable** piece of shared
+     work — a real `owner/repo` action or a dependency install. A prefix of
+     purely human-authored names is a naming coincidence, and `Set up job` alone
+     is only the runner booting;
+   * the credited setup prefix clears an absolute floor (10s), below which the
+     removed payments are noise against the cost of coupling the checks;
+   * the **workflow file** agrees, for the members it can be read for. Two jobs
+     can render the same step name while doing different work: a different
+     `working-directory`, a different `run:` body, or the same unnamed action
+     with different `with:` inputs (`python-version: 3.9` vs `3.12`).
+     Consolidating those removes neither install, so any such disagreement splits
+     the group.
+4. Project the consolidated job at `max(setup_p50) + max(useful_work_p50)` (the
+   collapsed tasks run concurrently inside it) and compare it against **the
+   tallest job that REMAINS after the consolidation** — the tallest job in the
+   workflow that is not a member of the credited group. If the projection reaches
+   that job, **withhold the finding**; if nothing outside the group is taller,
+   withhold it too. Consolidation must never lengthen the merge gate.
+
+   That job has to be a job that actually runs. Only jobs present in a **majority
+   of the sampled runs in which the whole group ran** are eligible to carry the
+   proof — a conditional job seen once in ten samples cannot show the gate is
+   unchanged, because on the other nine the group's own members are the tallest
+   thing left. The eligible set, and every job left out of it with its reason, are
+   stamped so the check can re-derive the same maximum.
+
+   The comparison is deliberately *not* against the workflow's cluster floor. The
+   question the gate answers is "does the merge gate get longer if these jobs are
+   collapsed?", and the gate afterwards is set by the jobs that were not touched.
+   A floor the group's own members help define measures the fix against something
+   the fix removes — which is a modelling error, not conservatism, and it silenced
+   the pattern on its own motivating shape (one long test job beside a flat row of
+   equally-sized small checks, where the second-tallest job is itself a member).
+5. Credit `occurrences x (N - 1) x setup_p50` runner-seconds across the sample,
+   where `setup_p50` is the **smallest** measured setup p50 in the group and
+   `occurrences` is the number of sampled runs in which **every** credited job
+   produced a clean measurement (it ran, its duration and its setup prefix both
+   measured) — a run where one of them was skipped paid no duplicate setup for
+   it and so has none to remove. Scale that to a month by the monthly volume for
+   the sampled event scope divided by sampled successful runs. This credits
+   removed setup runtime only — no wall-clock speedup is ever claimed.
+
+**Groups it could not decide are named in the report.** Once a candidate group
+has formed (at least three jobs on one runner sharing one setup prefix), every
+exit is either a *verdict* — the members depend on each other, the prefix is not
+shared work, the YAML steps differ, the setup is too small, consolidating
+would reach the tallest remaining job, the credited saving rounds to zero, or
+the group *is* the whole workflow (no job outside it, so the jobs run in parallel
+today and merging them can only keep or lengthen the wait) —
+or a *could not tell*: the `needs:` graph
+is undecidable, the group never ran complete in one sampled run, or jobs outside
+it exist but none runs often enough to measure against. Each could-not-tell group
+is listed on the findings document (`opt77_withheld_candidates`), and the
+report's Data sources table carries a `repeated-setup: held back` row — "N
+candidate job group(s) held back (lint + test + typecheck in ci.yml): the
+sampled runs never had every job in the group run together, so the saving could
+not be measured." The groups are named (workflow-qualified, at most five, then
+"and K more"), the reason is a plain-English phrase for the commonest gate, and
+`verify_report.py` re-derives the whole line, so an undecided group never reads
+as "measured, nothing found". Verdicts are not counted there.
+
+**What counts as the setup prefix.** Only the *leading* run of setup-classified
+steps, and only steps the classifier recognises. In full, a step name opening
+with (optionally after the `Run ` prefix GitHub renders for an unnamed step):
+
+* `set up` / `setup`, `checkout`, `install`, `cache`, `restore`, `fetch`,
+  `configure`, `init `, `bootstrap`;
+* `docker login`, `docker pull`, `docker compose up`;
+* `actions/checkout`, `actions/setup-*`, `actions/cache`, `pnpm/action-setup`,
+  and the bare `setup-node` / `setup-python` / `setup-go` / `setup-pnpm` forms;
+* the unnamed install commands themselves — `npm|pnpm|yarn|bun ci|install|i`,
+  `pip|pip3|pipenv|poetry|uv install|sync`, `uv pip install`,
+  `python -m pip install`, `bundle install`, `composer install`, `mix deps.get`,
+  `go mod download`, `cargo fetch`, `mvn dependency:`.
+
+Each install alternative pins the verb as the tool's *own subcommand*, so
+`mvn install` (which compiles and tests) and `bundle exec rspec spec/get_spec.rb`
+are builds and tests, not setup. A setup step the classifier does not recognise
+ends the prefix, so its time lands in "useful work" and the group is sized
+conservatively or withheld — never inflated.
+
+**Relationship to OPT65 (supersede, not disjoint).** These two were described as
+disjoint because a matrix leg never resolves to a single YAML job by name. That
+reasoning does not hold: OPT65 never required a *declared* matrix — it groups on a
+trailing parenthetical in the **observed** job name, so three ordinary jobs named
+`lint (eslint)`, `lint (biome)`, `lint (stylelint)` resolve to one YAML job each
+*and* form an OPT65 base. Both then describe the same consolidation. **OPT77
+supersedes OPT65 on any job set both claim**: one edit renders as one lever.
+
+The accepted cost: OPT65's billing round-up minutes are genuine, and they go
+unreported whenever it is superseded, so the report slightly **understates** that
+group's total. They are deliberately not folded into OPT77's credited number —
+OPT77 credits raw removed compute, and mixing a billable-round-up quantity into it
+would break its measured basis. Under-reporting a real saving is the safe
+direction; inventing a basis is not. Because that cost is real, every superseded
+finding is disclosed in the results (`superseded_findings`) with what displaced
+it and which of its jobs the surviving finding does *not* cover.
+
+**Fix**: Merge the group into one job that checks out and installs once, then
+runs the collapsed tasks **concurrently** inside that job (background processes
+joined at the end, or a task runner's own parallel mode). The concurrency is not
+a nicety: run sequentially, the consolidated job costs `setup + the SUM of the
+tasks` instead of `setup + the slowest task`, which can push it past the merge
+gate and make the change wall-clock-negative. Do not consolidate any job that can
+sit on the merge gate, and do not drop or narrow any check in the process — the
+consolidated job must still run everything the separate jobs ran, and still fail
+the build when any of them fails. When the jobs must stay separate (independent
+re-runs, distinct required checks), the alternative is to make each copy of the
+setup cheap instead of merging: bake the recurring `apt` / toolchain installs into
+a base image, as [OPT73](#opt73--shared-sub-step-across-critical-path-jobs-cluster-floor-lever)
+describes.
+
+**Failure-isolation cost (a real cost, not a footnote)**: N separate checks give
+N independently-red checks and N independently re-runnable units. One
+consolidated job gives one red check and re-runs everything, and a reviewer
+reading the checks list loses the at-a-glance "which one broke". Surface each
+task's own result inside the job (per-task step, or an explicit summary) so the
+diagnosis is not lost, and weigh the lost re-run granularity against the saved
+minutes before consolidating.
+
+**Required-checks caveat**: consolidating jobs renames the checks (the old job
+names disappear). If any of the consolidated jobs was a required status check,
+add the new consolidated job's check name to branch protection as a required
+check (or the ruleset equivalent), or the consolidated work silently stops gating
+merges until that admin-only step is done. If the consolidation routes the old
+checks' work behind a `needs:` edge and an aggregator, see OPT75's
+[dependency-failure skip caveat](#opt75--long-pole-optimize-or-relocate-the-dominant-step)
+— a dependent skipped by a failed dependency reports skipped, not failed, so the
+aggregator must run with `always()` (or `!cancelled()`) and propagate every
+`needs.<job>.result`, and keeping the required check name on that aggregator
+re-gates the merge without an admin.
+
+**Tier-2 render note**: OPT77 can promote only with measured setup evidence and a
+neutrality certificate whose `proof` token is `below_cluster_floor`. **That token
+is historical** for this pattern: the comparison is against the tallest job that
+*remains* after the consolidation, not against the workflow's cluster floor. The
+token is shared with OPT65 (whose cluster-floor comparison *is* genuine) and kept
+as the dispatch key; the meaning is restated wherever it is read — the detector,
+`verify_report.py`'s neutrality arm, `blocking_path.py`'s certificate summary and
+this note.
+
+The finding must stamp `wall_clock_p50_s=0`, `sizing_basis=measured`, the
+`(N-1) x setup_p50` model in `measured_signal`, and a structured
+`setup_consolidation` block that lets `verify_report.py` re-derive both the
+credited minutes and the margin. Every one of these keys is hard-required by that
+re-derivation:
+
+| key | what it carries |
+|---|---|
+| `credited_jobs` | the jobs the saving is claimed for; must equal `affected_jobs` |
+| `removed_setup_payments` | `N - 1` |
+| `setup_p50_s` | the smallest per-job setup p50 in the group |
+| `shared_setup_steps` | the prefix identities the group was formed on |
+| `per_job[job].setup_p50_s` / `.useful_work_p50_s` / `.setup_steps` | each job's own measured split and its own prefix, which is what proves the grouping |
+| `projected_consolidated_p50_s` | `max(setup) + max(useful)` |
+| `remaining_tallest_job` / `remaining_tallest_p50_s` | the job the projection is measured against |
+| `remaining_eligible_jobs` / `remaining_excluded_jobs` | the set that job was chosen from, and every job left out with its reason |
+| `occurrences`, `sampled_successful_run_count`, `monthly_volume`, `scale` | the scaling; `occurrences` can never exceed the sampled run count |
+
+It never claims a speedup; it credits only removed setup runtime.
+
+**Worked shape**: seven independent checks each start a runner, check out the
+repository and install dependencies before doing only seconds of useful work.
+Collapsing them into a single job, with the seven tasks running concurrently
+inside it, drops the number of times that setup prefix is paid from seven to one
+— `(7 - 1) x setup_p50` of removed setup runtime on every run of the workflow.
+Split across two consolidated jobs instead (say, because two of the checks need a
+different toolchain), the same arithmetic applies per group: each group of `n`
+pays its prefix once instead of `n` times.
 
 ---
 
@@ -869,7 +1523,7 @@ grep -rn 'workflow_run' .github/workflows/
 
 **Fix**: Consolidate into a single workflow with parallel jobs, or use `workflow_call` for reusable workflows that can run concurrently.
 
-**Required-checks caveat**: consolidating workflows renames the checks (the old `workflow_run` check name disappears). If the old check was a required status check, add the new job's check name to branch protection as a required check (or the ruleset equivalent), or the consolidated work silently stops gating merges until that admin-only step is done.
+**Required-checks caveat**: consolidating workflows renames the checks (the old `workflow_run` check name disappears). If the old check was a required status check, add the new job's check name to branch protection as a required check (or the ruleset equivalent), or the consolidated work silently stops gating merges until that admin-only step is done. If the consolidation routes the old check's work behind a `needs:` edge and an aggregator, see OPT75's [dependency-failure skip caveat](#opt75--long-pole-optimize-or-relocate-the-dominant-step) — a dependent skipped by a failed dependency reports skipped, not failed, so the aggregator must run with `always()` (or `!cancelled()`) and propagate every `needs.<job>.result`, and keeping the required check name on that aggregator re-gates the merge without an admin.
 
 ---
 
@@ -925,7 +1579,7 @@ title_template: "Long Test Job Without Sharding"
 
 **Fix**: Add matrix-based sharding. E.g., Playwright: `--shard=${{ matrix.shard }}/${{ strategy.job-total }}`.
 
-**Required-checks caveat**: if the job you're sharding is a **required status check** (a merge gate — which the long pole usually is), the new shard jobs must be added to branch protection as required checks (or the ruleset equivalent), or the sharded-out test work silently stops gating merges — everything stays green while the gate no longer actually runs it. The split isn't complete until the new jobs gate the merge, and re-establishing that gating is usually an admin-only step.
+**Required-checks caveat**: if the job you're sharding is a **required status check** (a merge gate — which the long pole usually is), the new shard jobs must be added to branch protection as required checks (or the ruleset equivalent), or the sharded-out test work silently stops gating merges — everything stays green while the gate no longer actually runs it. The split isn't complete until the new jobs gate the merge, and re-establishing that gating is usually an admin-only step. If the split routes the old check's work behind a `needs:` edge and an aggregator, see OPT75's [dependency-failure skip caveat](#opt75--long-pole-optimize-or-relocate-the-dominant-step) — a dependent skipped by a failed dependency reports skipped, not failed, so the aggregator must run with `always()` (or `!cancelled()`) and propagate every `needs.<job>.result`, and keeping the required check name on that aggregator re-gates the merge without an admin.
 
 **Wall-clock vs runner-minutes**: Sharding splits the long pole's test execution across **PARALLEL** jobs, so it lowers **wall-clock** (the critical path) but does **NOT** save runner-minutes — the same test work still runs, and more jobs add per-job fixed overhead (checkout, setup, dep install), so runner-minutes go **UP**. The two axes therefore point opposite ways: it is a **TOP Tier-1 wall-clock lever** (push it aggressively when cost is not a constraint — it directly parallelizes the long pole), but it **saves no runner-minutes** (it adds billable compute), so the bill axis shows zero. Note diminishing returns: sharding floors at the per-job fixed overhead, so it must be **stacked** with cache fixes that attack that overhead (warm build cache, dependency cache, browser-binary cache) — past a certain shard count the setup tax dominates and adding shards stops moving wall-clock. See `wall-clock-methodology.md` §7.
 
@@ -966,6 +1620,7 @@ title_template: "Shard Imbalance"
 - Hash-based partitioning (nextest): increase shard count to dilute hot shards.
 - Explicit test lists: rebalance based on measured per-test runtimes.
 - Timing-based sharding (pytest-split, nextest timing data): enable it.
+- Runner distributes by whole file (Jest `--shard`, Playwright `--shard` without `fullyParallel: true`, file-granular splitters): the imbalance is one oversized file, so find it from measured per-file runtime and split it before adding shards; more shards cannot spread one file. Playwright with `fullyParallel: true` shards individual tests, so this does not apply there.
 - Sizing: the slow shard can drop toward the mean leg duration → `Δwc ≈ slow − mean(legs)`.
 
 **Fix — case 2 (heterogeneous legs), NOT rebalanceable**:
@@ -973,7 +1628,7 @@ title_template: "Shard Imbalance"
 - **Split the slowest leg itself** — sub-shard that package's own test suite (add a `shard` axis *within* the slow package), or split its work into parallel jobs (e.g. run a multi-backend leg's Postgres and MySQL as separate matrix entries).
 - Do **NOT** describe this as "rebalance shard distribution" — the legs are not fungible; that advice is inapplicable and misleading.
 - Sizing is bounded by the **next-slowest leg**, which becomes the new long pole: splitting the slow leg in two gives `Δwc ≈ slow − max(slow/2, second_slowest)`, not `slow − mean`. To go lower, split the next leg too (stack across the cluster).
-- **Required-checks caveat**: splitting a required leg into new matrix entries / parallel jobs adds new check names. If the original leg was a required status check, add the new jobs to branch protection as required checks (or the ruleset equivalent) — otherwise the split-out work silently stops gating merges (everything stays green) until that admin-only gating step is done.
+- **Required-checks caveat**: splitting a required leg into new matrix entries / parallel jobs adds new check names. If the original leg was a required status check, add the new jobs to branch protection as required checks (or the ruleset equivalent) — otherwise the split-out work silently stops gating merges (everything stays green) until that admin-only gating step is done. If the split routes the old check's work behind a `needs:` edge and an aggregator, see OPT75's [dependency-failure skip caveat](#opt75--long-pole-optimize-or-relocate-the-dominant-step) — a dependent skipped by a failed dependency reports skipped, not failed, so the aggregator must run with `always()` (or `!cancelled()`) and propagate every `needs.<job>.result`, and keeping the required check name on that aggregator re-gates the merge without an admin.
 
 This applies to any framework with sharding (pytest `--shard`, cargo-nextest `--partition`, Jest/Playwright `--shard`) for case 1, and to any package/backend matrix for case 2.
 
@@ -1063,9 +1718,430 @@ title_template: "Full Git History Checkout"
 grep -rn 'fetch-depth' .github/workflows/
 ```
 
-**Fix**: Use `fetch-depth: 1` (default) unless the job needs git history (e.g., changelogs, blame). For PR diff detection against the merge commit's parents, `fetch-depth: 2` suffices — but change-scoped runners that diff against the BASE BRANCH (`turbo --filter=...[origin/main]`, `nx affected`, `vitest --changed` — see OPT34/OPT70) need the base ref fetched (`fetch-depth: 0` or a targeted base-ref fetch); do not shallow those jobs.
+**Fix**:
+
+- **Delete the checkout step outright** if no step in the job reads a file from the checkout (a job that only calls an API, downloads an artifact, or runs a container image). The cheapest checkout is none. Check first that nothing needs the repo indirectly: a local action (`uses: ./...`) or reusable-workflow path, `hashFiles()` in a cache key, a `run:` that calls `git` or a repo script, or a `gh` command relying on the current repo (it then needs `--repo` or `GH_REPO`). A missing file fails the job, so delete only when every step is accounted for.
+- Use `fetch-depth: 1` (default) unless the job needs git history (e.g., changelogs, blame). For PR diff detection against the merge commit's parents, `fetch-depth: 2` suffices — but change-scoped runners that diff against the BASE BRANCH (`turbo --filter=...[origin/main]`, `nx affected`, `vitest --changed` — see OPT34/OPT70) need the base ref fetched (`fetch-depth: 0` or a targeted base-ref fetch); do not shallow those jobs.
+- **Sparse / blobless checkout** is the option between a full clone and depth 1 for diff-based gates that need history but not every file: `filter: blob:none` (with `fetch-depth: 0`, full history with file contents fetched on demand) or `sparse-checkout:` (newline-separated patterns; only those paths materialized) on `actions/checkout`. Both are real inputs; the action's own docs say `filter` "overrides sparse-checkout if set", so verify a combination on the job rather than assume it. Confirm the job's steps only touch the sparse paths, or a missing file fails the job.
 
 ---
+
+---
+
+### OPT76 — Submodule / Git LFS Checkout Payload
+
+<!-- METADATA
+pattern: OPT76
+impact: MEDIUM
+class: static
+detector: yaml-job-correlated
+affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
+fix_strategy: submodule-lfs-checkout-payload
+title_template: "Submodule / Git LFS Checkout Payload"
+-->
+
+**TL;DR**: The checkout clones every submodule, or downloads every Git LFS
+object, for a job whose steps never read them — a fixed download paid on every
+single run.
+
+**Anti-pattern**: `actions/checkout` with `submodules: true` / `submodules:
+recursive`, or `lfs: true` (equivalently a `git lfs pull` / `git lfs fetch` step
+in a run block), in a job that never touches the submodule paths declared in
+`.gitmodules` or the paths `.gitattributes` marks `filter=lfs`. The payload is
+usually copied wholesale from one job that genuinely needs it (a release build,
+a docs render) into every job in the workflow, so the lint job clones the vendor
+tree and the unit-test job downloads the design assets. This is the sibling of
+OPT28 (`fetch-depth: 0`): the same checkout step, a different payload — and it
+is ranked and fixed separately because removing `fetch-depth: 0` does
+nothing about a submodule or LFS clone, and vice versa.
+
+**Detection heuristic**:
+
+```bash
+# 1. What payload does the repo actually declare?
+cat .gitmodules                       # submodule paths
+grep -n 'filter=lfs' .gitattributes   # LFS-tracked path patterns
+
+# 2. Which jobs pull it?
+grep -rn -e 'submodules:' -e 'lfs:' -e 'git lfs \(pull\|fetch\)' .github/workflows/
+
+# 3. Which of those jobs never reference a declared path (the finding)?
+```
+
+A finding requires all three: a declared payload (step 1), a job that pulls it
+(step 2), and **no** reference to any declared path anywhere in that job — its
+`run` blocks, step and job-level `working-directory`, `strategy.matrix` values,
+step `if:` and `name:`, job- and step-level `env:`, `with:` values, `uses:` refs,
+and the body of every local composite action the job invokes, followed
+transitively into the local actions those invoke (step 3). With no `.gitmodules` (or no
+`filter=lfs` line), there is no declared path to prove unread, so nothing is
+flagged. When a local composite action the job invokes cannot be read — at any depth in
+that chain — the pattern fails **closed** and stays silent, the same conservative
+stance OPT28 takes: the cost of a miss is a lost finding, never a fix that breaks
+a job. A checkout that names a `repository:` other than this one is skipped
+outright: it pulls that repo's submodules and LFS objects, about which this
+repo's `.gitmodules` and `.gitattributes` say nothing.
+
+Scoped, like OPT28, to workflows that run on `pull_request` / `push` /
+`workflow_call`. A `workflow_dispatch`- or `schedule`-only helper runs ~0×/mo,
+so its checkout payload is noise rather than a ranked optimization.
+
+**Fix**: Pull the payload only in the jobs that read it. Drop `submodules:` /
+`lfs:` from the other jobs' checkout, or scope the payload down where part of it
+is genuinely needed — `submodules: false` plus a targeted `git submodule update
+--init --depth 1 <path>` for the one submodule that is read, or `lfs: false`
+plus `git lfs pull --include='<path>'` for the assets that are read. Where every
+job in a cluster needs the same payload, the lever is OPT73 (a shared sub-step
+across the critical-path cluster), not this pattern.
+
+**Core evidence, and its honest limit**: the recipe rests on "this job does not
+reference anything under the submodule / does not read the LFS-tracked paths."
+The workflow YAML **cannot settle that on its own.** The detector proves only
+that no path declared in `.gitmodules` / `.gitattributes` appears in the job's
+own YAML or in the local composite actions it invokes. A build script, a
+Makefile target, a test fixture, or a config file the job invokes can read the
+payload without ever naming the path in CI config — and a `git submodule` /
+`git lfs` consumer inside a container image is invisible here too. So the
+finding is a **candidate, not a verdict**: before removing the payload, grep the
+scripts the job actually runs for the declared paths, and confirm on one run
+(the fix is trivially revertible — restore the `with:` key). If the submodule
+carries build inputs resolved by path at build time, treat the payload as
+load-bearing and skip the finding.
+
+**Sizing**: no static default seconds. The cost is the repo's own payload — the
+submodule tree's size and the LFS objects' bytes — which the workflow YAML never
+reveals, so the catalog gives this pattern no `_SIZING` model and no modeled
+saving; it renders **qualitatively** rather than carrying an invented number
+(the same honest path any un-modeled pattern takes — the `_SIZING`
+preamble in `collect_runs.py` states the rule: a pattern that isn't in the table
+is sized as `None`/`None` and rendered qualitatively, because the scanner never
+invents a number). Both axes therefore render empty. Where a reader wants the
+number, the measurement is the job's own checkout step duration before and after
+the change, per the rollout below — this pattern does not estimate it for them.
+
+**Risk**: **MEDIUM**. For a submodule, removing a payload the job depends on
+fails it loudly — a missing path, a missing file — which is why the rollout below
+is cheap. LFS is the dangerous variant, and it fails **quietly**: with `lfs:`
+dropped, a tracked file is still present as its ~130-byte pointer text, so a tool
+reads the pointer and produces a wrong output instead of an error. Only drop
+`lfs:` for jobs that read no tracked path at all, and check the job's output, not
+just its exit code.
+
+**Guardrail**: Never recommend dropping the payload for a job whose steps, or
+whose invoked local actions, reference a declared path. Never recommend it at all
+when the declared payload can't be read (no `.gitmodules` / `.gitattributes`) —
+absence of a declaration is not evidence of unread payload.
+
+**Rollout**: Change one job, re-run the workflow once, and compare that job's
+checkout step duration before and after. Revert by restoring the single `with:`
+key.
+
+---
+
+### OPT80 — Checkout Stalls on the Tail
+
+<!-- METADATA
+pattern: OPT80
+impact: MEDIUM
+class: data-driven
+detector: actions-checkout-tail-stall
+affected_files: ".github/workflows/*.yml,.github/workflows/*.yaml"
+fix_strategy: checkout-stalls-on-the-tail
+title_template: "Checkout Stalls on the Tail"
+-->
+
+**TL;DR**: The checkout step is a few seconds on a typical run and minutes on a
+handful, and the slow runs' own logs show the git fetch standing still. That is
+a stalled transfer, not a large one — and a low-speed abort plus a retry caps it.
+
+**Anti-pattern**: A job's `actions/checkout` has a heavy right tail. Most runs
+fetch in seconds; every so often one sits at the same `Receiving objects: N%`
+for a minute or more and then completes. Nothing in the repository changed
+between those runs — the transfer stalled, and `git` has no timeout configured,
+so it waits. The cost is paid by whoever happens to catch it, and it is
+invisible in a p50: the median run looks fine, and only the average moves.
+
+```
+before:  git fetch  ->  [stall, no timeout]  ->  ...  ->  done   (120s)
+after:   git fetch  ->  [stall]  -> abort at 30s -> retry -> done ( ~40s)
+```
+
+**Why this is not OPT49 revived**: [OPT49](#opt49--slow-setup-step) was cut for
+reading a cause out of a duration — "checkout took 61s, therefore the
+dependencies are uncached". OPT80 never infers. It proves the stall from the
+tail runs' own logs, and the proof is narrow: the percentage transferred must be
+the SAME on both sides of the pause. A heavy tail whose logs show a smooth fetch
+is **withheld** — and so is one whose fetch was merely slow, or that paused
+before any byte moved — because a long fetch with no stop in it is a large
+repository (that is [OPT28](#opt28--full-git-history-checkout)'s lever and
+[OPT76](#opt76--submodule--git-lfs-checkout-payload)'s), not a stalled one.
+
+**Detection heuristic** (every gate required; all fail closed):
+
+1. The step is `uses: actions/checkout@*`, or a **local composite action** whose
+   body checks out (this mirrors OPT76's transitive local-action indexing — it is
+   re-implemented against the workflow-YAML vintage the tail was measured on, not
+   imported. A local action that is unreadable, or that transitively invokes
+   itself, fails closed and the job is skipped). A hand-rolled
+   `git clone` in a `run:` block is **not** matched — its fix is flags on the
+   user's own command. A job declaring more than one checkout step is skipped:
+   which one the timing belongs to is ambiguous.
+   The step is located in the **YAML**, never by its timing. GitHub stamps step
+   timestamps at one-second granularity, so a warm checkout measures 0s; a
+   timing-based search would drop that run from the sample and inflate the p50.
+   A step `name:` carrying a `${{ }}` expression is rendered before the jobs API
+   reports it, so for those the step is matched on its `uses:` identity instead —
+   otherwise a repo that templates its step names is silently unreachable. When
+   the identity still matches no observed step, that is counted as
+   `checkout_step_identity_never_matched_in_steps` /
+   `checkout_step_measured_on_no_sampled_run`, never as "the job ran too rarely".
+2. At least **6** sampled occurrences of the job, all on **one** known
+   per-minute-billed runner label. A "tail" that is really some runs on a
+   different runner class is a runner comparison, not a stall.
+3. The checkout step's duration has a real tail:
+   `p95 ≥ max(3 × p50, p50 + 30s)`, with at least **2** runs at or above that
+   threshold. Both parts of the bound are named constants: the multiple keeps a
+   uniformly slow checkout out, the absolute floor keeps sub-minute jitter out.
+4. No retry or abort is configured already. Four doors, read with two different
+   scopes:
+
+   - **anywhere in the job** (the checkout inherits these wherever they are set):
+     `GIT_HTTP_LOW_SPEED_LIMIT` / `GIT_HTTP_LOW_SPEED_TIME` in the workflow-,
+     job- or step-level `env:` or in a local composite's body; and
+     **`git config http.lowSpeedLimit` / `http.lowSpeedTime`** — git's own
+     documented equivalent — in a `run:` step or a composite's body. Step order
+     is deliberately not checked: the setting is usually made in a setup step.
+   - **on the checkout step only**: a retry-wrapper action used *as* the checkout
+     step, or the body of the local composite that *is* the checkout step. A
+     retry wrapping `npm test` three steps below a bare `actions/checkout@v4`
+     retries the tests, not the fetch, and must not read as the fix.
+
+   A `git config` that `--unset`s, `--get`s or `--list`s the setting, and a
+   mention inside an `echo`, a `grep` or a `#` comment, never read as applied —
+   a repo that just removed the abort is the repo this pattern exists for. If a
+   door is open the fix is already applied and the finding is **withheld**. A
+   retry configuration that cannot be read is withheld too.
+5. For at least **2** of the tail runs, the captured checkout log shows the
+   transfer **standing still**: a gap of **≥ 20s** between two consecutive
+   `Receiving objects: N%` lines reporting the **same N**. A stall is progress
+   that STOPPED, not progress that had not started, so none of these qualifies:
+
+   - the quiet between `Fetching the repository` and the first `remote:` line
+     (DNS, auth, negotiation);
+   - the quiet across `remote: Enumerating / Counting / Compressing objects`
+     (the server building the pack, during which the client legitimately
+     receives nothing);
+   - two `Receiving objects` lines whose percentage **advanced** (a transfer
+     that is slow, not one that stopped);
+   - a pair at **100%** (`tail_pause_was_after_the_transfer_completed`) — the
+     transfer is already over, and the gap is the runner writing the pack to
+     disk. A low-speed network timeout cannot act on it, and the evidence would
+     have said the fetch was "stuck at 100%".
+
+   The first three are a large repository — OPT28's lever, not this one — and each
+   would be aborted by the low-speed timeout this pattern recommends, so
+   reporting them would hand the reader a fix that reds their CI. They are
+   withheld under `tail_pause_was_advancing_or_pre_transfer`, so a big-repo tail
+   is visible as that rather than as "the logs showed a smooth fetch". The
+   non-transfer lines stay in the vocabulary only as window anchors; they never
+   bracket a proven pause.
+
+   The two lines bracketing the longest qualifying gap are quoted **verbatim**,
+   and only lines inside the checkout step's own time window are read, so a
+   later `git submodule` or `git lfs` step cannot supply the proof. Logs are
+   fetched for **tail runs only**, newest-first, bounded by a named probe cap
+   (4) — never for the whole sample, and never at all for a job with no tail. A
+   tail run whose job has no log to serve (in flight, skipped) or whose step
+   window is unreadable is dropped **before** the fetch, so the bounded budget is
+   never spent on a run the result would be refused for.
+
+   The log is split on newlines only; within one record git's progress animation
+   is separated by **carriage returns**, and every fragment is read with the
+   record's timestamp. Reading only the first fragment threw the intermediate
+   percentages away, which is how a transfer that kept moving could look as
+   though it stood still. A log where more than a small named share of records
+   carry no parseable timestamp is refused (`log_lines_without_timestamps`)
+   rather than proved from what survived.
+
+   Every way a probe can fail to prove a stall is counted **separately**, and
+   every distinct reason across the probed runs is counted — not just the most
+   common one — because only some of them are evidence about the repository:
+
+   | gate | what it means |
+   |---|---|
+   | `tail_without_log_gap` | we looked, and the fetch was smooth. The only one that is evidence about the repo |
+   | `tail_pause_was_advancing_or_pre_transfer` | a big-repo pause: advancing, or before any byte moved |
+   | `tail_pause_was_after_the_transfer_completed` | a pause at 100% — local pack writing, not the network |
+   | `log_carries_no_progress_vocabulary` | `show-progress: false`; the checkout printed nothing |
+   | `progress_lines_all_outside_step_window` | the log has progress, none of it inside the step's own window (a clock/attempt mismatch) |
+   | `log_carries_no_parseable_timestamps` / `log_lines_without_timestamps` | the capture's gaps are not derivable |
+   | `tail_run_log_unavailable` | the log was fetched and was not there |
+   | `tail_run_has_no_log_to_fetch` | the run is in flight or skipped; no fetch was attempted |
+   | `tail_run_step_window_unreadable` | the step timestamps do not parse, so no log could be clamped |
+   | `quoted_progress_line_is_credential_shaped` | a stall was found and its proof dropped unquoted |
+   | `no_tail_run_log_was_probed` | the fallback when no run was reached at all |
+
+   A count in `opt80_withheld_by_gate` means one thing only: **a finding was
+   suppressed**. A poisoned line dropped from a finding that still fired is
+   recorded in a separate `opt80_notes` tally instead.
+
+Every one of those exits increments a stamped per-gate counter
+(`opt80_withheld_by_gate` on the findings document) and logs at DEBUG, so a
+detector that has quietly stopped firing is distinguishable from a repository
+with nothing to report.
+
+**Checkouts it could not decide are named in the report.** A job whose checkout
+measured a tail is a candidate. Its exit is a *verdict* when the tail runs' logs
+were read and show a smooth fetch, a pause that was advancing or came before the
+transfer, or one after the transfer completed; when the retry or abort is
+already configured; or when the measured excess or credited minutes are nothing.
+It is a *could not tell* when there were too few tail runs, the retry
+configuration could not be read, or the tail runs whose logs were unavailable,
+silent, undecidable or never fetched (only the newest four are) could still have
+supplied the missing proof. Each could-not-tell
+checkout is listed on the findings document (`opt80_withheld_candidates`, named
+by its commonest such reason), and the report's Data sources table carries a
+`checkout stall: held back` row — "N candidate checkout(s) held back (build):
+too few slow checkouts in the sampled runs to tell a stall from a one-off." The
+jobs are named (workflow-qualified when two workflows share a name, at most five,
+then "and K more"), the reason is a plain-English phrase for the commonest gate,
+and `verify_report.py` re-derives the whole line, so an undecided tail never
+reads as "measured, nothing found".
+
+**Log text is untrusted third-party data.** Only lines from the closed progress
+vocabulary above are ever read, the two quoted lines are quoted and never acted
+on, and a quoted line carrying a credential shape drops that run's proof rather
+than being masked — a masked git progress line is no longer evidence of
+anything. If that leaves fewer than two clean proofs the finding is withheld
+outright. Either way the poisoned line is never quoted.
+
+**Sizing (measured — the tail-excess model)**:
+
+```
+tail_excess_s = mean(checkout_s) - p50(checkout_s)        over the sample
+runner_min    = tail_excess_s x effective_monthly_volume / 60
+wall_clock_p50_s = 0
+```
+
+Never the full p95, never the whole step. `effective_monthly_volume` is the
+workflow's monthly volume scaled by how often *this job* actually ran in the
+sample, so a job behind an `if:` gate is not credited at the workflow's
+frequency. The evidence renders p50 / p95 / max so the reader sees the spread.
+
+`wall_clock_p50_s` is **0 by construction**, and this is deliberate: the median
+run has no stall, so capping the tail cannot move the p50 merge gate. What does
+improve is the tail runs' own wall-clock, bounded above by the longest observed
+pause — stamped as `tail_run_longest_pause_s` and named in the rendered evidence,
+along with whether the job sits on the critical path — but **not credited**,
+because a mean-minus-median quantity is not a p50 saving and must not be rendered
+as one. It is an upper bound, not a forecast: the recommended abort fires at 30
+seconds and the retry re-fetches, so the realised gain on a stalled run is
+smaller than the pause it replaces.
+
+**Fix recipe**, in this order, with the caveat that **retry and abort cap the
+damage; they do not fix the network**:
+
+1. Set `GIT_HTTP_LOW_SPEED_LIMIT: 1000` and `GIT_HTTP_LOW_SPEED_TIME: 30` in the
+   checkout step's `env:` **and** wrap the checkout in a retry (step 2) in the
+   same change. Git then aborts a transfer that stays under 1 KB/s for 30
+   seconds instead of waiting indefinitely. The abort on its own is not a
+   half-measure but a regression: the runs this pattern measured stalled and
+   then *succeeded*, and aborting without a retry turns them into failures.
+2. Wrap the checkout in a retry with backoff (a retry action, or a local
+   composite). The abort from (1) is what makes the retry fast — **never add a
+   retry without it**, or the retry inherits the same hang and doubles the worst
+   case.
+3. Where the job allows it, a shallow / blobless / sparse checkout shrinks what
+   can stall at all. This pairs with [OPT28](#opt28--full-git-history-checkout),
+   which already knows which jobs read history — check it before narrowing the
+   checkout, because a job that needs history fails only later, inside the step
+   that reads it.
+4. A persistent git mirror on the runner removes the fetch entirely. That is a
+   **runner-side capability your runner provider may or may not offer** — it is
+   not something this change installs, and this skill does not recommend a
+   vendor for it.
+
+Expect the tail to shorten, not to disappear, and re-measure the same step after
+the change.
+
+**Risk**: **MEDIUM**. No check is renamed, so branch protection is untouched.
+But the abort in step 1 does change how a *succeeding* transfer is handled: the
+runs this pattern measures stalled and then completed, so an abort shipped
+without the retry converts them into red runs. Shipped together, steps 1 and 2
+turn a long stall into a short retry; shipped apart, step 1 alone is a
+regression. Step 3 is the one that can break a job outright (a narrowed checkout
+the job silently depended on), which is why it is third and gated on OPT28.
+
+**Guardrail**: never present this as a fix for a checkout that is merely large;
+never add a retry without the abort, and never add the abort without the retry;
+never narrow the checkout without
+confirming the job reads no history and no excluded path; never describe the
+runner-side mirror as part of the change.
+
+**Published example**: Linear's CI writeup
+(<https://linear.app/now/ci-bottleneck-reworked>) replaced `actions/checkout`
+with a composite that retries with backoff and sets the same two low-speed
+variables so a stalled fetch aborts after about 30 seconds. That is cited as a
+real-world instance of the shape; it is **not** this skill's sizing, and no
+number from it is ever credited to a user's repository.
+
+**Tier-2 render note**: OPT80 can promote only with measured tail evidence and a
+neutrality certificate whose `proof` token is `checkout_tail_excess` — its own
+token, because the credited quantity is one step's tail excess rather than a job
+duration, so neither the cluster-floor comparison nor the post-completion
+argument describes it. The meaning is restated wherever it is read: the
+detector, `verify_report.py`'s neutrality arm, `blocking_path.py`'s certificate
+summary and this note.
+
+The finding must stamp `wall_clock_p50_s=0`, `sizing_basis=measured`, the
+tail-excess model in `measured_signal`, and a structured `checkout_stall` block
+that lets `verify_report.py` re-derive the whole claim. The block must carry all
+of these keys. The ones marked **re-derived** are recomputed by the neutrality
+arm and fail the report when they disagree; the rest are stamped so the claim can
+be audited by hand, and the arm reads its own copies of the constants rather than
+the stamped ones, so a drifted constant fails the engine/verifier coupling test
+instead of being silently trusted:
+
+| key | what it carries |
+|---|---|
+| `kind` | **re-derived** — `opt80_checkout_tail_stall`; a block without it is not this claim |
+| `job` | **re-derived** — the credited job; must equal `affected_jobs` |
+| `checkout_step` / `checkout_step_identity` / `checkout_step_source` | which step was measured, and whether it is `actions/checkout` directly or a local composite that wraps one |
+| `runner_label` | the one billed label every credited occurrence ran on |
+| `per_run_checkout_s` | each sampled occurrence's job id, run URL and checkout seconds — the inputs p50 / p95 / mean / max are recomputed from |
+| `p50_s` / `p95_s` / `mean_s` / `max_s` | **re-derived** — the distribution, recomputed from `per_run_checkout_s` |
+| `tail_threshold_s` | **re-derived** — the threshold the tail test produced |
+| `tail_p95_multiple` / `tail_p95_abs_s` / `min_tail_runs` / `min_gap_s` / `min_proven_tail_runs` / `min_sampled_occurrences` / `log_probe_max` | **re-derived** — the bounds the detector used. The arm re-derives on its OWN `_VR_OPT80_*` copies (a bound read out of the artifact under audit proves nothing) and then compares each stamped value to its copy, failing the claim on any disagreement; an engine/verifier coupling test pins the copies to the engine's constants |
+| `tail_run_job_ids` | **re-derived** — which runs were tail runs, against the threshold, bounded by the sampled occurrences |
+| `proven_tail_runs` | **re-derived** — per proven run the two quoted lines, their log timestamps and the derived gap. The gap is recomputed from the timestamps, and so is the PREDICATE: the arm re-runs its own copy of the `Receiving objects: N%` regex over both quoted lines and fails the claim unless both match, report the same N, and that N is below 100 — otherwise a stamped `5% → 60%` pair would render as proof of a stall. Both lines are re-scanned for credential shapes here too |
+| `logs_fetched` | **re-derived** — against the verifier's PINNED probe cap (never the stamped `log_probe_max`, which is only compared to it), and against the number of tail runs |
+| `tail_excess_s` / `runner_min_saving` | **re-derived** — the credited quantity and the minutes it becomes |
+| `tail_run_longest_pause_s` | **re-derived** — must equal the largest gap across the proven runs, because the evidence renders it as the upper bound on what capping the stall recovers |
+| `on_critical_path` | **re-derived** — against the report's own rendered Long-pole sections, since this is the exact fact the pole-rule exemption below turns the blanket check off for |
+| `monthly_volume` / `sampled_successful_run_count` | bounds-checked, not re-derivable — they come from the collection, not from anything in the block. `monthly_volume` must be positive and the sampled count must be at least the occurrences |
+| `effective_monthly_volume` / `occurrences` | **re-derived** — the scaling; `occurrences` can never exceed the sampled run count, and the effective volume must be the monthly volume scaled by `occurrences / sampled` |
+
+**The slowest job is not excluded.** Every other Tier-2 proof argues its credited
+work is off the merge gate by showing the job is not the long pole; the report
+verifier enforces that as a blanket rule. `checkout_tail_excess` is exempt from
+it, because it carries the thing that rule stands in for: the credited quantity
+is `mean - p50` of one step, and a quantity defined as the distance of the mean
+above the median cannot by construction move the median — which the verifier
+re-derives from the stamped per-run inputs rather than infers. So a stalling
+checkout on the workflow's slowest job **is** reported, and the finding says in
+plain words that the effect on the merge wait is measured and not credited in
+this version. The `wall_clock_p50_s == 0` check still applies to it unchanged.
+
+It never claims a speedup on the typical run. It credits the tail excess in full,
+which assumes the stall is fully capped — the residual the abort and re-fetch
+leave behind is not netted out, so treat the credited minutes as the optimistic
+end of the range.
+
+**Worked shape**: a `smoke` job checks out in eight seconds on ten of twelve
+sampled runs and in two minutes on the other two. Both slow runs' logs sit at
+`Receiving objects: 17%` for eighty-five seconds before finishing. The credited
+saving is the average's inflation — mean minus p50 — times how often the job
+runs, and nothing at all is credited to the ten runs that were already fine.
 
 ---
 
@@ -2769,7 +3845,8 @@ title_template: "Dead Workflow Env Vars / Config"
 ## Category 14: Structural / Critical-Path Levers
 
 These patterns are a **different class** from everything above. The catalog
-patterns OPT1–OPT69 are *hygiene*: each is a named, locally-checkable defect with
+patterns OPT1–OPT69, OPT76, OPT77, OPT79 and OPT80 are *hygiene*: each is a named,
+locally-checkable defect with
 a mechanical, low-risk fix, detected by matching workflow YAML against the
 catalog. On real repos almost every hygiene hit moves **~0 developer
 wall-clock** — the true bottleneck is usually a check that is *working as
@@ -2783,6 +3860,14 @@ checks, and finds shared/redundant work), and the final lever framing is written
 by a per-candidate reasoning step. They carry an OPT-id so the report and tests
 stay catalog-keyed, but the catalog is no longer the only thing that can produce
 a finding.
+
+Most of them (OPT70–OPT75) are routed by the deterministic structural router in
+`collect_runs.py`. **OPT78** is routed instead by a drill-time leaf detector over
+the long pole's captured log (ARCHITECTURE §12.3), corroborated against the repo's
+test-runner config. It emits no finding record, so the render boundary's `Risk`
+row and banner never see it: its HIGH risk is stamped on the pole's drill-down
+and its intent check, guardrail and rollout ride in its agent prompt. `scan.py`
+reports it as having no critical-path router so its coverage is never overstated.
 
 **The cost of the higher leverage is higher risk.** A hygiene fix at worst does
 nothing. A structural change can **degrade correctness** — drop coverage, turn a
@@ -2976,13 +4061,13 @@ fix_strategy: trust-boundary-cache-split
 title_template: "Untrusted fork-PR job redoes cold work it can't cache securely"
 -->
 
-**TL;DR**: Jobs triggered by PRs from forks can't use the shared cache, so they redo the full install/build from scratch every time.
+**TL;DR**: A fork PR can only *restore* what the base branch already published — anything it saves is scoped to its own pull request — so where the warm asset is behind repo secrets, or nothing on the base branch publishes it under a key the fork can compute, every fork PR redoes the full install/build from scratch.
 
-**Anti-pattern**: A fork-PR-triggered job on the critical path whose setup can't be warm because the trust boundary denies it: `pull_request` from a fork runs with a read-only `GITHUB_TOKEN` and no repo secrets, so it can't restore a cache the trusted side wrote (or the cache scope isolates fork branches), and every fork PR pays cold install/build. Trust-boundary-forced cold work is structural, not a missing-cache hygiene bug.
+**Anti-pattern**: A fork-PR-triggered job on the critical path whose setup can't be warm because the trust boundary denies it. Two constraints, routinely confused — keep them apart. **Save side**: a `pull_request` run saves into the merge ref's scope (`refs/pull/.../merge`), and per GitHub's dependency-caching reference such a cache "can only be restored by re-runs of the pull request" — so a fork PR warms nothing but itself. (This binds same-repo PRs identically; it is not what makes a fork colder.) **Restore side**: a fork PR **can** read the base branch — "If a workflow run is triggered for a pull request, it can also restore caches created in the base branch, including base branches of forked repositories" (same reference) — so a base-branch entry keyed on something the fork can compute, such as a lockfile hash, **does** hit, and a job like that is not this anti-pattern. What is fork-specific is what the fork cannot reach at all: it runs with a read-only `GITHUB_TOKEN` and **no repo secrets**, so a secrets-gated remote build cache (Turborepo/Nx Cloud, a registry-backed BuildKit cache, a private base image) is unavailable to it, and it cannot restore an upstream *feature* branch's own scope. Where the warm asset sits behind one of those, trust-boundary-forced cold work is structural, not a missing-cache hygiene bug.
 
-**Detection heuristic** (routed): the job runs on `pull_request` (fork-reachable, not `pull_request_target`), has a high setup/build floor, and references no secrets / uses a cache the fork can't populate. Its cold setup is the addressable cost, but the naive fix (let the fork write the shared cache) is a **cache-poisoning** vector.
+**Detection heuristic** (routed): the job runs on `pull_request` (fork-reachable, not `pull_request_target`), has a high setup/build floor, and its warm asset is one a fork cannot reach — a secrets-gated remote cache, or a scope no fork run can restore. **Gate on this first, or the pattern fires on repos that are already warm:** check whether a trusted trigger (`push` to the base branch, or `schedule`) already publishes a GitHub Actions cache entry under a key the fork can compute — `actions/setup-*` with `cache:` enabled, or `actions/cache` on a `push` job, keyed on a lockfile hash, is the common case, and it restores fine on a fork PR. If such an entry exists, OPT74 does not apply. Where it doesn't, the cold setup is the addressable cost — but the naive fix (let the fork write the shared cache) is a **cache-poisoning** vector.
 
-**Fix recipe**: **Trusted-producer + read-only-consumer split.** A trusted workflow (`push` to the base branch, or `schedule`) builds the shared dependencies/base image and publishes them **keyed by a ref the consumer can compute** (base-branch SHA, lockfile hash). The untrusted fork job **restores read-only** with a **local fallback**: on a cache miss it does the cold work rather than failing, so a fork PR is never blocked on the producer. The producer's output must be **content-addressed and validated** (the consumer recomputes/verifies the key from its own inputs) so a poisoned cache entry can't be served to the trusted side.
+**Fix recipe**: **Trusted-producer + read-only-consumer split.** **First confirm one isn't already there** — if the base branch already publishes a restorable entry under a consumer-computable key, the split is in place and a second producer changes nothing. Otherwise: a trusted workflow (`push` to the base branch, or `schedule`) builds the shared dependencies/base image and publishes them **keyed by a ref the consumer can compute** (base-branch SHA, lockfile hash). The untrusted fork job **restores read-only** with a **local fallback**: on a cache miss it does the cold work rather than failing, so a fork PR is never blocked on the producer. The producer's output must be **content-addressed and validated** (the consumer recomputes/verifies the key from its own inputs) so a poisoned cache entry can't be served to the trusted side.
 
 **Encode the cache-poisoning guardrails generally**: never let an untrusted job **write** a cache/artifact the trusted side reads; key shared artifacts by an input the consumer independently derives (not an attacker-controlled branch name); validate restored content before use; and keep the fallback path (cold build) always available so availability doesn't depend on the producer.
 
@@ -3026,9 +4111,100 @@ Report the dominant step, its category, and its share so the reader sees *why* t
 
 **Risk**: **MEDIUM** by default — the dominant-step remedy ranges from LOW (cache an install) to HIGH (scope a test/build, inheriting OPT70). The emitted candidate carries the risk of whichever specific lever its dominant category routes to.
 
+**Required-coverage caveat (the relocate branch)**: moving the dominant step out of the gating job moves the *work*, not the *gate*. If the pole is a required status check, the relocated work only keeps gating merges when the coverage is re-established **in the same change**. A `needs:` edge alone is not enough — `needs:` orders jobs, it does not gate merges, so the required check can go green while the moved work failed. Two routes, and they are not equally available:
+
+- **Keep the required check name (no admin needed — prefer this).** Give the *work-carrying* jobs the new names and leave the **required check name** on a verdict/aggregator job that `needs:` them and rejects them when they failed or did not execute (next caveat for how). Branch protection is not edited at all, because the name it requires never moved.
+- **Add the new job's check name to branch protection** (or the ruleset equivalent) as a required check. This one is **admin-only**: it belongs in the fix handoff as an explicit step for the operator, and the audit never changes protection rules itself. Do not ship the relocation ungated while waiting on it.
+
+The **advisory-async** branch above — moving a non-required scan off the PR path (OPT71) — stays restricted to genuinely advisory work: a non-required job feeding a required aggregator is required *in effect*, full stop, whatever the aggregator's own verdict logic turns out to do. **The rule chains at every hop**: a job feeding an aggregator that is itself only required *in effect* is required *in effect* too, so tracing one edge and finding a non-required job there settles nothing — follow the chain until it reaches a required check name or runs out. An aggregator whose logic propagates only *some* upstream outcomes (this section's `contains(needs.*.result, 'failure')` trap, below) still counts as propagating here: a leaky verdict is a reason to FIX the verdict, never a licence to de-scope the job feeding it. The nuance can only make MORE things required, never fewer. And an **unknown** required status is treated as required, never as permission to de-scope. OPT71's consumer enumeration still applies in full — and note `needs:` takes **job ids, not check names**, so enumerate every job that `needs:` this one, every later step reading its outputs, every downstream comment/label/deploy, and every aggregator reading its result.
+
+**Dependency-failure skip caveat**: a job skipped because a job in its `needs:` list FAILED does not report failure — it reports as skipped, exactly like an `if:`-skipped job, and a required check satisfied by that job can therefore be satisfied while its work never ran ([GitHub: troubleshooting required status checks](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)). The verdict/aggregator job that stands in for the relocated work must therefore do BOTH things: run with `if: always()` (or `!cancelled()`) so a failed dependency cannot skip it away, AND explicitly propagate the upstream outcomes — read each `needs.<job>.result` and exit non-zero unless every required upstream result is `success`, treating `failure`, `cancelled` and `skipped` alike as a fail. Adding `always()` without propagating the results is the trap: the verdict then runs, reports success, and green-lights a merge whose required work failed or never executed.
+
+The whole verdict job, with the required check name kept on it:
+
+```yaml
+  test:                       # KEEPS the name branch protection requires
+    needs: [lint, integration]
+    if: always()              # `!cancelled()` instead if a user-cancelled run
+    runs-on: ubuntu-latest    #   should stay cancelled rather than go red
+    steps:
+      - name: Verdict
+        run: |
+          echo "lint=${{ needs.lint.result }} integration=${{ needs.integration.result }}"
+          [ "${{ needs.lint.result }}" = success ] \
+            && [ "${{ needs.integration.result }}" = success ] || exit 1
+```
+
+Three ways to get this wrong: putting the `needs.*.result` test in the job-level `if:` (that *skips* the verdict instead of failing it, and a skipped check reports success); using `contains(needs.*.result, 'failure')`, which misses `skipped` and `cancelled`; and renaming the required job so the required check never reports at all — which does not silently pass, it blocks the pull request forever. `always()` runs on cancellation too, so a cancelled run turns the required check red; `!cancelled()` avoids that but leaves the verdict skipped-and-therefore-green on cancel. Pick deliberately.
+
 **Guardrail**: Carry the guardrail of the routed lever (e.g. OPT70's full-suite fallback if the dominant step is a test being scoped). Never present the decomposition as free.
 
 **Rollout**: The routed lever's rollout. Re-measure the pole's p50 after the dominant step is attacked; the next-largest step (or the cluster floor) becomes the new target.
+
+---
+
+---
+
+### OPT78 — Per-File Test Isolation Rebuilding Shared Module State
+
+<!-- METADATA
+pattern: OPT78
+impact: HIGH
+class: structural
+detector: critical-path-log-leaf
+risk: HIGH
+affected_files: "vitest*.config.*,vitest.*.ts,vite.*config*.*,vitest.workspace.*,package.json"
+fix_strategy: test-isolation-shared-module-registry
+title_template: "Per-file test isolation rebuilds the shared module graph for every test file"
+-->
+
+**TL;DR**: Your slowest test job spends more time re-importing the app for each test file than running the tests — because the runner isolates every file and each one rebuilds the same expensive module graph from scratch.
+
+**Scope: vitest only.** The mechanism is vitest's `isolate` option, which defaults to `true` and gives every test file a fresh module registry. Other runners are deliberately out of scope here rather than guessed at: jest's per-file module registry is not configurable the same way (`--runInBand` and `maxWorkers` change *where* files run, not whether the registry is rebuilt), and the pytest equivalents (`pytest-forked`, `pytest-xdist --dist` modes) have different semantics again. A narrower, correct pattern beats a broad, wrong one; widen this entry only with verified config facts for the runner being added. The vm pools (`vmThreads`, `vmForks`) cannot turn isolation off at all, so a suite on one of them never gets this lever.
+
+**Anti-pattern**: A vitest suite on the measured critical path whose `import` phase exceeds its `tests` phase. Every test file re-resolves, re-transforms and re-executes the same shared graph — an ORM entity registry, a GraphQL schema build, decorator registration, a DI container — and with hundreds of files in a shard that setup is paid hundreds of times. The tests themselves are not the cost; re-reaching the starting line is.
+
+**Detection heuristic** (routed from the measured long pole, not a flat grep — ARCHITECTURE §12.3): this pattern is emitted by the `vitest-isolate-pool` leaf detector in `blocking_path.py`, which runs over the drilled long pole's captured log — not by the static scan and not by the structural router in `collect_runs.py`. It fires only when all of the following are read, never inferred:
+
+1. The drilled long-pole job's captured log shows a vitest run whose `Duration … (transform …, setup …, import …, tests …)` line has `import + transform` above `tests`, with `import` above 30s. The detector reads the summary *shape*, not a version: the `import` label is what vitest 4.0.14 and later print (4.0.0–4.0.13 and 3.x print `collect` there), and vitest 5 prints the breakdown as percentages. Runs in those other shapes do not match, so on them the pattern stays silent rather than guessing. Those version boundaries are a dated observation (checked against vitest 4.1.x in 2026-09), not something the code checks: the contract is the summary-line regex, so a future vitest that keeps the same line keeps matching and one that changes it stops — no version gate is read anywhere. vitest may already count part of the transform wait inside `import`, so the gate is looser than it reads; it only decides whether to name the split, never a credited saving.
+2. `scan.py`'s `test_runner_isolation` block — read from the repo's own vitest config files (every `vitest*` config-extension file, setup and `.d.ts` files excepted, plus any `vite.*config*` file; the local modules those configs import; and the `package.json` scripts beside them) — reports a verdict of `isolation_on` — every config file read completely, none opting out — and the log carries neither documented spelling of the CLI opt-out (`--no-isolate`, `--isolate=false`). That verdict is computed once by the scan, so a second reader of the fact cannot reassemble it wrongly from the individual fields.
+3. The pole's measured dominant step category is `test`. If it is not, the leaf is not dropped: the off-category demotion (ARCHITECTURE §12.4b) keeps it as a labelled secondary observation that still names it as a HIGH-risk change, never crowned as the pole's cause and never framed as a quick cleanup.
+
+**Withheld, not silent**: if gate 2 cannot be established — no vitest config was found, a config could not be read (including one whose bytes are not UTF-8 text, such as a UTF-16 file), a config takes its settings from a package the read cannot follow, a config sets `isolate` to a value the read cannot resolve, the config walk could not cover the repo, the config reader itself failed, the suite runs on a vm pool, or the repo already opts out — the lever is **withheld** and the pole gets the guarded `vitest-import-bound` leaf instead. That leaf still names the measured import-bound split, states that OPT78 was withheld and why, and tells the agent not to turn isolation off from this finding; it points at cutting the import cost itself. The pole therefore stays a catalog match: it never dead-ends, and it is never sent to the log-grounded gap-fill or to the maintainer loop as a pattern the catalog lacks.
+
+The finding's evidence carries both halves of its claim, and labels each for what it is. The measured half is a verbatim line from the captured log — the `Duration` line of the slowest run, the one the finding sizes, and that run's own `Test Files` line. The config half is **not** a quoted line and says so inline — it is a statement about the *absence* of an opt-out (or, when withheld, the reason), which by construction has no line to quote — and it names the config file(s) it was read from.
+
+Three deliberate limits follow from reading a config as text rather than executing it:
+
+- **Any mention of `isolate` that is not the literal `true` withholds the lever — but only a literal `false` is reported as an opt-out.** A vitest config is executable TS/JS, so the value can be computed, shorthand (`{ isolate }`), spread across lines, or behind a flag. A literal `isolate: true` reads as isolation on; a literal `isolate: false` (or vitest 3.x's `singleThread` / `singleFork: true`, which vitest 4 maps to `isolate: false`) is a **resolved opt-out** the report can quote; anything else — a computed value, a shorthand, the word in a comment — is reported as **unresolved**, which withholds the lever just the same but is never stated as the fact that the repo already opts out. The distinction matters because the withheld message names a file and a line: calling an unresolvable line an opt-out told the reader their repo opts out at a line that says no such thing.
+- **A package the config takes its settings FROM withholds the lever; a package it merely uses does not.** Settings pulled in through `mergeConfig` / `extends` are followed into the local module they come from. A base that is a bare package specifier cannot be followed, so if the config uses that binding as a config base — merged, spread, read as `.test`, named by `extends`, or re-exported whole — the lever is withheld, whatever the package is called (`@acme/tooling` is as likely as `@acme/vitest-config`). A bare specifier used as anything else — a plugin, a test environment, a mock helper, a side-effect import such as `dotenv/config` — cannot carry the opt-out and is ignored. Deciding by package NAME instead was wrong in both directions at once: it missed bases with neutral names, and it permanently withheld the lever from every repo importing an ordinary plugin whose name happens to contain "vitest" or "test" (`@cloudflare/vitest-pool-workers`, `vitest-environment-nuxt`, `@storybook/test-runner`).
+- **Config discovery is a bounded walk, and an incomplete walk withholds the lever.** Root configs plus a capped walk beneath them (build output, `node_modules`, a known-inert set of dot-directories such as `.git`, `.github` and local worktree copies under `.claude`, and Bazel's `bazel-*` links are skipped — any other dot-directory IS walked, because `.config/vitest.config.ts` is a real place to keep one), so a monorepo's `packages/*/vitest.config.ts` is seen. If the walk leaves ground unvisited that could hold a config — it hit its file cap, or it pruned a directory that is a package root or holds one a single grouping level down, for depth, for being a symlink, for carrying a build-output name (`build`, `out`, `vendor`, `target`), or for being unreadable — it reports itself **truncated** and the lever is withheld: "no opt-out was found" is not "no opt-out exists", and a repo that has already adopted this lever must never be told to adopt it. The package-root test is what keeps that guard from swallowing the pattern whole: a vitest config sits at a package root beside its `package.json`, while ordinary source trees nest well past the depth bound and hold no config at all, so counting every deep directory would mark nearly every repo truncated and retire the pattern in silence.
+- **One opt-out anywhere withholds the lever for the repo.** A repo that has already stood up a shared-registry project is mid-rollout by this entry's own recipe, and telling it to adopt the lever again would be noise. The consequence is accepted: once the first file opts in, ci-speedup stops raising this lever (the withheld leaf still names the import-bound split), and extending the rollout to more files is the maintainer's call, informed by their own benchmark rather than by a repeat finding.
+
+**Fix recipe**: Let a reviewed subset of test files share one module registry per worker, as an **opt-in project** — never a global flip.
+
+1. Read the vitest config's history first: if isolation is set the way it is on purpose, a change that contradicts that is a policy change for the owner, not a quick win.
+2. Add a SECOND vitest project (in `projects`) with `isolate: false`, and keep the existing isolated project as the default. vitest selects a project's files by `include` globs, so files join the shared project only through an explicit per-file list or a dedicated filename suffix — joining is a reviewed act.
+3. Write explicit **teardown** for every piece of shared state the joining files touch — module-level caches, registries, singletons, DB/HTTP clients, global config. A shared registry means one file's leftovers are the next file's starting state.
+4. Files that use fake timers, or that hold shared state you cannot untangle safely, **stay in the isolated project**. Leaving files behind is the expected outcome, not a failure.
+5. Attack the underlying setup cost too where you can (lazier imports, a cheaper schema build) — that fix carries none of this risk.
+
+**Mandatory guardrail (this pattern is invalid without it)**:
+
+1. **Opt-in per file, never a global `isolate: false`.** A repo-wide flip silently changes the execution model of every test that already passes.
+2. **Teardown before a file joins.** No file joins the shared project until the state it mutates is explicitly reset between files.
+3. **Randomize file order in the shared project** (`sequence.shuffle`). Order dependence that a fixed order hides is exactly what this change can introduce.
+4. **No-weakening rail**: speed is never bought by verifying less. Sharing a module registry must not skip setup a test depends on, and a file that only passes because an earlier file did its setup is not a passing test.
+
+**Failure mode, plainly**: a test that passes only because a previous file left state behind — or fails only because of it. That is an **order-dependent green**, which is worse than a red: CI stays green while the suite has quietly stopped checking what it claims to check.
+
+**Conservative rollout (REQUIRED)**: Start in **shadow mode** — the candidate files run in BOTH projects, with the shared project non-required — and compare results over real PR traffic. Only once they agree does a file leave the isolated project (exclude it from that project's `include`, or it runs twice). Move files in small batches, each with its teardown, and revert a file to the isolated project at the first unexplained failure. Keep the full isolated run on the merge queue / default branch until the shared project has been stable across a representative stretch of PR traffic.
+
+**Sizing — deliberately uncredited**: the realizable saving **cannot** be derived from config, and this skill does not credit one. The only number it reports is the measured `import` share of the drilled run, which is an upper bound on what removing repeated imports could touch — not a saving, because part of that import cost is paid once per worker whatever you do. Turning the lever into a number requires a **benchmark**: run the candidate files in a shared-registry project and compare the suite's wall time against the isolated project. OPT78 therefore carries no `_SIZING` model and never contributes a credited wall-clock or runner-minute saving. A structural lever the router places on the same pole (typically OPT75 on a test-dominant pole) keeps its own sizing, which is that lever's estimate, not OPT78's.
+
+**Real-world example (Linear, 2026)** — someone else's published result, not a projection for your repo. Source: ["AI coding has made CI a bottleneck, so we reworked ours to keep up"](https://linear.app/now/ci-bottleneck-reworked). Linear called this their largest single performance improvement, worth roughly 17% in monthly savings at their volume. They introduced an opt-in vitest project with `isolate: false` so reviewed files could share a module registry within each worker, rather than rebuilding their entity, GraphQL and decorator graph in each test shard. Their slowest shard fell from roughly 300–379s to about 195s and total API-shard runner time dropped from about 32.8 to 22 minutes per run. They also called it the optimization with the highest correctness risk: eligibility was explicit per file, teardown was added for the shared state, and files using fake timers or otherwise-untangleable state were left in the isolated project.
+
+**Risk**: **HIGH** — correctness exposure. NEVER list as a quick win.
 
 ---
 
