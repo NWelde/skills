@@ -703,6 +703,37 @@ unversioned and updates by reinstall from `main`.
 
 ### Fixed
 
+- **2026-09-30** — **The repeated-setup (OPT77) and stalled-checkout (OPT80)
+  patterns now say when they measured something and could not decide it.** Both
+  kept a private tally of why they held candidates back, but nothing showed it,
+  so a report could read "checked, nothing found" when a group of small jobs or
+  a slow checkout had actually been set aside — because the sampled runs never
+  ran the whole group together, say, or because the slow runs' logs were gone.
+  The Data sources table now carries one row per pattern when that happens:
+  "N candidate job group(s) held back (lint + test in ci.yml): <reason>." under
+  `repeated-setup: held back`, and "N candidate checkout(s) held back (build):
+  <reason>." under `checkout stall: held back`. The jobs are named
+  (workflow-qualified when two workflows share a job name, at most five, then
+  "and K more"), and the reason is a plain-English sentence for the most common
+  cause, never an internal code. This is the same held-back disclosure the cache
+  check (OPT79) already gave: all three patterns now share one mechanism — one
+  row builder, one job list, one self-check — so a fourth pattern discloses a
+  held-back candidate by registering its reasons, not by growing a fourth copy. Only undecided candidates count; a candidate
+  that was decided (the jobs depend on each other, the logs show a smooth fetch)
+  does not. A slow checkout whose logs were not all read, because only the newest
+  four are fetched, counts as undecided when the unread runs could still have
+  proven a stall. A group of small jobs that is the whole workflow, with no other
+  job to compare against, is now treated as decided (merging them in parallel
+  can only keep or lengthen the wait) instead of held back; the case where other
+  jobs exist but none ran often enough to compare against stays held back. The
+  report's self-check re-derives each whole line (count, jobs, reason) from the
+  findings and fails a report that omits one, misstates any part, prints a code
+  in place of the reason, or carries one with nothing behind it; a gate with no
+  plain-English reason fails the check instead of printing, and a malformed
+  withheld list fails rather than reading as empty. The offline end-to-end run
+  now holds back one real group and one real checkout and checks the rendered
+  lines. (#111)
+
 - **2026-09-29** — **The stalled-checkout pattern (OPT80) no longer misses a
   stall, or invents one, in three cases.** A low-speed setting on some other
   step, or a `git config` applied after the checkout had already run, no longer

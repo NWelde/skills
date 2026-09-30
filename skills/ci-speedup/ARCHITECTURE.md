@@ -1067,6 +1067,38 @@ the eligible set the tallest-remaining job was chosen from. Like OPT65 it claims
 no speedup (`wall_clock_p50_s=0`, `realization=none`), and it shares
 `_billed_job_runner` and `_tier2_scope_event` with it.
 
+OPT77 and OPT80 each also keep an explicit list of the candidates they measured
+but could NOT decide — `opt77_withheld_candidates` (a formed group that exited on
+anything outside `_OPT77_VERDICT_GATES`) and `opt80_withheld_candidates` (a
+checkout with a measured tail that exited unresolved, outside
+`_OPT80_VERDICT_GATES`; after the log probe, only when the unread, unfetched or
+undecided tail runs could still have supplied the missing proof, named by their
+commonest reason). The per-gate tallies (`opt77_withheld_by_gate`,
+`opt80_withheld_by_gate`) are for maintainers; these lists reach the reader.
+
+The held-back disclosure is ONE mechanism shared by OPT77, OPT79 and OPT80.
+`blocking_path._WITHHELD_ROWS` maps each pattern's findings-doc key to its Data
+sources row label, its counted noun and its "Used for" cell, and
+`_withheld_candidates_line` builds the same sentence for all three:
+"N candidate … held back (<jobs>): <reason>." — the entries distinct and sorted,
+workflow-qualified as `<workflow.yml> / <job>` when two workflows share a job
+name (an OPT77 entry is the whole group), at most five then ", and K more", every
+repo-controlled name escaped for the table; the reason a plain-English phrase for
+the commonest gate, ties alphabetical. A pattern contributes only its key, its
+row text and its gate→phrase table (registered in `_WITHHELD_PHRASES_BY_KEY`),
+never its own row builder. The phrase tables (`_OPT77_WITHHOLD_PHRASES`,
+`_OPT79_HELD_BACK_REASONS`, `_OPT80_WITHHOLD_PHRASES`) map EVERY withhold gate
+their collector can record, and
+a test enumerates those gates from the detectors' source so a new gate cannot
+ship without a phrase. `verify_report.py`'s `check_coverage_disclosed` carries
+its own copy of the tables (pinned equal by a coupling test) and re-derives the
+whole line — count, jobs, reason — from the findings document, failing a report
+that omits the row, misstates any part of it, prints a gate name instead of a
+phrase, or carries a row with nothing behind it; a recorded gate with no phrase
+fails closed. A group that is the whole workflow (`group_is_the_whole_workflow`,
+no job outside it) is a verdict, not a withhold, and is never listed. The three
+files name the keys as constants a coupling test pins equal.
+
 OPT80 (checkout stalls on the tail) is the third measured Tier-2 lever, and the
 first whose admission rests on a LOG rather than on a timing alone. It measures
 one step's distribution across the sample — the checkout step, identified from
@@ -1314,13 +1346,16 @@ so is a job whose YAML showed a cache and which fell out BEFORE any log was read
 (`_OPT79_EARLY_HELD_BACK_GATES`: two caches, unreadable `package.json`, a cache
 that does not serve the install, an unrecognised first step, a separate save step,
 an unpriceable runner, the per-workflow probe budget). A job with no cache at all
-is not a candidate. `blocking_path` renders the list as the `cache hit/miss
+is not a candidate. `blocking_path` renders the list through the SHARED
+held-back row builder described under OPT77 above, as the `cache hit/miss
 verdicts` Data sources row ("N candidate cache(s) held back (<jobs>): <reason>.").
 The reason is a module-level dict, gate to plain-English phrase
-(`_OPT79_HELD_BACK_REASONS`, a standalone copy in `verify_report.py`), covering
+(`_OPT79_HELD_BACK_REASONS`, registered in `_WITHHELD_PHRASES_BY_KEY`, with a
+standalone copy in `verify_report.py`), covering
 `_OPT79_HELD_BACK_GATES`; a test enumerates the gates from the source so a new one
 cannot ship without a phrase. `verify_report.py` re-derives the whole sentence
-(count, job list, reason) and FAILS on a gate with no phrase, so a held-back cache
+(count, job list, reason) — the same re-derivation it runs for OPT77 and OPT80 —
+and FAILS on a gate with no phrase, so a held-back cache
 is not indistinguishable from no cache and a code is never printed. The probe's own cost is stamped ONCE, in
 `data_sources.cache_probe_logs` as `{planned, probed, returned, budget}` — the
 row the report renders and the verifier re-derives; when `planned` exceeds
