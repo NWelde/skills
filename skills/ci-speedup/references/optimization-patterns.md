@@ -957,7 +957,8 @@ title_template: "Repeated Checkout/Setup Without Artifact Handoff (and Slow Tool
 | **ESLint**         | **oxlint**            | **~8–20×** realistic (NOT the 50–100× advertised when type-aware rules and custom plugins exist) | Partial fit only  | Recommend a **dual-run scoped ESLint pattern** when ANY of the following are present: custom local rules, `tailwindcss` plugin, type-aware rules requiring `tsgolint`, framework plugins (`convex/*`, `next/*`, `@typescript-eslint/*` type-aware rules), or a `react-hooks/exhaustive-deps` configuration the team relies on. In dual-run, oxlint runs first across the tree; ESLint runs second with a config restricted to the rules oxlint can't replicate. Do NOT recommend a wholesale oxlint-only swap when these gates are present. |
 | **Babel**          | **SWC**               | **~10×** compile                                                                                 | Yes for most      | Drop-in via `next/babel`, framework integration, or `@swc/jest`. Verify any custom Babel plugins have SWC equivalents before recommending.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | **Webpack**        | **Turbopack**         | **~2–5×** build                                                                                  | Yes (Next.js 16+) | Default in Next.js 16+. Check for `webpack:` overrides in `next.config.js` that force fallback to webpack — those often need to be ported or removed before Turbopack is actually active.                                                                                                                                                                                                                                                                                                                                                   |
-| **`tsc --noEmit`** | esbuild/swc typecheck | **DO NOT recommend**                                                                             | **Anti-pattern**  | esbuild and swc do not typecheck. They strip types. `tsc --noEmit` is the only real type-check in the TypeScript ecosystem. Recommending this swap is a coverage regression masquerading as a speedup — the "speed without coverage is a regression" principle explicitly forbids it. Skip it.                                                                                                                                                                                                                                              |
+| **`tsc --noEmit`** (TypeScript 5.x/6.x) | **TypeScript 7** (`typescript@^7`, the native port; the command is still `tsc`) | Vendor-stated "typically 8x to 12x on full builds" (TypeScript 7.0 announcement); measure per repo | Yes for type-check-only steps | Same checker, native and multithreaded: an upgrade of the real type-check, not a swap to a tool that skips it, and NOT the esbuild/swc anti-row below, which strips types. TypeScript 7.0 is stable (7.0.2 is `latest` on npm); the older `tsgo` / `@typescript/native-preview` preview is superseded, so do not recommend it. Caveats: 7.0 ships without a programmatic compiler API (expected in 7.1), so tools that call it (typescript-eslint type-aware rules, webpack/ts-loader style loaders) need the side-by-side `@typescript/typescript6` alias (`tsc6`); 7.0 changes defaults (`strict: true`, `types: []`, no `baseUrl`), so expect new errors on upgrade. On small CI runners, `--checkers` / `--singleThreaded` bound memory. Keep the old compiler for anything needing the API. |
+| **`tsc --noEmit`** | esbuild/swc typecheck | **DO NOT recommend**                                                                             | **Anti-pattern**  | esbuild and swc do not typecheck. They strip types. A real type-check needs the TypeScript compiler itself (`tsc`, or its TypeScript 7 native port above). Recommending this swap is a coverage regression masquerading as a speedup — the "speed without coverage is a regression" principle explicitly forbids it. Skip it.                                                                                                                                                                                                                                              |
 
 **Detection heuristic**:
 
@@ -1238,7 +1239,11 @@ tasks` instead of `setup + the slowest task`, which can push it past the merge
 gate and make the change wall-clock-negative. Do not consolidate any job that can
 sit on the merge gate, and do not drop or narrow any check in the process — the
 consolidated job must still run everything the separate jobs ran, and still fail
-the build when any of them fails.
+the build when any of them fails. When the jobs must stay separate (independent
+re-runs, distinct required checks), the alternative is to make each copy of the
+setup cheap instead of merging: bake the recurring `apt` / toolchain installs into
+a base image, as [OPT73](#opt73--shared-sub-step-across-critical-path-jobs-cluster-floor-lever)
+describes.
 
 **Failure-isolation cost (a real cost, not a footnote)**: N separate checks give
 N independently-red checks and N independently re-runnable units. One
@@ -1596,6 +1601,7 @@ title_template: "Shard Imbalance"
 - Hash-based partitioning (nextest): increase shard count to dilute hot shards.
 - Explicit test lists: rebalance based on measured per-test runtimes.
 - Timing-based sharding (pytest-split, nextest timing data): enable it.
+- Runner distributes by whole file (Jest `--shard`, Playwright `--shard` without `fullyParallel: true`, file-granular splitters): the imbalance is one oversized file, so find it from measured per-file runtime and split it before adding shards; more shards cannot spread one file. Playwright with `fullyParallel: true` shards individual tests, so this does not apply there.
 - Sizing: the slow shard can drop toward the mean leg duration → `Δwc ≈ slow − mean(legs)`.
 
 **Fix — case 2 (heterogeneous legs), NOT rebalanceable**:
@@ -1693,7 +1699,11 @@ title_template: "Full Git History Checkout"
 grep -rn 'fetch-depth' .github/workflows/
 ```
 
-**Fix**: Use `fetch-depth: 1` (default) unless the job needs git history (e.g., changelogs, blame). For PR diff detection against the merge commit's parents, `fetch-depth: 2` suffices — but change-scoped runners that diff against the BASE BRANCH (`turbo --filter=...[origin/main]`, `nx affected`, `vitest --changed` — see OPT34/OPT70) need the base ref fetched (`fetch-depth: 0` or a targeted base-ref fetch); do not shallow those jobs.
+**Fix**:
+
+- **Delete the checkout step outright** if no step in the job reads a file from the checkout (a job that only calls an API, downloads an artifact, or runs a container image). The cheapest checkout is none. Check first that nothing needs the repo indirectly: a local action (`uses: ./...`) or reusable-workflow path, `hashFiles()` in a cache key, a `run:` that calls `git` or a repo script, or a `gh` command relying on the current repo (it then needs `--repo` or `GH_REPO`). A missing file fails the job, so delete only when every step is accounted for.
+- Use `fetch-depth: 1` (default) unless the job needs git history (e.g., changelogs, blame). For PR diff detection against the merge commit's parents, `fetch-depth: 2` suffices — but change-scoped runners that diff against the BASE BRANCH (`turbo --filter=...[origin/main]`, `nx affected`, `vitest --changed` — see OPT34/OPT70) need the base ref fetched (`fetch-depth: 0` or a targeted base-ref fetch); do not shallow those jobs.
+- **Sparse / blobless checkout** is the option between a full clone and depth 1 for diff-based gates that need history but not every file: `filter: blob:none` (with `fetch-depth: 0`, full history with file contents fetched on demand) or `sparse-checkout:` (newline-separated patterns; only those paths materialized) on `actions/checkout`. Both are real inputs; the action's own docs say `filter` "overrides sparse-checkout if set", so verify a combination on the job rather than assume it. Confirm the job's steps only touch the sparse paths, or a missing file fails the job.
 
 ---
 
